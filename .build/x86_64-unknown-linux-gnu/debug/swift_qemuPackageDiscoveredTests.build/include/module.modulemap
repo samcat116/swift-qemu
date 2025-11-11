@@ -1,3 +1,0 @@
-module swift_qemuPackageDiscoveredTests {
-    header "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/swift_qemuPackageDiscoveredTests.build/include/swift-qemuPackageDiscoveredTests-Swift.h"
-}

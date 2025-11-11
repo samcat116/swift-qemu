@@ -1,4 +1,0 @@
-module CNIOPosix {
-    umbrella header "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-nio/Sources/CNIOPosix/include/CNIOPosix.h"
-    export *
-}
