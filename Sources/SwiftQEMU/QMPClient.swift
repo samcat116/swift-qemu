@@ -28,23 +28,49 @@ public final class QMPClient: @unchecked Sendable {
     /// Connect to QEMU via Unix domain socket
     public func connectUnix(path: String) async throws {
         logger.info("Connecting to QEMU via Unix socket", metadata: ["path": .string(path)])
-        
+
         let handler = QMPChannelHandler(logger: logger)
         self.handler = handler
-        
+
         let bootstrap = ClientBootstrap(group: eventLoopGroup)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .channelInitializer { channel in
                 return channel.pipeline.addHandler(handler)
             }
-        
-        self.channel = try await bootstrap.connect(unixDomainSocketPath: path).get()
-        self.isConnected = true
-        
-        // Wait for greeting and negotiate capabilities
-        try await negotiateCapabilities()
-        
-        logger.info("Connected to QEMU successfully")
+
+        // Retry connection with exponential backoff
+        var retries = 0
+        let maxRetries = 10
+        var lastError: Error?
+
+        while retries < maxRetries {
+            do {
+                self.channel = try await bootstrap.connect(unixDomainSocketPath: path).get()
+                self.isConnected = true
+
+                // Wait for greeting and negotiate capabilities
+                try await negotiateCapabilities()
+
+                logger.info("Connected to QEMU successfully")
+                return
+            } catch {
+                // Clean up connection state before retry to avoid using stale connections
+                self.isConnected = false
+                self.channel = nil
+                
+                lastError = error
+                retries += 1
+
+                if retries < maxRetries {
+                    let delay = UInt64(min(100_000_000 * (1 << retries), 1_000_000_000)) // Exponential backoff, max 1 second
+                    logger.debug("QMP connection attempt \(retries) failed, retrying in \(Double(delay) / 1_000_000_000)s: \(error)")
+                    try await Task.sleep(nanoseconds: delay)
+                }
+            }
+        }
+
+        logger.error("Failed to connect to QMP after \(maxRetries) retries: \(lastError?.localizedDescription ?? "unknown error")")
+        throw lastError ?? QMPError.notConnected
     }
     
     /// Connect to QEMU via TCP socket
