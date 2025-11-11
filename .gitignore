@@ -1,3 +1,4 @@
+
 # Swift Package Manager
 .build/
 .swiftpm/
@@ -14,3 +15,14 @@ xcuserdata/
 # QEMU temporary files
 /tmp/qemu-*.sock
 /tmp/qemu-*.log
+
+# Swift build artifacts
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+.DS_Store
+
+# Package.resolved (should be committed for executables, not for libraries)
+# Package.resolved
+
