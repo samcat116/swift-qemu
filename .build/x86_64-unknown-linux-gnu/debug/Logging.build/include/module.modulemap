@@ -1,0 +1,3 @@
+module Logging {
+    header "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/include/Logging-Swift.h"
+}

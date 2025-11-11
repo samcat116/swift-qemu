@@ -1,0 +1,4 @@
+module CNIODarwin {
+    umbrella header "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-nio/Sources/CNIODarwin/include/CNIODarwin.h"
+    export *
+}
