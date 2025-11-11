@@ -46,20 +46,41 @@ public final class QEMUProcess: @unchecked Sendable {
         process.executableURL = URL(fileURLWithPath: qemuPath)
         process.arguments = arguments
         
-        // Capture output for debugging
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        
+        // Redirect output to log file for debugging
+        let logPath = "/tmp/qemu-\(UUID().uuidString).log"
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        let logHandle = FileHandle(forWritingAtPath: logPath)
+        process.standardOutput = logHandle
+        process.standardError = logHandle
+        logger.info("QEMU output redirected to: \(logPath)")
+
         // Start process
         try process.run()
         self.process = process
-        
-        // Wait a moment for QEMU to initialize
-        try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
-        
+
         logger.info("QEMU process started", metadata: ["pid": .stringConvertible(process.processIdentifier)])
+
+        // Wait for QMP socket to be ready with retry
+        var retries = 0
+        let maxRetries = 20 // 10 seconds total (20 * 0.5s)
+        while retries < maxRetries {
+            // Check if socket file exists
+            if FileManager.default.fileExists(atPath: qmpSocketPath) {
+                // Socket exists, wait a bit more for it to be ready to accept connections
+                try await Task.sleep(nanoseconds: 200_000_000) // 0.2 seconds
+                logger.info("QMP socket ready", metadata: ["path": .string(qmpSocketPath)])
+                break
+            }
+
+            // Wait and retry
+            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+            retries += 1
+
+            if retries == maxRetries {
+                logger.error("QMP socket not created after \(maxRetries) retries", metadata: ["path": .string(qmpSocketPath)])
+                throw QMPError.socketCreationFailed
+            }
+        }
     }
     
     /// Stop QEMU process
