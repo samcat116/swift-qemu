@@ -1,0 +1,33 @@
+{
+  "": {
+    "swift-dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/master.swiftdeps"
+  },
+  "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-log/Sources/Logging/Locks.swift": {
+    "dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Locks.d",
+    "object": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Locks.swift.o",
+    "swiftmodule": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Locks~partial.swiftmodule",
+    "swift-dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Locks.swiftdeps",
+    "diagnostics": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Locks.dia"
+  },
+  "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-log/Sources/Logging/LogHandler.swift": {
+    "dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/LogHandler.d",
+    "object": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/LogHandler.swift.o",
+    "swiftmodule": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/LogHandler~partial.swiftmodule",
+    "swift-dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/LogHandler.swiftdeps",
+    "diagnostics": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/LogHandler.dia"
+  },
+  "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-log/Sources/Logging/Logging.swift": {
+    "dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Logging.d",
+    "object": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Logging.swift.o",
+    "swiftmodule": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Logging~partial.swiftmodule",
+    "swift-dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Logging.swiftdeps",
+    "diagnostics": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/Logging.dia"
+  },
+  "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-log/Sources/Logging/MetadataProvider.swift": {
+    "dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/MetadataProvider.d",
+    "object": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/MetadataProvider.swift.o",
+    "swiftmodule": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/MetadataProvider~partial.swiftmodule",
+    "swift-dependencies": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/MetadataProvider.swiftdeps",
+    "diagnostics": "/home/runner/work/swift-qemu/swift-qemu/.build/x86_64-unknown-linux-gnu/debug/Logging.build/MetadataProvider.dia"
+  }
+}

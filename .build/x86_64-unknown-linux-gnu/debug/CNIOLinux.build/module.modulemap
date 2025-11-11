@@ -1,0 +1,4 @@
+module CNIOLinux {
+    umbrella header "/home/runner/work/swift-qemu/swift-qemu/.build/checkouts/swift-nio/Sources/CNIOLinux/include/CNIOLinux.h"
+    export *
+}

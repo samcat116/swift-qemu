@@ -57,7 +57,7 @@ public final class QEMUProcess: @unchecked Sendable {
             // Redirect output to log file for debugging
             let logPath = "/tmp/qemu-\(UUID().uuidString).log"
             FileManager.default.createFile(atPath: logPath, contents: nil)
-            let logHandle = FileHandle(forWritingAtPath: logPath)
+            let logHandle = try FileHandle(forUpdating: URL(fileURLWithPath: logPath))
             process.standardOutput = logHandle
             process.standardError = logHandle
             logger.info("QEMU output redirected to: \(logPath)")
@@ -65,7 +65,7 @@ public final class QEMUProcess: @unchecked Sendable {
             // Redirect to /dev/null to prevent pipe buffer overflow
             // Note: We cannot use Pipe() without actively reading it, as QEMU's output
             // will fill the buffer and cause the process to crash
-            let devNull = FileHandle(forWritingAtPath: "/dev/null")
+            let devNull = FileHandle.nullDevice
             process.standardOutput = devNull
             process.standardError = devNull
             logger.debug("QEMU output redirected to /dev/null")
