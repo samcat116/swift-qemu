@@ -92,11 +92,12 @@ public final class QEMUProcess: @unchecked Sendable {
             // Wait and retry
             try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
             retries += 1
+        }
 
-            if retries == maxRetries {
-                logger.error("QMP socket not created after \(maxRetries) retries", metadata: ["path": .string(qmpSocketPath)])
-                throw QMPError.socketCreationFailed
-            }
+        // After all retries, check if socket was created
+        if !FileManager.default.fileExists(atPath: qmpSocketPath) {
+            logger.error("QMP socket not created after \(maxRetries) retries", metadata: ["path": .string(qmpSocketPath)])
+            throw QMPError.socketCreationFailed
         }
     }
     
