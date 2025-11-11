@@ -54,6 +54,10 @@ public final class QMPClient: @unchecked Sendable {
                 logger.info("Connected to QEMU successfully")
                 return
             } catch {
+                // Clean up connection state before retry to avoid using stale connections
+                self.isConnected = false
+                self.channel = nil
+                
                 lastError = error
                 retries += 1
 
