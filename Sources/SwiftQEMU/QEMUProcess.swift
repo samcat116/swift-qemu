@@ -45,14 +45,31 @@ public final class QEMUProcess: @unchecked Sendable {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: qemuPath)
         process.arguments = arguments
-        
-        // Redirect output to log file for debugging
-        let logPath = "/tmp/qemu-\(UUID().uuidString).log"
-        FileManager.default.createFile(atPath: logPath, contents: nil)
-        let logHandle = FileHandle(forWritingAtPath: logPath)
-        process.standardOutput = logHandle
-        process.standardError = logHandle
-        logger.info("QEMU output redirected to: \(logPath)")
+
+        // Redirect output based on environment variable
+        // ENABLE_QEMU_PROCESS_LOG_FILES controls whether output goes to log files or /dev/null
+        let enableLogFiles = ProcessInfo.processInfo.environment["ENABLE_QEMU_PROCESS_LOG_FILES"]
+        let shouldLogToFile = enableLogFiles?.lowercased() == "true" ||
+                              enableLogFiles?.lowercased() == "yes" ||
+                              enableLogFiles == "1"
+
+        if shouldLogToFile {
+            // Redirect output to log file for debugging
+            let logPath = "/tmp/qemu-\(UUID().uuidString).log"
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+            let logHandle = FileHandle(forWritingAtPath: logPath)
+            process.standardOutput = logHandle
+            process.standardError = logHandle
+            logger.info("QEMU output redirected to: \(logPath)")
+        } else {
+            // Redirect to /dev/null to prevent pipe buffer overflow
+            // Note: We cannot use Pipe() without actively reading it, as QEMU's output
+            // will fill the buffer and cause the process to crash
+            let devNull = FileHandle(forWritingAtPath: "/dev/null")
+            process.standardOutput = devNull
+            process.standardError = devNull
+            logger.debug("QEMU output redirected to /dev/null")
+        }
 
         // Start process
         try process.run()
