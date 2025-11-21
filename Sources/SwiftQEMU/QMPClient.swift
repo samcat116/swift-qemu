@@ -207,7 +207,7 @@ public final class QMPClient: @unchecked Sendable {
 
 // MARK: - QMP Channel Handler
 
-private final class QMPChannelHandler: ChannelInboundHandler {
+private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     typealias OutboundOut = ByteBuffer
     
