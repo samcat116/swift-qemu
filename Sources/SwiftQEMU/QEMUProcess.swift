@@ -56,7 +56,7 @@ public final class QEMUProcess: @unchecked Sendable {
         if shouldLogToFile {
             // Redirect output to log file for debugging
             let logPath = "/tmp/qemu-\(UUID().uuidString).log"
-            FileManager.default.createFile(atPath: logPath, contents: nil)
+            _ = FileManager.default.createFile(atPath: logPath, contents: nil)
             let logHandle = FileHandle(forWritingAtPath: logPath)
             process.standardOutput = logHandle
             process.standardError = logHandle

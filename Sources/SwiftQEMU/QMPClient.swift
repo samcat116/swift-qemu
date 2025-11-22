@@ -294,36 +294,32 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     }
     
     private func processMessage(_ data: Data) {
-        do {
-            // Try to decode as greeting first
-            if let greeting = try? decoder.decode(QMPGreeting.self, from: data) {
-                logger.debug("Received QMP greeting", metadata: [
-                    "version": .stringConvertible("\(greeting.QMP.version.qemu.major).\(greeting.QMP.version.qemu.minor).\(greeting.QMP.version.qemu.micro)")
-                ])
-                greetingContinuation?.resume()
-                greetingContinuation = nil
-                return
-            }
-            
-            // Try to decode as response
-            if let response = try? decoder.decode(QMPResponse.self, from: data) {
-                if !pendingRequests.isEmpty {
-                    let continuation = pendingRequests.removeFirst()
-                    continuation.resume(returning: response)
-                }
-                return
-            }
-            
-            // Try to decode as event
-            if let event = try? decoder.decode(QMPEvent.self, from: data) {
-                logger.debug("Received QMP event", metadata: ["event": .string(event.event)])
-                // Events are logged but not handled in this simple implementation
-                return
-            }
-            
-            logger.warning("Unknown QMP message format")
-        } catch {
-            logger.error("Failed to process QMP message: \(error)")
+        // Try to decode as greeting first
+        if let greeting = try? decoder.decode(QMPGreeting.self, from: data) {
+            logger.debug("Received QMP greeting", metadata: [
+                "version": .stringConvertible("\(greeting.QMP.version.qemu.major).\(greeting.QMP.version.qemu.minor).\(greeting.QMP.version.qemu.micro)")
+            ])
+            greetingContinuation?.resume()
+            greetingContinuation = nil
+            return
         }
+
+        // Try to decode as response
+        if let response = try? decoder.decode(QMPResponse.self, from: data) {
+            if !pendingRequests.isEmpty {
+                let continuation = pendingRequests.removeFirst()
+                continuation.resume(returning: response)
+            }
+            return
+        }
+
+        // Try to decode as event
+        if let event = try? decoder.decode(QMPEvent.self, from: data) {
+            logger.debug("Received QMP event", metadata: ["event": .string(event.event)])
+            // Events are logged but not handled in this simple implementation
+            return
+        }
+
+        logger.warning("Unknown QMP message format")
     }
 }
