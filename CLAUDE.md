@@ -54,7 +54,7 @@ swift test --filter QMPProtocolTests
 
 ### Critical Reliability Fixes
 
-The codebase includes two critical fixes for production reliability (documented in CHANGES.md):
+The codebase includes critical fixes for production reliability:
 
 1. **Pipe Buffer Overflow Prevention**: QEMU stdout/stderr are redirected away from pipes to prevent crashes when buffers fill up. The original implementation used `Pipe()` objects but never read from them, causing QEMU to crash with `NIOCore.IOError` when the 64KB buffer filled. Current behavior:
    - Set `ENABLE_QEMU_PROCESS_LOG_FILES=true` to capture output in `/tmp/qemu-*.log` files
@@ -65,6 +65,14 @@ The codebase includes two critical fixes for production reliability (documented 
    - QEMUProcess waits up to 10 seconds (20 retries × 0.5s) for QMP socket file creation
    - QMPClient retries connection up to 10 times with exponential backoff (0.1s, 0.2s, 0.4s, 0.8s, max 1s)
    - Handles timing issues where socket file exists but isn't ready for connections
+
+3. **stdin Job Control Prevention**: QEMU stdin is redirected to `/dev/null` to prevent job control issues. When running from a terminal, not setting stdin causes QEMU to inherit the TTY, triggering SIGSTOP/SIGTTOU signals and putting the process in T (stopped) state, making the QMP socket unresponsive.
+
+4. **createVM Timeout and Cleanup**: The `createVM()` method has a configurable timeout (default 30 seconds) and automatic cleanup:
+   - If the operation times out or fails, the QEMU process is automatically terminated
+   - State is properly reset (`isConnected = false`, `status = .stopped`)
+   - Throws `QMPError.timeout` on timeout
+   - Prevents orphaned QEMU processes on connection failures
 
 ### Configuration Types
 
@@ -130,7 +138,9 @@ config.cpuCount = 2
 config.disks.append(QEMUDisk(path: "/path/to/disk.qcow2"))
 
 // Create VM (starts QEMU process in paused state by default)
+// Optional timeout parameter (default 30 seconds)
 try await manager.createVM(config: config)
+// Or with custom timeout: try await manager.createVM(config: config, timeout: 60)
 
 // Start VM execution
 try await manager.start()
@@ -145,6 +155,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - notConnected, connectionLost
 - processNotRunning, processAlreadyRunning
 - socketCreationFailed (QMP socket not created within timeout)
+- timeout (createVM operation exceeded timeout)
 - invalidResponse, invalidConfiguration
 - qmpError(class, description) for QMP-specific errors
 

@@ -71,6 +71,12 @@ public final class QEMUProcess: @unchecked Sendable {
             logger.debug("QEMU output redirected to /dev/null")
         }
 
+        // Redirect stdin to /dev/null to prevent job control issues
+        // When running from a terminal, not setting standardInput causes QEMU to
+        // inherit the TTY stdin, triggering SIGSTOP/SIGTTOU and T (stopped) state.
+        let devNullInput = FileHandle(forReadingAtPath: "/dev/null")
+        process.standardInput = devNullInput
+
         // Start process
         try process.run()
         self.process = process

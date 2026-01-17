@@ -23,25 +23,67 @@ public actor QEMUManager {
     // MARK: - VM Lifecycle
     
     /// Create and start a VM with the given configuration
-    public func createVM(config: QEMUConfiguration) async throws {
+    /// - Parameters:
+    ///   - config: The QEMU VM configuration
+    ///   - timeout: Timeout in seconds for the entire operation (default: 30)
+    public func createVM(config: QEMUConfiguration, timeout: TimeInterval = 30) async throws {
         guard !process.isRunning else {
             throw QMPError.processAlreadyRunning
         }
-        
+
         logger.info("Creating QEMU VM")
-        
-        // Start QEMU process
-        try await process.start(with: config)
-        
-        // Connect to QMP
-        let socketPath = process.getQMPSocketPath()
-        try await qmpClient.connectUnix(path: socketPath)
-        isConnected = true
-        
-        // Update status
-        await updateStatus()
-        
-        logger.info("QEMU VM created successfully")
+        status = .creating
+
+        do {
+            // Wrap entire operation in a timeout
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                // Timeout task
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    throw QMPError.timeout
+                }
+
+                // Main creation task
+                group.addTask {
+                    // Start QEMU process
+                    try await self.process.start(with: config)
+
+                    // Connect to QMP
+                    let socketPath = self.process.getQMPSocketPath()
+                    try await self.qmpClient.connectUnix(path: socketPath)
+                }
+
+                // Wait for first task to complete (either timeout or creation)
+                do {
+                    _ = try await group.next()
+                    group.cancelAll()
+                } catch {
+                    group.cancelAll()
+                    throw error
+                }
+            }
+
+            // Success path
+            isConnected = true
+            await updateStatus()
+            logger.info("QEMU VM created successfully")
+
+        } catch {
+            // Cleanup on any failure
+            logger.error("Failed to create QEMU VM: \(error)")
+
+            // Reset state
+            isConnected = false
+            status = .stopped
+
+            // Clean up process if it was started
+            if process.isRunning {
+                logger.warning("Cleaning up orphaned QEMU process")
+                process.stop()
+            }
+
+            throw error
+        }
     }
     
     /// Start/resume VM execution
