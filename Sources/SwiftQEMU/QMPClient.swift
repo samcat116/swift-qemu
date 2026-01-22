@@ -178,7 +178,73 @@ public final class QMPClient: @unchecked Sendable {
     public func quit() async throws {
         _ = try await execute(.quit)
     }
-    
+
+    // MARK: - Block Device Hot-Plug Commands
+
+    /// Add a qcow2 block device backend
+    /// - Parameters:
+    ///   - nodeName: Unique identifier for the block device (e.g., "drive-vdb")
+    ///   - filename: Path to the disk image
+    ///   - readOnly: Whether the disk is read-only
+    public func blockdevAdd(nodeName: String, filename: String, readOnly: Bool = false) async throws {
+        let arguments: [String: Any] = [
+            "driver": "qcow2",
+            "node-name": nodeName,
+            "file": [
+                "driver": "file",
+                "filename": filename
+            ],
+            "read-only": readOnly
+        ]
+        _ = try await execute(.blockdevAdd, arguments: arguments)
+    }
+
+    /// Remove a block device backend
+    /// - Parameter nodeName: The node name used when adding the device
+    public func blockdevDel(nodeName: String) async throws {
+        _ = try await execute(.blockdevDel, arguments: ["node-name": nodeName])
+    }
+
+    /// Add a device (e.g., virtio-blk-pci)
+    /// - Parameters:
+    ///   - driver: Device driver type (default: "virtio-blk-pci")
+    ///   - deviceId: Unique device identifier (e.g., "vdb")
+    ///   - driveId: The node-name of the backing block device
+    ///   - bus: Optional PCI bus to attach to
+    public func deviceAdd(
+        driver: String = "virtio-blk-pci",
+        deviceId: String,
+        driveId: String,
+        bus: String? = nil
+    ) async throws {
+        var arguments: [String: Any] = [
+            "driver": driver,
+            "id": deviceId,
+            "drive": driveId
+        ]
+        if let bus = bus {
+            arguments["bus"] = bus
+        }
+        _ = try await execute(.deviceAdd, arguments: arguments)
+    }
+
+    /// Remove a device and wait for DEVICE_DELETED event
+    /// - Parameters:
+    ///   - deviceId: The device ID to remove
+    ///   - timeout: Timeout in seconds for waiting on DEVICE_DELETED event
+    public func deviceDel(deviceId: String, timeout: TimeInterval = 5) async throws {
+        _ = try await execute(.deviceDel, arguments: ["id": deviceId])
+        try await handler?.waitForDeviceDeleted(deviceId: deviceId, timeout: timeout)
+    }
+
+    /// Query attached block devices
+    public func queryBlock() async throws -> [[String: Any]] {
+        guard let result = try await execute(.queryBlock) as? [[String: Any]] else {
+            return []
+        }
+        return result
+    }
+
     // MARK: - Private Methods
     
     private func negotiateCapabilities() async throws {
@@ -217,6 +283,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     
     private var greetingContinuation: CheckedContinuation<Void, Error>?
     private var pendingRequests: [CheckedContinuation<QMPResponse?, Error>] = []
+    private var deviceDeletedContinuations: [String: CheckedContinuation<Void, Error>] = [:]
     private var buffer = ByteBuffer()
     
     init(logger: Logger) {
@@ -235,13 +302,19 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     
     func channelInactive(context: ChannelHandlerContext) {
         logger.debug("QMP channel became inactive")
-        
+
         // Cancel pending operations
         for continuation in pendingRequests {
             continuation.resume(throwing: QMPError.connectionLost)
         }
         pendingRequests.removeAll()
-        
+
+        // Cancel device deletion waiters
+        for (_, continuation) in deviceDeletedContinuations {
+            continuation.resume(throwing: QMPError.connectionLost)
+        }
+        deviceDeletedContinuations.removeAll()
+
         greetingContinuation?.resume(throwing: QMPError.connectionLost)
         greetingContinuation = nil
     }
@@ -256,7 +329,23 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
             self.greetingContinuation = continuation
         }
     }
-    
+
+    func waitForDeviceDeleted(deviceId: String, timeout: TimeInterval) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await withCheckedThrowingContinuation { continuation in
+                    self.deviceDeletedContinuations[deviceId] = continuation
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                throw QMPError.timeout
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
     func sendRequest(_ request: QMPRequest) async throws -> QMPResponse? {
         guard let channel = channel else {
             throw QMPError.notConnected
@@ -316,7 +405,14 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         // Try to decode as event
         if let event = try? decoder.decode(QMPEvent.self, from: data) {
             logger.debug("Received QMP event", metadata: ["event": .string(event.event)])
-            // Events are logged but not handled in this simple implementation
+
+            // Handle DEVICE_DELETED event
+            if event.event == "DEVICE_DELETED",
+               let eventData = event.data?.value as? [String: Any],
+               let device = eventData["device"] as? String,
+               let continuation = deviceDeletedContinuations.removeValue(forKey: device) {
+                continuation.resume()
+            }
             return
         }
 

@@ -72,7 +72,14 @@ public enum QMPCommand {
     case queryVersion
     case queryMachines
     case queryKVM
-    
+
+    // Block device hot-plug commands
+    case blockdevAdd
+    case blockdevDel
+    case deviceAdd
+    case deviceDel
+    case queryBlock
+
     public var name: String {
         switch self {
         case .capabilities: return "qmp_capabilities"
@@ -85,6 +92,11 @@ public enum QMPCommand {
         case .queryVersion: return "query-version"
         case .queryMachines: return "query-machines"
         case .queryKVM: return "query-kvm"
+        case .blockdevAdd: return "blockdev-add"
+        case .blockdevDel: return "blockdev-del"
+        case .deviceAdd: return "device_add"
+        case .deviceDel: return "device_del"
+        case .queryBlock: return "query-block"
         }
     }
 }

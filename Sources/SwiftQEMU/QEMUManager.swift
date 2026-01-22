@@ -201,7 +201,7 @@ public actor QEMUManager {
     private func updateStatus() async {
         do {
             let qmpStatus = try await qmpClient.queryStatus()
-            
+
             switch qmpStatus.status.lowercased() {
             case "running":
                 status = qmpStatus.running ? .running : .paused
@@ -219,6 +219,69 @@ public actor QEMUManager {
             logger.error("Failed to query VM status: \(error)")
             status = .unknown
         }
+    }
+
+    // MARK: - Disk Hot-Plug Operations
+
+    /// Attach a disk to a running VM
+    /// - Parameters:
+    ///   - path: Path to the qcow2 disk image
+    ///   - deviceName: Name for the device (e.g., "vdb")
+    ///   - readOnly: Whether the disk should be read-only
+    public func attachDisk(path: String, deviceName: String, readOnly: Bool = false) async throws {
+        guard isConnected else {
+            throw QMPError.notConnected
+        }
+
+        let nodeName = "drive-\(deviceName)"
+
+        logger.info("Attaching disk", metadata: [
+            "path": .string(path),
+            "deviceName": .string(deviceName),
+            "readOnly": .stringConvertible(readOnly)
+        ])
+
+        // Step 1: Add block device backend
+        try await qmpClient.blockdevAdd(nodeName: nodeName, filename: path, readOnly: readOnly)
+
+        // Step 2: Add virtio-blk frontend
+        do {
+            try await qmpClient.deviceAdd(deviceId: deviceName, driveId: nodeName)
+        } catch {
+            // Rollback: remove the block device if frontend fails
+            try? await qmpClient.blockdevDel(nodeName: nodeName)
+            throw error
+        }
+
+        logger.info("Disk attached successfully", metadata: ["deviceName": .string(deviceName)])
+    }
+
+    /// Detach a disk from a running VM
+    /// - Parameter deviceName: The device name to detach (e.g., "vdb")
+    public func detachDisk(deviceName: String) async throws {
+        guard isConnected else {
+            throw QMPError.notConnected
+        }
+
+        let nodeName = "drive-\(deviceName)"
+
+        logger.info("Detaching disk", metadata: ["deviceName": .string(deviceName)])
+
+        // Step 1: Remove the device frontend (waits for DEVICE_DELETED event)
+        try await qmpClient.deviceDel(deviceId: deviceName)
+
+        // Step 2: Remove the block device backend
+        try await qmpClient.blockdevDel(nodeName: nodeName)
+
+        logger.info("Disk detached successfully", metadata: ["deviceName": .string(deviceName)])
+    }
+
+    /// List attached block devices
+    public func listDisks() async throws -> [[String: Any]] {
+        guard isConnected else {
+            throw QMPError.notConnected
+        }
+        return try await qmpClient.queryBlock()
     }
 }
 
