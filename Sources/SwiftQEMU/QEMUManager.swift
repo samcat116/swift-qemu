@@ -277,7 +277,7 @@ public actor QEMUManager {
     }
 
     /// List attached block devices
-    public func listDisks() async throws -> [[String: Any]] {
+    public func listDisks() async throws -> [AnyCodable] {
         guard isConnected else {
             throw QMPError.notConnected
         }

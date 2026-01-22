@@ -238,11 +238,11 @@ public final class QMPClient: @unchecked Sendable {
     }
 
     /// Query attached block devices
-    public func queryBlock() async throws -> [[String: Any]] {
-        guard let result = try await execute(.queryBlock) as? [[String: Any]] else {
+    public func queryBlock() async throws -> [AnyCodable] {
+        guard let result = try await execute(.queryBlock) as? [Any] else {
             return []
         }
-        return result
+        return result.map { AnyCodable($0) }
     }
 
     // MARK: - Private Methods
