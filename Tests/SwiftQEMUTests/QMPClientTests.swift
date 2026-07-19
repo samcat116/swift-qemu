@@ -205,6 +205,54 @@ final class QMPClientTests: XCTestCase {
         try await client.disconnect()
     }
 
+    /// A zero timeout must fail immediately, not never.
+    ///
+    /// When the deadline raced the parking task, a deadline that reached its
+    /// callback first found no waiter to fail; the operation then parked on a
+    /// continuation nobody would resume and the wait hung — a timeout that
+    /// hangs. A zero (or near-zero) budget makes that ordering the likely one.
+    func testZeroTimeoutFailsImmediatelyRatherThanHanging() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        do {
+            try await client.deviceDel(deviceId: "vdb", timeout: 0)
+            XCTFail("Expected a zero timeout to fail")
+        } catch let error as QMPError {
+            guard case .timeout = error else {
+                return XCTFail("Expected .timeout, got \(error)")
+            }
+        }
+
+        try await client.disconnect()
+    }
+
+    /// The same ordering hazard at small-but-nonzero budgets, repeated so a
+    /// deadline that fires before the waiter parks is likely to be hit.
+    func testTinyTimeoutsNeverStrandTheWaiter() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        for _ in 0..<25 {
+            do {
+                try await client.deviceDel(deviceId: "vdb", timeout: 0.001)
+                XCTFail("Expected the wait to time out")
+            } catch let error as QMPError {
+                guard case .timeout = error else {
+                    return XCTFail("Expected .timeout, got \(error)")
+                }
+            }
+        }
+
+        try await client.disconnect()
+    }
+
     /// A normal command round-trip still works, and the response is correlated
     /// back by id.
     func testCommandRoundTrip() async throws {

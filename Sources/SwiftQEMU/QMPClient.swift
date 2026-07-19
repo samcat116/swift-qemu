@@ -313,55 +313,6 @@ public final class QMPClient: @unchecked Sendable {
     }
 }
 
-// MARK: - Timeout helper
-
-/// Outcome of racing an operation against a deadline. A dedicated case (rather
-/// than an optional) keeps "the operation returned nil" distinguishable from
-/// "the deadline won".
-private enum QMPTimeoutRace<T: Sendable>: Sendable {
-    case value(T)
-    case timedOut
-}
-
-/// Run `operation` under a deadline.
-///
-/// On expiry `unpark` is invoked *before* the group drains. That ordering is
-/// load-bearing: `operation` is parked on a `CheckedContinuation`, and a task
-/// group awaits all of its children before returning. Cancelling a parked
-/// continuation does not resume it, so without `unpark` handing it an error the
-/// group would wait on it forever — a "timeout" that hangs, which is precisely
-/// the bug this replaces.
-private func withQMPTimeout<T: Sendable>(
-    seconds: TimeInterval,
-    unpark: @escaping @Sendable () -> Void,
-    operation: @escaping @Sendable () async throws -> T
-) async throws -> T {
-    try await withThrowingTaskGroup(of: QMPTimeoutRace<T>.self) { group in
-        group.addTask { .value(try await operation()) }
-        group.addTask {
-            do {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            } catch {
-                // Cancelled because the operation already won; leave its
-                // continuation alone.
-                return .timedOut
-            }
-            unpark()
-            return .timedOut
-        }
-
-        while let outcome = try await group.next() {
-            if case .value(let value) = outcome {
-                group.cancelAll()
-                return value
-            }
-            // The deadline won. `unpark` has since failed the operation's
-            // continuation, so the next `next()` rethrows that error.
-        }
-        throw QMPError.timeout
-    }
-}
-
 // MARK: - QMP Channel Handler
 
 private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendable {
@@ -454,25 +405,24 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 
     func waitForGreeting(timeout: TimeInterval) async throws {
-        try await withQMPTimeout(seconds: timeout, unpark: { [weak self] in
-            self?.timeOutGreeting()
-        }) { [self] in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                lock.lock()
-                switch greeting {
-                case .satisfied:
-                    // The greeting landed before we got here. Latching it is
-                    // what keeps this from parking forever.
-                    lock.unlock()
-                    continuation.resume()
-                case .failed(let error):
-                    lock.unlock()
-                    continuation.resume(throwing: error)
-                case .pending:
-                    greetingContinuation = continuation
-                    lock.unlock()
-                }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            switch greeting {
+            case .satisfied:
+                // The greeting landed before we got here. Latching it is
+                // what keeps this from parking forever.
+                lock.unlock()
+                continuation.resume()
+                return
+            case .failed(let error):
+                lock.unlock()
+                continuation.resume(throwing: error)
+                return
+            case .pending:
+                greetingContinuation = continuation
+                lock.unlock()
             }
+            armDeadline(timeout) { [weak self] in self?.timeOutGreeting() }
         }
     }
 
@@ -485,19 +435,16 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 
     func waitForDeviceDeleted(deviceId: String, timeout: TimeInterval) async throws {
-        try await withQMPTimeout(seconds: timeout, unpark: { [weak self] in
-            self?.timeOutDeviceDeleted(deviceId: deviceId)
-        }) { [self] in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                lock.lock()
-                if let closeError {
-                    lock.unlock()
-                    continuation.resume(throwing: closeError)
-                    return
-                }
-                deviceDeletedContinuations[deviceId] = continuation
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            lock.lock()
+            if let closeError {
                 lock.unlock()
+                continuation.resume(throwing: closeError)
+                return
             }
+            deviceDeletedContinuations[deviceId] = continuation
+            lock.unlock()
+            armDeadline(timeout) { [weak self] in self?.timeOutDeviceDeleted(deviceId: deviceId) }
         }
     }
 
@@ -536,20 +483,46 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         buffer.writeString("\n")
         let outbound = buffer
 
-        return try await withQMPTimeout(seconds: timeout, unpark: { [weak self] in
-            self?.timeOutRequest(id: id)
-        }) { [self] in
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
-                lock.lock()
-                if let closeError {
-                    lock.unlock()
-                    continuation.resume(throwing: closeError)
-                    return
-                }
-                pendingRequests.append((id: id, continuation: continuation))
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
+            lock.lock()
+            if let closeError {
                 lock.unlock()
-                channel.writeAndFlush(outbound, promise: nil)
+                continuation.resume(throwing: closeError)
+                return
             }
+            pendingRequests.append((id: id, continuation: continuation))
+            lock.unlock()
+            channel.writeAndFlush(outbound, promise: nil)
+            armDeadline(timeout) { [weak self] in self?.timeOutRequest(id: id) }
+        }
+    }
+
+    /// Start the deadline for a waiter that is *already installed*.
+    ///
+    /// Ordering is the whole point. Racing the deadline against the parking
+    /// task in a group let the deadline fire first, in which case it found no
+    /// waiter to fail, and the task then parked on a continuation nobody would
+    /// ever resume — a timeout that hangs, the exact failure this file exists
+    /// to remove. Arming only after installation makes that unrepresentable:
+    /// the deadline either finds the waiter or finds it already resolved.
+    ///
+    /// A non-positive timeout expires immediately rather than never.
+    private func armDeadline(_ seconds: TimeInterval, _ expire: @escaping @Sendable () -> Void) {
+        guard seconds > 0 else {
+            expire()
+            return
+        }
+        // Detached so it cannot inherit cancellation from the caller: a
+        // cancelled deadline that skipped `expire` would strand the waiter.
+        Task.detached {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            } catch {
+                return
+            }
+            // A no-op once the waiter resolved normally: every timeOut* helper
+            // removes by key under the lock, so it fails only a live waiter.
+            expire()
         }
     }
 
