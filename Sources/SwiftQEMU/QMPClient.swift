@@ -604,15 +604,31 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         if let response = try? decoder.decode(QMPResponse.self, from: data) {
             lock.lock()
             var waiter: CheckedContinuation<QMPResponse?, Error>?
-            if let id = response.id?.value as? String,
-               let index = pendingRequests.firstIndex(where: { $0.id == id }) {
-                waiter = pendingRequests.remove(at: index).continuation
+            var unmatchedID: String?
+            if let id = response.id?.value as? String {
+                // Tagged: match strictly, and drop it if nothing matches. A
+                // tagged response with no waiter is a late reply to a request
+                // that already timed out — QEMU still answers those. Falling
+                // back to FIFO here would hand it to whichever request is
+                // pending *now*, which is precisely the response-shift
+                // corruption id correlation exists to prevent.
+                if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
+                    waiter = pendingRequests.remove(at: index).continuation
+                } else {
+                    unmatchedID = id
+                }
             } else if !pendingRequests.isEmpty {
-                // No usable id (older QEMU, or a response we didn't tag):
-                // fall back to submission order.
+                // Untagged (an older QEMU that does not echo `id`): submission
+                // order is the only correlation available.
                 waiter = pendingRequests.removeFirst().continuation
             }
             lock.unlock()
+
+            if let unmatchedID {
+                logger.debug(
+                    "Discarding QMP response with no matching request",
+                    metadata: ["id": .string(unmatchedID)])
+            }
             waiter?.resume(returning: response)
             return
         }

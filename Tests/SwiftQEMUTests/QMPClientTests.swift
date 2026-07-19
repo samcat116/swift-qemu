@@ -25,6 +25,10 @@ final class QMPClientTests: XCTestCase {
         case silent
         /// Greet and negotiate normally, but never emit DEVICE_DELETED.
         case greetButSwallowDeviceDeleted
+        /// Greet and negotiate normally, then answer subsequent commands with
+        /// an id belonging to no outstanding request. Models QEMU finally
+        /// replying to a request that already timed out.
+        case greetThenReplyWithStaleID
     }
 
     private static let greeting = #"{"QMP": {"version": {"qemu": {"major": 8, "minor": 0, "micro": 0}, "package": ""}, "capabilities": []}}"#
@@ -54,6 +58,7 @@ final class QMPClientTests: XCTestCase {
 
             private let behaviour: ServerBehaviour
             private var buffer = ByteBuffer()
+            private var negotiated = false
 
             init(behaviour: ServerBehaviour) {
                 self.behaviour = behaviour
@@ -73,7 +78,16 @@ final class QMPClientTests: XCTestCase {
                 // Echo back a success response per newline-delimited request,
                 // preserving the request's `id` the way QEMU does.
                 while let line = readLine(&buffer) {
-                    let id = Self.extractID(from: line)
+                    var id = Self.extractID(from: line)
+                    if behaviour == .greetThenReplyWithStaleID {
+                        // Negotiation must still succeed, so only corrupt the
+                        // id on commands issued after qmp_capabilities.
+                        if line.contains("qmp_capabilities") {
+                            negotiated = true
+                        } else if negotiated {
+                            id = "stale-id-for-a-request-that-timed-out"
+                        }
+                    }
                     let idField = id.map { ", \"id\": \"\($0)\"" } ?? ""
                     write("{\"return\": {}\(idField)}", context: context)
                 }
@@ -162,6 +176,33 @@ final class QMPClientTests: XCTestCase {
                 return XCTFail("Expected .timeout, got \(error)")
             }
         }
+    }
+
+    /// A response whose id matches no outstanding request must be discarded,
+    /// not handed to whichever request happens to be pending. QEMU still
+    /// answers requests that already timed out, and resuming a *different*
+    /// caller with that stale payload is the response-shift corruption that id
+    /// correlation exists to prevent.
+    func testResponseWithUnmatchedIDIsDiscardedRatherThanShifted() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetThenReplyWithStaleID)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 0.4, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        // The server answers, but under an id nobody is waiting on. The correct
+        // outcome is that this command times out — never that it silently
+        // adopts a reply meant for someone else.
+        do {
+            _ = try await client.execute(.cont)
+            XCTFail("Expected the command to time out rather than accept a mismatched response")
+        } catch let error as QMPError {
+            guard case .timeout = error else {
+                return XCTFail("Expected .timeout, got \(error)")
+            }
+        }
+
+        try await client.disconnect()
     }
 
     /// A normal command round-trip still works, and the response is correlated
