@@ -1,0 +1,21 @@
+Sources/SwiftQEMU/QMPClient.swift
+  s_0b0c2b9bd67cb5::t_2f1ece5adc7cde 607-619,621-622,626-631
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_0b0c2b9bd67cb5::t_14b1692791cd5c 28-31,61,81-90,181-207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "d038ec4b9b8112094d3b3405ea677669c2c13423",
+  "prompts": {},
+  "sessions": {
+    "s_0b0c2b9bd67cb5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d0567f44-f1ed-44e8-8ae6-5647dcc96e6a",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
