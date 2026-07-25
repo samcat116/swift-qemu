@@ -36,9 +36,11 @@ swift test --filter QMPProtocolTests
 - Manages the QEMU process lifecycle using Foundation's Process API
 - Builds QEMU command-line arguments from QEMUConfiguration
 - Handles QMP Unix socket creation and readiness with retry logic (up to 10 seconds)
-- **Critical fix**: Redirects stdout/stderr to prevent pipe buffer overflow crashes
-  - If `ENABLE_QEMU_PROCESS_LOG_FILES=true` (or `yes`, `1`): outputs to `/tmp/qemu-*.log`
+- **Critical fix**: Redirects stdout to prevent pipe buffer overflow crashes
+  - If `ENABLE_QEMU_PROCESS_LOG_FILES=true` (or `yes`, `1`): stdout goes to `/tmp/qemu-*.log`
   - Otherwise: redirects to `/dev/null` (default behavior)
+- **Captures stderr** into a bounded tail buffer (last 16KB) via an actively drained pipe, exposed as `capturedStderr` and attached to errors. Also teed to the log file when log files are enabled.
+- Detects early process exit during the socket wait and throws `QMPError.processExited(exitCode:killedBySignal:stderr:)` immediately
 
 **QMPClient** (Sources/SwiftQEMU/QMPClient.swift)
 - Implements QMP protocol communication using SwiftNIO
@@ -56,10 +58,10 @@ swift test --filter QMPProtocolTests
 
 The codebase includes critical fixes for production reliability:
 
-1. **Pipe Buffer Overflow Prevention**: QEMU stdout/stderr are redirected away from pipes to prevent crashes when buffers fill up. The original implementation used `Pipe()` objects but never read from them, causing QEMU to crash with `NIOCore.IOError` when the 64KB buffer filled. Current behavior:
+1. **Pipe Buffer Overflow Prevention**: QEMU stdout is redirected away from pipes to prevent crashes when buffers fill up. The original implementation used `Pipe()` objects but never read from them, causing QEMU to crash with `NIOCore.IOError` when the 64KB buffer filled. Current behavior:
    - Set `ENABLE_QEMU_PROCESS_LOG_FILES=true` to capture output in `/tmp/qemu-*.log` files
-   - Default behavior (when env var not set): redirects to `/dev/null`
-   - **Never** redirects to Pipe() objects without active reading
+   - Default behavior (when env var not set): stdout redirects to `/dev/null`
+   - stderr uses a `Pipe()` that **is** continuously drained by a `readabilityHandler` into `StderrCapture` (bounded to the last 16KB). A pipe is only ever safe with an active reader — **never** attach one without draining it.
 
 2. **QMP Connection Retry Logic**:
    - QEMUProcess waits up to 10 seconds (20 retries × 0.5s) for QMP socket file creation
@@ -73,6 +75,12 @@ The codebase includes critical fixes for production reliability:
    - State is properly reset (`isConnected = false`, `status = .stopped`)
    - Throws `QMPError.timeout` on timeout
    - Prevents orphaned QEMU processes on connection failures
+   - Logs QEMU's stderr (`qemuStderr` metadata) on every failure, before the process is torn down
+
+5. **Startup Failure Diagnosis**: QEMU reports a bad argument or a missing disk image by printing to stderr and exiting. With stderr discarded that surfaced only as a QMP connect timeout, naming nothing. Now:
+   - The socket wait polls process liveness and bails out as soon as QEMU exits, instead of waiting out the full 10 seconds
+   - `QMPError.processExited(exitCode:killedBySignal:stderr:)` carries the stderr tail, and its `errorDescription` includes the last 10 lines — so the thrown error alone names the cause
+   - `QEMUProcess.capturedStderr` stays readable after `stop()` for post-mortem reporting
 
 ### Configuration Types
 
@@ -103,8 +111,9 @@ The codebase includes critical fixes for production reliability:
 
 **ENABLE_QEMU_PROCESS_LOG_FILES**: Controls QEMU process output handling
 - Set to `true`, `yes`, or `1` to capture output in `/tmp/qemu-*.log` files
-- When unset or any other value: redirects output to `/dev/null`
+- When unset or any other value: redirects stdout to `/dev/null`
 - Usage: `ENABLE_QEMU_PROCESS_LOG_FILES=true swift run`
+- Does **not** affect stderr capture — stderr is always captured in memory and reported on failure, regardless of this variable
 
 ### Testing with Real QEMU
 
@@ -154,7 +163,8 @@ try await manager.shutdown()
 All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - notConnected, connectionLost
 - processNotRunning, processAlreadyRunning
-- socketCreationFailed (QMP socket not created within timeout)
+- socketCreationFailed (QMP socket not created within timeout, process still alive)
+- processExited(exitCode:killedBySignal:stderr:) (QEMU died before the socket was ready; carries its stderr)
 - timeout (createVM operation exceeded timeout)
 - invalidResponse, invalidConfiguration
 - qmpError(class, description) for QMP-specific errors

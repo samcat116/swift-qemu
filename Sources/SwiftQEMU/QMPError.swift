@@ -11,7 +11,10 @@ public enum QMPError: Error, LocalizedError {
     case invalidConfiguration
     case socketCreationFailed
     case timeout
-    
+    /// QEMU exited before the QMP socket was ready, carrying its stderr so the cause
+    /// (a rejected argument, a missing disk image) is in the error itself.
+    case processExited(exitCode: Int32, killedBySignal: Bool, stderr: String)
+
     public var errorDescription: String? {
         switch self {
         case .notConnected:
@@ -32,6 +35,22 @@ public enum QMPError: Error, LocalizedError {
             return "Failed to create QMP socket"
         case .timeout:
             return "Operation timed out"
+        case .processExited(let exitCode, let killedBySignal, let stderr):
+            let cause = killedBySignal ? "was killed by signal \(exitCode)" : "exited with code \(exitCode)"
+            let detail = QMPError.lastLines(of: stderr)
+            guard !detail.isEmpty else {
+                return "QEMU \(cause) before the QMP socket was ready (no stderr output)"
+            }
+            return "QEMU \(cause) before the QMP socket was ready: \(detail)"
         }
+    }
+
+    /// Keep error messages to the tail of stderr, which is where QEMU puts the reason
+    /// it gave up.
+    private static func lastLines(of stderr: String, count: Int = 10) -> String {
+        let lines = stderr
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        return lines.suffix(count).joined(separator: "\n")
     }
 }
