@@ -69,8 +69,13 @@ public actor QEMUManager {
             logger.info("QEMU VM created successfully")
 
         } catch {
-            // Cleanup on any failure
-            logger.error("Failed to create QEMU VM: \(error)")
+            // Cleanup on any failure. Read stderr before stopping the process — on a
+            // timeout QEMU is still alive, and its output is usually the only thing
+            // that explains why the socket never showed up.
+            let stderr = process.capturedStderr
+            logger.error("Failed to create QEMU VM: \(error)", metadata: [
+                "qemuStderr": .string(stderr.isEmpty ? "<empty>" : stderr)
+            ])
 
             // Reset state
             isConnected = false
