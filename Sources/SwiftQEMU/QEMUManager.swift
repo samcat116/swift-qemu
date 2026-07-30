@@ -134,61 +134,77 @@ public actor QEMUManager {
     }
     
     /// Shutdown the VM gracefully
-    public func shutdown() async throws {
+    /// - Parameter timeout: How long to wait for the guest to power itself off
+    ///   before termination is forced (default: 30 seconds)
+    public func shutdown(timeout: TimeInterval = 30) async throws {
         guard isConnected else {
             throw QMPError.notConnected
         }
-        
+
         logger.info("Shutting down VM")
-        
+
         try await qmpClient.systemPowerdown()
         status = .shuttingDown
-        
+
         // Wait for shutdown with timeout
-        // Wait for shutdown with timeout
-        try await withThrowingTaskGroup(of: Void.self) { group in
+        await withTaskGroup(of: Void.self) { group in
             group.addTask {
-                try await Task.sleep(nanoseconds: 30_000_000_000) // 30 seconds
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             }
-            
+
             group.addTask {
-                try await self.process.waitUntilExit()
+                // A process that has already gone is a completed shutdown, not
+                // an error worth failing the whole call over.
+                try? await self.process.waitUntilExit()
             }
-            
-            // Wait for first task to complete (either timeout or shutdown)
-            _ = try await group.next()
+
+            // Whichever finishes first ends the wait; cancelling the other is
+            // now enough to make it return, so leaving this scope cannot block.
+            await group.next()
             group.cancelAll()
         }
-        
+
         if process.isRunning {
             logger.warning("VM did not shut down gracefully, forcing termination")
             try await destroy()
         } else {
+            // The socket is dead either way; drop the connection so the client
+            // is not left believing it has one.
+            try? await qmpClient.disconnect()
             status = .stopped
             isConnected = false
         }
-        
+
         logger.info("VM shutdown complete")
     }
-    
+
     /// Force quit the VM
     public func destroy() async throws {
         logger.info("Destroying VM")
-        
+
         if isConnected {
             do {
                 try await qmpClient.quit()
             } catch {
                 logger.debug("QMP quit failed, process may already be terminating")
             }
-            
-            try await qmpClient.disconnect()
+
+            // Teardown must not be able to skip process termination. QEMU exits
+            // in response to `quit`, which closes the channel from its end, and
+            // letting that surface as a thrown error meant `process.stop()` below
+            // never ran — leaving exactly the orphaned QEMU this method exists to
+            // clean up.
+            do {
+                try await qmpClient.disconnect()
+            } catch {
+                logger.debug("QMP disconnect reported \(error) while tearing down")
+            }
             isConnected = false
         }
-        
+
         process.stop()
         status = .stopped
-        
+
         logger.info("VM destroyed")
     }
     
@@ -282,7 +298,7 @@ public actor QEMUManager {
     }
 
     /// List attached block devices
-    public func listDisks() async throws -> [AnyCodable] {
+    public func listDisks() async throws -> [JSONValue] {
         guard isConnected else {
             throw QMPError.notConnected
         }

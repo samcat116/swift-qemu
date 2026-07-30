@@ -23,10 +23,12 @@ public struct QMPGreeting: Codable, Sendable {
 /// QMP request structure
 public struct QMPRequest: Codable, Sendable {
     public let execute: String
-    public let arguments: [String: AnyCodable]?
-    public let id: AnyCodable?
-    
-    public init(execute: String, arguments: [String: AnyCodable]? = nil, id: AnyCodable? = nil) {
+    public let arguments: [String: JSONValue]?
+    /// Correlation token echoed back by QEMU. Always a string here; the client
+    /// generates it so responses can be matched to their request.
+    public let id: String?
+
+    public init(execute: String, arguments: [String: JSONValue]? = nil, id: String? = nil) {
         self.execute = execute
         self.arguments = arguments
         self.id = id
@@ -34,34 +36,114 @@ public struct QMPRequest: Codable, Sendable {
 }
 
 /// QMP response structure
+///
+/// Decoded only via ``QMPMessage``, which is what guarantees at least one of
+/// `return`/`error` is present. Decoding this type directly accepts any JSON
+/// object, because every property is optional.
 public struct QMPResponse: Codable, Sendable {
-    public let `return`: AnyCodable?
+    public let `return`: JSONValue?
     public let error: QMPErrorResponse?
-    public let id: AnyCodable?
+    /// Whatever QEMU echoed back, kept untyped so an unexpected id shape cannot
+    /// fail the decode of an otherwise usable response.
+    public let id: JSONValue?
+
+    public init(return: JSONValue? = nil, error: QMPErrorResponse? = nil, id: JSONValue? = nil) {
+        self.return = `return`
+        self.error = error
+        self.id = id
+    }
 }
 
 /// QMP error response
 public struct QMPErrorResponse: Codable, Sendable {
     public let `class`: String
     public let desc: String
+
+    public init(class: String, desc: String) {
+        self.class = `class`
+        self.desc = desc
+    }
 }
 
 /// QMP event structure
 public struct QMPEvent: Codable, Sendable {
     public let event: String
-    public let data: AnyCodable?
-    public let timestamp: QMPTimestamp
+    public let data: JSONValue?
+    /// Optional so a future or trimmed-down event still decodes. An event that
+    /// fails to decode is an event that goes undelivered, and `DEVICE_DELETED`
+    /// going undelivered is what makes a disk detach hang.
+    public let timestamp: QMPTimestamp?
+
+    public init(event: String, data: JSONValue? = nil, timestamp: QMPTimestamp? = nil) {
+        self.event = event
+        self.data = data
+        self.timestamp = timestamp
+    }
 }
 
 /// QMP timestamp
 public struct QMPTimestamp: Codable, Sendable {
     public let seconds: Int
     public let microseconds: Int
+
+    public init(seconds: Int, microseconds: Int) {
+        self.seconds = seconds
+        self.microseconds = microseconds
+    }
+}
+
+// MARK: - Inbound Message Discrimination
+
+/// One message read off the QMP socket, identified by which key it carries.
+///
+/// The three inbound shapes must be told apart by their discriminating key, not
+/// by trying each type in turn: every property of ``QMPResponse`` is optional, so
+/// a try-in-sequence decode accepts an *event* as an all-`nil` response. That
+/// silently swallowed every asynchronous event — `DEVICE_DELETED` never reached
+/// the waiter, so disk detach always timed out — and worse, an event arriving
+/// while a command was in flight was handed to that command as its reply. QEMU
+/// really does interleave the two: `cont` produces
+///
+///     {"timestamp": {...}, "event": "RESUME"}
+///     {"return": {}, "id": "..."}
+///
+/// so the reply a caller received depended on event timing.
+public enum QMPMessage: Sendable {
+    case greeting(QMPGreeting)
+    case response(QMPResponse)
+    case event(QMPEvent)
+}
+
+extension QMPMessage: Decodable {
+    private enum DiscriminatingKey: String, CodingKey {
+        case QMP
+        case event
+        case `return`
+        case error
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: DiscriminatingKey.self)
+
+        if container.contains(.QMP) {
+            self = .greeting(try QMPGreeting(from: decoder))
+        } else if container.contains(.event) {
+            self = .event(try QMPEvent(from: decoder))
+        } else if container.contains(.return) || container.contains(.error) {
+            self = .response(try QMPResponse(from: decoder))
+        } else {
+            throw DecodingError.dataCorruptedError(
+                forKey: DiscriminatingKey.return,
+                in: container,
+                debugDescription: "Message carries none of QMP, event, return or error"
+            )
+        }
+    }
 }
 
 // MARK: - QMP Commands
 
-public enum QMPCommand {
+public enum QMPCommand: Sendable {
     case capabilities
     case queryStatus
     case cont
@@ -105,70 +187,15 @@ public enum QMPCommand {
 
 public struct QMPStatusResponse: Codable, Sendable {
     public let status: String
-    public let singlestep: Bool
+    /// Absent on QEMU releases that dropped it from `query-status` (verified
+    /// missing on 11.0.2). Requiring it made every status query fail, which left
+    /// the manager reporting `.unknown` for a perfectly healthy VM.
+    public let singlestep: Bool?
     public let running: Bool
-}
 
-// MARK: - Type-erased Codable wrapper
-
-public struct AnyCodable: Codable, @unchecked Sendable {
-    public let value: Any
-    
-    public init(_ value: Any) {
-        self.value = value
-    }
-    
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        
-        if container.decodeNil() {
-            self.value = NSNull()
-        } else if let bool = try? container.decode(Bool.self) {
-            self.value = bool
-        } else if let int = try? container.decode(Int.self) {
-            self.value = int
-        } else if let double = try? container.decode(Double.self) {
-            self.value = double
-        } else if let string = try? container.decode(String.self) {
-            self.value = string
-        } else if let array = try? container.decode([AnyCodable].self) {
-            self.value = array.map { $0.value }
-        } else if let dictionary = try? container.decode([String: AnyCodable].self) {
-            self.value = dictionary.mapValues { $0.value }
-        } else {
-            throw DecodingError.dataCorruptedError(
-                in: container,
-                debugDescription: "Could not decode AnyCodable"
-            )
-        }
-    }
-    
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        
-        switch value {
-        case is NSNull:
-            try container.encodeNil()
-        case let bool as Bool:
-            try container.encode(bool)
-        case let int as Int:
-            try container.encode(int)
-        case let double as Double:
-            try container.encode(double)
-        case let string as String:
-            try container.encode(string)
-        case let array as [Any]:
-            try container.encode(array.map { AnyCodable($0) })
-        case let dictionary as [String: Any]:
-            try container.encode(dictionary.mapValues { AnyCodable($0) })
-        default:
-            throw EncodingError.invalidValue(
-                value,
-                EncodingError.Context(
-                    codingPath: encoder.codingPath,
-                    debugDescription: "Could not encode AnyCodable"
-                )
-            )
-        }
+    public init(status: String, singlestep: Bool? = nil, running: Bool) {
+        self.status = status
+        self.singlestep = singlestep
+        self.running = running
     }
 }
