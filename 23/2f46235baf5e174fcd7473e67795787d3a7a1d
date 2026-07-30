@@ -1,0 +1,65 @@
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_81bc9e44cb038f::t_8f532054e393ac 95-99
+  s_81bc9e44cb038f::t_3b6b79cbb0b226 318-453
+  s_81bc9e44cb038f::t_a58a98e9fe8c60 32-42,45-46
+  s_81bc9e44cb038f::t_4a867a003e5599 115-146
+  s_f65b135d9b9b85::t_7ba9d8c6ecfeaa 47
+Sources/SwiftQEMU/QMPProtocol.swift
+  s_81bc9e44cb038f::t_79d6d8508a86a6 26-31,39-42,44,46-54,61-65,71-81,88-141,146,190-193,196-199,201
+Sources/SwiftQEMU/QEMUManager.swift
+  s_81bc9e44cb038f::t_2339b6bc7eaea5 301
+  s_81bc9e44cb038f::t_c0ab225e2c3c2f 137-139,143,145,148,150,152,154,156-158,160-163,166,171-173,177,180,184,191-201,204,207
+Tests/SwiftQEMUTests/QEMUProcessTests.swift
+  s_81bc9e44cb038f::t_6d4ba54e45fef6 199-280
+  s_81bc9e44cb038f::t_39a2fe7fb792ad 188
+  s_81bc9e44cb038f::t_b7a972230076f4 28-41
+Sources/SwiftQEMU/JSONValue.swift
+  s_81bc9e44cb038f::t_b55b864d11ac5d 1-182
+CLAUDE.md
+  s_81bc9e44cb038f::t_01ac4019e1402b 111
+  s_81bc9e44cb038f::t_92309aaf298455 178,188,190-199
+  s_81bc9e44cb038f::t_72e4e5f0b42a51 51-52,57-62
+  s_81bc9e44cb038f::t_ab80e53d8b7365 92-110,112-114
+Sources/SwiftQEMU/QMPClient.swift
+  s_81bc9e44cb038f::t_b836aa52d63295 667
+  s_81bc9e44cb038f::t_afe7e88db99aa3 311-319,321-322
+  s_81bc9e44cb038f::t_a690482b9b8fe6 438-439
+  s_81bc9e44cb038f::t_7284cb8f959669 753-769,771
+  s_81bc9e44cb038f::t_678f14487867cb 674
+  s_81bc9e44cb038f::t_db125f7bdfda6c 502-532,535-542,544,549-551,555-556,559-560,564,566-568
+  s_81bc9e44cb038f::t_dc3903b1980493 8,25-37,55-59,73-75,104-129,137-141,144-145,148-155,157-163,167-175,184-190,196-197,199,201,209,219-220,226-227,264,266,269,271,279,294-297,300,310,326-327,332-334,337-338,340,345,361-363,401,407,409,445-446,458-461,479-486,584,593,670-672,678-683,688-710,712-726,728-731,733,735-741,743-748,752,770,772
+  s_81bc9e44cb038f::t_435d6147e3c815 552-554,558
+  s_81bc9e44cb038f::t_8baec522b62563 385-396
+  s_81bc9e44cb038f::t_09238b36214112 213-217
+Tests/SwiftQEMUTests/QMPProtocolTests.swift
+  s_81bc9e44cb038f::t_98ef67d56ee1f6 5-13,26-28,33-36,38-40,45,47,50-52,54-78,80-82,91,94-98,101-104,106,114,117-121,126-187,190-233,235
+Sources/SwiftQEMU/QEMUProcess.swift
+  s_81bc9e44cb038f::t_f339f20fd4d558 11
+  s_81bc9e44cb038f::t_ff7e294ef4e165 375-443
+  s_81bc9e44cb038f::t_e4ac09c12f9ece 114-119
+  s_81bc9e44cb038f::t_9bbb9504e43aee 197-208,210,213-219,221-225,227-228,230-231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "232f46235baf5e174fcd7473e67795787d3a7a1d",
+  "prompts": {},
+  "sessions": {
+    "s_81bc9e44cb038f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b034d906-e6ec-4a0b-8f09-9a4a6842b265",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    },
+    "s_f65b135d9b9b85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d20059d8-84b0-427f-a6e0-9cb58fbae441",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
