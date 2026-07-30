@@ -17,10 +17,18 @@ public final class QMPClient: Sendable {
     /// bounds.
     public static let defaultConnectTimeout: TimeInterval = 10
 
+    /// Default cap on a single inbound QMP frame, terminating newline included.
+    ///
+    /// 512 KB is far above any real QMP message — `query-block` on a VM with a
+    /// long device list is the largest realistic payload and runs to tens of KB
+    /// — while still bounding what an unterminated frame can cost.
+    public static let defaultMaximumFrameSize = 512 * 1024
+
     private let logger: Logger
     private let eventLoopGroup: EventLoopGroup
     private let requestTimeout: TimeInterval
     private let connectTimeout: TimeInterval
+    private let maximumFrameSize: Int
 
     /// Connection state.
     ///
@@ -39,11 +47,15 @@ public final class QMPClient: Sendable {
     public init(
         logger: Logger = Logger(label: "SwiftQEMU.QMPClient"),
         requestTimeout: TimeInterval = QMPClient.defaultRequestTimeout,
-        connectTimeout: TimeInterval = QMPClient.defaultConnectTimeout
+        connectTimeout: TimeInterval = QMPClient.defaultConnectTimeout,
+        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize
     ) {
         self.logger = logger
         self.requestTimeout = requestTimeout
         self.connectTimeout = connectTimeout
+        // A cap below one byte would reject the frame that is about to arrive
+        // whatever it is, so clamp rather than let a caller disable framing.
+        self.maximumFrameSize = max(1, maximumFrameSize)
         // The process-wide singleton group, not a private one. A per-client
         // group costs a dedicated OS thread per VM, and tearing it down in
         // `deinit` meant a blocking `syncShutdownGracefully()` on whatever
@@ -121,7 +133,7 @@ public final class QMPClient: Sendable {
         // has latched its greeting/close state and must not be reused for the
         // next connection.
         let state = self.state
-        let handler = QMPChannelHandler(logger: logger) {
+        let handler = QMPChannelHandler(logger: logger, maximumFrameSize: maximumFrameSize) {
             // The peer going away must clear the connected flag, so a later
             // command fails as not-connected rather than being written into a
             // dead channel and waiting out its timeout.
@@ -358,6 +370,10 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     private let logger: Logger
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    /// Largest inbound frame this connection will buffer, terminating newline
+    /// included. Frames are newline-delimited, so without a cap a peer that
+    /// never sends one grows `buffer` for as long as it keeps writing.
+    private let maximumFrameSize: Int
     /// Invoked once the connection is no longer usable, so the owning client can
     /// stop reporting itself as connected.
     private let onConnectionLost: @Sendable () -> Void
@@ -433,19 +449,39 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
 
     /// Event-loop-confined: only touched from `channelRead`.
     private var buffer = ByteBuffer()
+    /// Event-loop-confined, like `buffer`. Latched once framing has failed, so
+    /// bytes still in flight when the close was requested are dropped rather
+    /// than parsed on a connection we have already given up on.
+    private var hasFailedFraming = false
 
-    init(logger: Logger, onConnectionLost: @escaping @Sendable () -> Void = {}) {
+    init(
+        logger: Logger,
+        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize,
+        onConnectionLost: @escaping @Sendable () -> Void = {}
+    ) {
         self.logger = logger
+        self.maximumFrameSize = maximumFrameSize
         self.onConnectionLost = onConnectionLost
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !hasFailedFraming else { return }
+
         var input = self.unwrapInboundIn(data)
         buffer.writeBuffer(&input)
 
-        // Process complete JSON messages
-        while let message = extractJSONMessage() {
-            processMessage(message)
+        // Process complete JSON messages, and give up on the connection rather
+        // than buffer a frame that has grown past the cap.
+        drain: while true {
+            switch nextFrame() {
+            case .frame(let message):
+                processMessage(message)
+            case .incomplete:
+                break drain
+            case .overflow(let bytes):
+                failOversizedFrame(bytes: bytes, context: context)
+                return
+            }
         }
     }
 
@@ -867,21 +903,56 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         lock.unlock()
     }
 
-    private func extractJSONMessage() -> Data? {
+    private enum FrameExtraction {
+        case frame(Data)
+        /// No terminator yet, and what is buffered still fits the cap.
+        case incomplete
+        /// One frame is over the cap. The payload is what is buffered for it so
+        /// far, which for an unterminated frame is a lower bound.
+        case overflow(bytes: Int)
+    }
+
+    private func nextFrame() -> FrameExtraction {
         // Look for complete JSON objects ending with newline
         guard let newlineIndex = buffer.readableBytesView.firstIndex(of: UInt8(ascii: "\n")) else {
-            return nil
+            // Nothing here is a frame yet. It can still be over the cap: a peer
+            // that writes without ever terminating is exactly the case the cap
+            // exists for, and waiting for its newline is waiting forever.
+            return buffer.readableBytes > maximumFrameSize
+                ? .overflow(bytes: buffer.readableBytes)
+                : .incomplete
         }
 
         let messageLength = buffer.readableBytesView.startIndex.distance(to: newlineIndex) + 1
+        guard messageLength <= maximumFrameSize else {
+            return .overflow(bytes: messageLength)
+        }
         guard let slice = buffer.readSlice(length: messageLength) else {
-            return nil
+            return .incomplete
         }
         // Reclaim the space this message occupied instead of letting the read
         // region grow for the lifetime of the connection.
         buffer.discardReadBytes()
 
-        return Data(slice.readableBytesView.dropLast()) // Remove newline
+        return .frame(Data(slice.readableBytesView.dropLast())) // Remove newline
+    }
+
+    /// Drop a connection whose peer sent a frame larger than we will buffer.
+    ///
+    /// Failing the waiters *before* closing is what makes the cause visible:
+    /// `failAllWaiters` latches the first error, so the in-flight caller gets
+    /// `frameTooLarge` rather than the `connectionLost` that `channelInactive`
+    /// would otherwise latch a moment later.
+    private func failOversizedFrame(bytes: Int, context: ChannelHandlerContext) {
+        logger.error("QMP frame exceeded the maximum size; closing the connection", metadata: [
+            "bytes": .stringConvertible(bytes),
+            "limit": .stringConvertible(maximumFrameSize)
+        ])
+        hasFailedFraming = true
+        // Release it now rather than hold it for as long as the handler lives.
+        buffer.clear()
+        failAllWaiters(with: QMPError.frameTooLarge(limit: maximumFrameSize))
+        context.close(promise: nil)
     }
 
     private func processMessage(_ data: Data) {
