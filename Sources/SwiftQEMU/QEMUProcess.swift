@@ -701,6 +701,17 @@ public actor QEMUProcess {
             args.append(deviceOptions)
         }
         
+        // PCIe root ports for hot-plug. Root ports cannot themselves be
+        // hot-plugged, so if `attachDisk` is ever to work they have to be here, at
+        // launch. `chassis` is mandatory and must be unique — two ports without it
+        // take QEMU down at startup with `Can't add chassis slot, error -16` — and
+        // no `bus=` is given because the machine's own default PCIe root complex is
+        // the right parent on q35 and arm `virt` alike.
+        for (index, portID) in config.hotplugPortIDs.enumerated() {
+            args.append("-device")
+            args.append("pcie-root-port,id=\(portID),chassis=\(index + 1)")
+        }
+
         // Kernel and initrd if provided
         if let kernel = config.kernel {
             args.append("-kernel")
@@ -943,6 +954,40 @@ public enum QEMUAccelerator: String, Sendable, CaseIterable {
     }
 }
 
+/// How many `pcie-root-port` devices the launch arguments pre-create for disk
+/// hot-plug.
+///
+/// This exists because a q35 machine cannot hot-plug anything onto its default
+/// bus. `device_add` with no `bus` lands on `pcie.0`, which answers
+/// `Bus 'pcie.0' does not support hotplugging` — so `attachDisk` failed outright
+/// under the library's own default machine type. A PCIe root complex accepts
+/// hot-plug only through a root port, and a root port cannot itself be
+/// hot-plugged: it has to be on the command line before QEMU starts. The arm
+/// `virt` machine behaves identically; the older `pc` machine's `pci.0` accepts
+/// hot-plug directly and needs none of this. All three verified on QEMU 11.0.2.
+public enum QEMUHotplugPorts: Sendable, Equatable {
+    /// Pre-create `QEMUConfiguration.automaticHotplugPortCount` ports on machine
+    /// types that need them, and none on machine types that do not. The default.
+    ///
+    /// The gate is deliberately an allowlist: a root port is only valid where
+    /// there is a PCI bus to put it on, and on `microvm` — which has none — the
+    /// argument stops QEMU from starting at all.
+    case automatic
+    /// Pre-create exactly this many, whatever the machine type. A root port holds
+    /// exactly one device (a second `device_add` onto the same port is refused
+    /// with `slot 0 function 0 already occupied`), so this is also the number of
+    /// disks that can be hot-plugged at once.
+    case count(Int)
+    /// Pre-create none, leaving `device_add` to land on the machine's default bus.
+    /// Right for `pc`, and for a caller building its own topology through
+    /// `additionalArgs` — which is also the case that must not collide with the
+    /// chassis numbers used here.
+    ///
+    /// Deliberately not spelled `none`, which collides with `Optional.none` at
+    /// the use site.
+    case disabled
+}
+
 /// QEMU VM configuration
 public struct QEMUConfiguration: Sendable {
     public var machineType: String = "q35"
@@ -971,10 +1016,65 @@ public struct QEMUConfiguration: Sendable {
     public var startPaused: Bool = true
     public var additionalArgs: [String] = []
 
+    /// PCIe root ports pre-created for `QEMUManager.attachDisk` to plug into.
+    /// See `QEMUHotplugPorts` for why hot-plug on the default machine type needs
+    /// them at all.
+    public var hotplugPorts: QEMUHotplugPorts = .automatic
+
+    /// How many root ports `.automatic` provides, and so how many disks can be
+    /// hot-plugged at once without configuring anything.
+    public static let automaticHotplugPortCount = 4
+
+    /// Prefix for the generated port ids, namespaced so a caller's own devices in
+    /// `additionalArgs` cannot collide with them.
+    static let hotplugPortIDPrefix = "swiftqemu-hotplug"
+
     /// The CPU model actually passed to `-cpu`: `cpuType` when set, otherwise
     /// the accelerator's own default.
     public var resolvedCPUType: String {
         cpuType ?? accelerator.defaultCPUType
+    }
+
+    /// How many `pcie-root-port` devices this configuration actually emits.
+    public var resolvedHotplugPortCount: Int {
+        switch hotplugPorts {
+        case .disabled:
+            return 0
+        case .count(let count):
+            return max(0, count)
+        case .automatic:
+            return requiresHotplugPort ? QEMUConfiguration.automaticHotplugPortCount : 0
+        }
+    }
+
+    /// The ids of the emitted root ports, in the order `QEMUManager` hands them
+    /// out. Both the launch arguments and the manager's pool of free ports are
+    /// derived from this one list, so they cannot drift apart.
+    public var hotplugPortIDs: [String] {
+        (0..<resolvedHotplugPortCount).map { "\(QEMUConfiguration.hotplugPortIDPrefix)\($0)" }
+    }
+
+    /// Whether this configuration's machine type refuses hot-plug on its default
+    /// bus, and therefore needs a root port for `attachDisk` to target.
+    public var requiresHotplugPort: Bool {
+        QEMUConfiguration.machineRequiresHotplugPort(machineType)
+    }
+
+    /// Whether `machineType`'s default bus refuses hot-plug.
+    ///
+    /// True for the PCIe-root-complex machines — q35 (including its versioned
+    /// `pc-q35-*` names) and arm/riscv `virt` — whose `pcie.0` answers
+    /// `Bus 'pcie.0' does not support hotplugging`. False for everything else,
+    /// which is the safe direction to be wrong in: a machine wrongly listed here
+    /// gets a root port that may stop QEMU from starting, while one wrongly left
+    /// out just fails the eventual `attachDisk` with a message naming the cause.
+    public static func machineRequiresHotplugPort(_ machineType: String) -> Bool {
+        // Machine names carry options after a comma (`q35,accel=tcg`), and
+        // versions after a dash (`pc-q35-10.0`, `virt-9.2`).
+        let name = machineType.split(separator: ",").first.map(String.init) ?? machineType
+
+        return name == "q35" || name.hasPrefix("pc-q35")
+            || name == "virt" || name.hasPrefix("virt-")
     }
 
     /// Compatibility shim for the previous `Bool`.

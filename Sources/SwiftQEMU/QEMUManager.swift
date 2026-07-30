@@ -7,7 +7,16 @@ public actor QEMUManager {
     private let process: QEMUProcess
     private let qmpClient: QMPClient
     private var isConnected = false
-    
+
+    /// The configuration the running VM was started with. Hot-plug needs it after
+    /// the fact: which bus `device_add` may target is decided by the machine type
+    /// and the root ports that were put on the command line at launch.
+    private var configuration: QEMUConfiguration?
+
+    /// The pre-created PCIe root ports, and which device holds each one.
+    private var hotplugPorts = HotplugPortPool(portIDs: [])
+
+
     /// Current VM status
     public private(set) var status: QEMUVMStatus = .stopped
     
@@ -51,6 +60,8 @@ public actor QEMUManager {
 
         logger.info("Creating QEMU VM")
         status = .creating
+        configuration = config
+        hotplugPorts = HotplugPortPool(portIDs: config.hotplugPortIDs)
 
         do {
             // Wrap entire operation in a timeout
@@ -103,6 +114,7 @@ public actor QEMUManager {
             // Reset state
             isConnected = false
             status = .stopped
+            forgetHotplugState()
 
             // Clean up process if it was started. `stop()` waits for the child to
             // actually go, so what follows this cannot race a half-dead QEMU — and
@@ -205,6 +217,7 @@ public actor QEMUManager {
             await process.stop()
             status = .stopped
             isConnected = false
+            forgetHotplugState()
         }
 
         logger.info("VM shutdown complete")
@@ -254,6 +267,7 @@ public actor QEMUManager {
         }
 
         status = .stopped
+        forgetHotplugState()
 
         logger.info("VM destroyed")
     }
@@ -287,22 +301,45 @@ public actor QEMUManager {
 
     // MARK: - Disk Hot-Plug Operations
 
-    /// Attach a disk to a running VM
+    /// Attach a disk to a running VM.
+    ///
+    /// On a machine type whose default bus refuses hot-plug — q35, the library's
+    /// own default, and arm `virt` — the disk is plugged into one of the
+    /// `pcie-root-port` devices `QEMUConfiguration.hotplugPorts` put on the command
+    /// line at launch, and each port holds one disk. On `pc`, whose `pci.0` accepts
+    /// hot-plug directly, no bus is named and QEMU's default applies.
+    ///
     /// - Parameters:
     ///   - path: Path to the qcow2 disk image
     ///   - deviceName: Name for the device (e.g., "vdb")
     ///   - readOnly: Whether the disk should be read-only
-    public func attachDisk(path: String, deviceName: String, readOnly: Bool = false) async throws {
+    ///   - bus: The bus to plug into, for a caller that built its own PCI topology
+    ///     (through `additionalArgs`, say). Overrides the pre-created root ports
+    ///     and is passed to `device_add` verbatim; when `nil`, a free root port is
+    ///     used if there is one.
+    /// - Throws: `QMPError.noHotplugPortAvailable` when the machine type needs a
+    ///   root port and none is free — thrown before anything is sent to QEMU, so a
+    ///   full pool costs nothing but the error.
+    public func attachDisk(
+        path: String,
+        deviceName: String,
+        readOnly: Bool = false,
+        bus: String? = nil
+    ) async throws {
         guard isConnected else {
             throw QMPError.notConnected
         }
 
+        // Resolved before the backend is added: a rejected attach should not have to
+        // be rolled back when the topology already said it could not work.
+        let targetBus = try hotplugBus(explicit: bus)
         let nodeName = "drive-\(deviceName)"
 
         logger.info("Attaching disk", metadata: [
             "path": .string(path),
             "deviceName": .string(deviceName),
-            "readOnly": .stringConvertible(readOnly)
+            "readOnly": .stringConvertible(readOnly),
+            "bus": .string(targetBus ?? "<machine default>")
         ])
 
         // Step 1: Add block device backend
@@ -310,19 +347,37 @@ public actor QEMUManager {
 
         // Step 2: Add virtio-blk frontend
         do {
-            try await qmpClient.deviceAdd(deviceId: deviceName, driveId: nodeName)
+            try await qmpClient.deviceAdd(deviceId: deviceName, driveId: nodeName, bus: targetBus)
         } catch {
             // Rollback: remove the block device if frontend fails
             try? await qmpClient.blockdevDel(nodeName: nodeName)
-            throw error
+            throw hotplugFailure(error, bus: targetBus)
+        }
+
+        // Claimed only now: a port burned by a failed attach would be unusable for
+        // the life of the VM.
+        if let targetBus = targetBus {
+            hotplugPorts.claim(targetBus, for: deviceName)
         }
 
         logger.info("Disk attached successfully", metadata: ["deviceName": .string(deviceName)])
     }
 
-    /// Detach a disk from a running VM
-    /// - Parameter deviceName: The device name to detach (e.g., "vdb")
-    public func detachDisk(deviceName: String) async throws {
+    /// Detach a disk from a running VM.
+    ///
+    /// PCI hot-*unplug* needs the guest to cooperate: QEMU asks the guest to
+    /// release the device and only emits `DEVICE_DELETED` once it has. A VM with no
+    /// guest OS — or one whose guest ignores the request — never answers, and this
+    /// call times out with no device removed. That is QEMU's behaviour, not a
+    /// failure of this library: verified over a raw QMP socket that a guest-less VM
+    /// produces no `DEVICE_DELETED` at all.
+    ///
+    /// - Parameters:
+    ///   - deviceName: The device name to detach (e.g., "vdb")
+    ///   - timeout: How long to wait for `DEVICE_DELETED` before giving up
+    ///     (default: 5 seconds). A guest may take considerably longer than this to
+    ///     quiesce a disk that is in use.
+    public func detachDisk(deviceName: String, timeout: TimeInterval = 5) async throws {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -332,7 +387,11 @@ public actor QEMUManager {
         logger.info("Detaching disk", metadata: ["deviceName": .string(deviceName)])
 
         // Step 1: Remove the device frontend (waits for DEVICE_DELETED event)
-        try await qmpClient.deviceDel(deviceId: deviceName)
+        try await qmpClient.deviceDel(deviceId: deviceName, timeout: timeout)
+
+        // The root port is only free once the device is really gone, which is what
+        // `deviceDel` returning means.
+        hotplugPorts.release(deviceName)
 
         // Step 2: Remove the block device backend
         try await qmpClient.blockdevDel(nodeName: nodeName)
@@ -347,6 +406,116 @@ public actor QEMUManager {
         }
         return try await qmpClient.queryBlock()
     }
+
+    /// How many more disks can be hot-plugged before the root ports run out.
+    /// `nil` on a machine type that hot-plugs onto its default bus, where there is
+    /// no such limit to report.
+    public var availableHotplugPorts: Int? {
+        guard configuration?.requiresHotplugPort == true else { return nil }
+        return hotplugPorts.freeCount
+    }
+
+    // MARK: - Hot-Plug Topology
+
+    /// Which bus `device_add` should target, or `nil` for QEMU's default.
+    ///
+    /// The port is chosen but not claimed — see `attachDisk`.
+    private func hotplugBus(explicit: String?) throws -> String? {
+        // A caller who has built its own topology knows better than this does.
+        if let explicit = explicit { return explicit }
+
+        if let port = hotplugPorts.nextFreePort { return port }
+
+        // No ports, either because none were asked for or because they are all
+        // taken. That is only a problem where the default bus refuses hot-plug.
+        guard let config = configuration, config.requiresHotplugPort else { return nil }
+
+        throw QMPError.noHotplugPortAvailable(
+            machineType: config.machineType,
+            portCount: hotplugPorts.capacity,
+            inUse: hotplugPorts.inUseCount
+        )
+    }
+
+    /// Replace QEMU's own "does not support hotplugging" with an error that names
+    /// the fix. Anything else passes through untouched.
+    private func hotplugFailure(_ error: Error, bus: String?) -> Error {
+        guard case QMPError.qmpError(_, let description) = error,
+              description.lowercased().contains("does not support hotplug") else {
+            return error
+        }
+
+        // QEMU names the bus it actually tried, which is the useful one when we
+        // named none: `Bus 'pcie.0' does not support hotplugging`.
+        let reported = bus ?? QEMUManager.quotedName(in: description) ?? "the default bus"
+
+        return QMPError.hotplugNotSupported(
+            bus: reported,
+            machineType: configuration?.machineType ?? "unknown"
+        )
+    }
+
+    private static func quotedName(in description: String) -> String? {
+        let parts = description.split(separator: "'", omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return nil }
+        return String(parts[1])
+    }
+
+    /// Drop the topology of a VM that is no longer running, so a later `createVM`
+    /// cannot inherit stale port assignments.
+    private func forgetHotplugState() {
+        configuration = nil
+        hotplugPorts = HotplugPortPool(portIDs: [])
+    }
+}
+
+// MARK: - Hot-Plug Port Pool
+
+/// The pre-created `pcie-root-port` devices of a running VM, and which hot-plugged
+/// disk occupies each one.
+///
+/// A root port takes exactly one device — QEMU refuses a second with
+/// `slot 0 function 0 already occupied` — so ports have to be handed out one at a
+/// time and handed back on detach. Claiming is deliberately separate from choosing,
+/// so an attach that QEMU rejects does not consume a port for the life of the VM.
+struct HotplugPortPool: Sendable {
+    /// Every port the VM was launched with, in the order they are handed out.
+    private let portIDs: [String]
+    /// Device name to the port it occupies. The only mutable state, so a released
+    /// port returns to its original place in the order rather than to the back of a
+    /// queue.
+    private var assignments: [String: String] = [:]
+
+    init(portIDs: [String]) {
+        self.portIDs = portIDs
+    }
+
+    var capacity: Int { portIDs.count }
+
+    var inUseCount: Int { assignments.count }
+
+    var freeCount: Int { capacity - inUseCount }
+
+    /// The lowest-numbered unoccupied port, or `nil` when they are all taken.
+    var nextFreePort: String? {
+        let occupied = Set(assignments.values)
+        return portIDs.first { !occupied.contains($0) }
+    }
+
+    /// Record that `device` now occupies `port`. A port this pool does not own —
+    /// which is what a caller-supplied `bus` is — is not tracked.
+    mutating func claim(_ port: String, for device: String) {
+        guard portIDs.contains(port) else { return }
+        assignments[device] = port
+    }
+
+    /// Give up whatever port `device` held. A device that never held one is a no-op.
+    mutating func release(_ device: String) {
+        assignments.removeValue(forKey: device)
+    }
+
+    /// Which port a device holds, if any. For tests and diagnostics.
+    func port(for device: String) -> String? { assignments[device] }
 }
 
 // MARK: - VM Status
