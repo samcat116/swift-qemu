@@ -38,7 +38,16 @@ actor QMPConnection {
     /// Resolved by the greeting QEMU sends the instant it accepts. Created here
     /// rather than when someone waits for it, so the greeting cannot arrive
     /// before there is something to receive it.
-    private let greeting: QMPWaiter<Void>
+    ///
+    /// It carries the greeting itself rather than merely signalling that one
+    /// arrived, because its `capabilities` list is what negotiation is driven from.
+    /// Holding the value *in* the latch is what removes the question of whether a
+    /// negotiation woken by the latch can see the greeting it was waiting for.
+    private let greeting: QMPWaiter<QMPGreeting>
+
+    /// Fan-out of asynchronous events to `events()` subscribers. Lock-guarded and
+    /// `nonisolated` so subscribing stays synchronous — see ``QMPEventBroadcaster``.
+    nonisolated let events = QMPEventBroadcaster()
 
     /// Outstanding requests in submission order. QMP echoes our `id` back, so a
     /// reply is matched to its request rather than to whatever is at the head;
@@ -148,9 +157,10 @@ actor QMPConnection {
         switch message {
         case .greeting(let greetingMessage):
             logger.debug("Received QMP greeting", metadata: [
-                "version": .string(Self.describe(greetingMessage))
+                "version": .string(Self.describe(greetingMessage)),
+                "capabilities": .string(greetingMessage.QMP.capabilities.joined(separator: ","))
             ])
-            greeting.resolve()
+            greeting.resolve(.success(greetingMessage))
         case .response(let response):
             deliverResponse(response)
         case .event(let event):
@@ -188,11 +198,19 @@ actor QMPConnection {
     private func deliverEvent(_ event: QMPEvent) {
         logger.debug("Received QMP event", metadata: ["event": .string(event.event)])
 
-        guard event.event == "DEVICE_DELETED",
-              let device = event.data?["device"]?.stringValue else {
-            return
+        // The dedicated waiter first, then everyone watching. A detach needs a
+        // targeted, timed wait, so it keeps its ticket path rather than scanning the
+        // shared stream — but the event is still worth publishing, and resolving the
+        // ticket must not consume it on the way.
+        if event.event == QMPEventName.deviceDeleted,
+           let device = event.data?["device"]?.stringValue {
+            resolveDeviceDeletion(device: device)
         }
 
+        events.broadcast(event)
+    }
+
+    private func resolveDeviceDeletion(device: String) {
         // The oldest live expectation for this device, so repeated detaches are
         // matched in the order they were issued. Already-resolved expectations are
         // skipped: one that has timed out or been cancelled would absorb the event
@@ -229,6 +247,11 @@ actor QMPConnection {
         for deletion in deletions {
             deletion.waiter.resolve(.failure(error))
         }
+        // Event streams end with the connection they belong to. Because only this
+        // one place decides a connection has ended, that happens exactly once and at
+        // a defined point: `disconnect()` waits for the reader task, so a stream is
+        // already finished by the time it returns.
+        events.finish()
     }
 
     // MARK: - Teardown
@@ -252,7 +275,8 @@ actor QMPConnection {
 
     // MARK: - Greeting
 
-    func waitForGreeting() async throws {
+    /// The greeting QEMU sent, waiting for it if it has not arrived yet.
+    func waitForGreeting() async throws -> QMPGreeting {
         try await greeting.value
     }
 
@@ -266,11 +290,15 @@ actor QMPConnection {
         let id = "swiftqemu-\(nextRequestID)"
         // Tag the request so its response can be correlated back to it. Without
         // an id, matching is positional — and a single timed-out request would
-        // shift every later response onto the wrong caller.
+        // shift every later response onto the wrong caller. It matters twice as
+        // much for an out-of-band request, which is answered out of order by
+        // definition — so `outOfBand` has to be carried across this rebuild, or the
+        // command silently goes out in-band.
         let identified = QMPRequest(
             execute: request.execute,
             arguments: request.arguments,
-            id: id
+            id: id,
+            outOfBand: request.outOfBand
         )
         // Encoded before the waiter is registered, so a failure here cannot leave
         // a registration behind with nothing to resolve it.

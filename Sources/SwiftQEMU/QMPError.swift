@@ -33,6 +33,12 @@ public enum QMPError: Error, LocalizedError {
     /// QEMU refused `device_add` because the target bus does not support hot-plug.
     /// The `qmpError` this replaces said which bus, but not what to do about it.
     case hotplugNotSupported(bus: String, machineType: String)
+    /// An operation needs a QMP capability that this connection does not have —
+    /// either QEMU never offered it in its greeting, or it was excluded from
+    /// `QMPClient.requestedCapabilities`. Sending the request anyway earns a QMP
+    /// error that names the rejected JSON member rather than the missing
+    /// capability, so this is caught before it goes out.
+    case capabilityNotNegotiated(QMPCapability)
 
     public var errorDescription: String? {
         switch self {
@@ -92,6 +98,8 @@ public enum QMPError: Error, LocalizedError {
                 that bus does not support hot-plug. Pre-create PCIe root ports with \
                 QEMUConfiguration.hotplugPorts, or target a bus that accepts hot-plug.
                 """
+        case .capabilityNotNegotiated(let capability):
+            return "The QMP capability '\(capability.rawValue)' was not negotiated on this connection"
         }
     }
 

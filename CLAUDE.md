@@ -30,7 +30,8 @@ swift test --filter QMPProtocolTests
 - High-level API that coordinates process and QMP management
 - Manages VM lifecycle: create, start, pause, reset, shutdown, destroy
 - Owns the running VM's hot-plug topology: it keeps the `QEMUConfiguration` the VM was started with, and a `HotplugPortPool` of the `pcie-root-port` devices from its command line, because which bus `device_add` may target is decided at launch and not at attach time (see fix 16)
-- Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown)
+- Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown), kept current from QMP events rather than only on demand (see fix 18)
+- Re-exposes the event stream as `events(bufferSize:)` for applications, alongside its own subscription
 - Actor-based for thread-safe concurrent access
 
 **QEMUProcess** (Sources/SwiftQEMU/QEMUProcess.swift)
@@ -49,29 +50,39 @@ swift test --filter QMPProtocolTests
 **QMPClient** (Sources/SwiftQEMU/QMPClient.swift)
 - The public QMP API: connect (Unix domain socket or TCP), negotiate, execute commands, disconnect. Everything below the API — framing, correlation, waiting — belongs to `QMPConnection`
 - **Critical fix**: Implements exponential backoff retry logic (up to 10 attempts) for socket connection timing issues
-- Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit, and the block hot-plug set
-- Holds the current `QMPConnection` and the task consuming it in one lock-guarded box, so the type is honestly `Sendable` rather than `@unchecked Sendable`
+- Handles the QMP greeting, capability negotiation, and command execution
+- Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit, query-yank, yank, and the block hot-plug set
+- **Events**: `events(bufferSize:)` hands out an `AsyncStream<QMPEvent>` per subscriber — bounded, oldest-dropped, finished when the connection ends (see fix 18)
+- **Capabilities**: the greeting is kept (`greeting`), and the capabilities it offers that appear in `requestedCapabilities` are enabled and reported as `negotiatedCapabilities`. `executeOutOfBand` sends `exec-oob` requests for the handful of commands QEMU allows out-of-band
+- Holds the current `QMPConnection`, the task consuming it, and what negotiation settled on, in one lock-guarded box — so the type is honestly `Sendable` rather than `@unchecked Sendable`
 - `isConnected` is **derived from `Channel.isActive`**, not from a flag something has to remember to clear. A channel that has gone inactive is not a connection, however it died, so the next command fails fast instead of being written into a dead socket
-- `disconnect()` is idempotent, treats an already-closed channel as success, and waits for the reader task — so everything parked on the connection has been failed by the time it returns
-- Builds the pipeline for each connection: `ByteToMessageHandler(QMPFrameDecoder(...))` then a `NIOAsyncChannel<ByteBuffer, ByteBuffer>` (see fix 18)
+- `disconnect()` is idempotent, treats an already-closed channel as success, and waits for the reader task — so everything parked on the connection has been failed, and every event stream finished, by the time it returns
+- Builds the pipeline for each connection: `ByteToMessageHandler(QMPFrameDecoder(...))` then a `NIOAsyncChannel<ByteBuffer, ByteBuffer>` (see fix 19)
 - `deinit` closes the channel. That is what ends the reader task, so a client dropped without `disconnect()` does not leave the task — and the connection it holds — alive for as long as QEMU keeps the socket open
 
 **QMPConnection** (Sources/SwiftQEMU/QMPConnection.swift)
-- An `actor` owning one live connection: the loop consuming the inbound `AsyncSequence`, the outstanding waiters, and the write side. Replaces the old `QMPChannelHandler` (see fix 18)
+- An `actor` owning one live connection: the loop consuming the inbound `AsyncSequence`, the outstanding waiters, and the write side. Replaces the old `QMPChannelHandler` (see fix 19)
 - `run()` is one unstructured task per connection — the public API is a long-lived object with imperative connect/execute/disconnect calls, so there is no caller scope to hold the channel open. Inside it everything is structured: `executeThenClose` bounds the channel's lifetime, and closing the channel is what ends the loop
 - **The inbound sequence ending is the connection ending.** Whatever stops `run()` is the error every waiter gets, which is why there is no longer a first-error latch to arbitrate between `channelRead`, `channelInactive` and `disconnect()` all noticing separately
-- Correlation is unchanged: replies are matched on the `id` this client generates, a tagged reply with no waiter is discarded rather than shifted onto another caller, and untagged replies (old QEMU) fall back to submission order among requests that have actually reached the socket
+- Correlation is unchanged: replies are matched on the `id` this client generates, a tagged reply with no waiter is discarded rather than shifted onto another caller, and untagged replies (old QEMU) fall back to submission order among requests that have actually reached the socket. `outOfBand` is carried across the rebuild that adds the id, or an OOB command silently goes out in-band
 
 **QMPWaiter** (Sources/SwiftQEMU/QMPWaiter.swift)
 - The one-shot latch every QMP wait is built from — greeting, reply, `DEVICE_DELETED`. Owns its own deadline (an event-loop timer, cancelled on resolution) and is cancellation-aware
-- **One rule: the first resolution wins, and a caller that parks afterwards resumes immediately with what was latched.** Delivery, deadline, cancellation and teardown are four callers of `resolve`, in any order, from any thread, so there is no "install the waiter first, arm the deadline second" ordering left to get wrong (see fix 18)
+- **One rule: the first resolution wins, and a caller that parks afterwards resumes immediately with what was latched.** Delivery, deadline, cancellation and teardown are four callers of `resolve`, in any order, from any thread, so there is no "install the waiter first, arm the deadline second" ordering left to get wrong (see fix 19)
+- The greeting waiter carries the `QMPGreeting` itself, so negotiation reads the capabilities out of the wait rather than fetching them from somewhere else afterwards
+
+**QMPEventBroadcaster** (Sources/SwiftQEMU/QMPEventBroadcaster.swift)
+- The per-connection fan-out behind `events(bufferSize:)`: one `AsyncStream` continuation per subscriber, `bufferingNewest` so a yield can never block the reader loop, finished when the connection ends
+- Lock-guarded rather than actor-isolated, because subscribing must stay **synchronous** — an `async` `events()` would open a window for an event to slip past between the call and the first iteration
 
 **QMPFrameDecoder** (Sources/SwiftQEMU/QMPFrameDecoder.swift)
 - A `ByteToMessageDecoder` splitting the inbound stream into newline-delimited frames, so one inbound element is exactly one message
-- Enforces `maximumFrameSize` (default 512 KB) on the frame itself, terminating newline included; over-limit frames fail the connection with `QMPError.frameTooLarge` (see fix 15). This is **not** `ByteToMessageHandler(_:maximumBufferSize:)`, which cannot express it — see fix 18
+- Enforces `maximumFrameSize` (default 512 KB) on the frame itself, terminating newline included; over-limit frames fail the connection with `QMPError.frameTooLarge` (see fix 15). This is **not** `ByteToMessageHandler(_:maximumBufferSize:)`, which cannot express it — see fix 19
 
 **QMPProtocol** (Sources/SwiftQEMU/QMPProtocol.swift)
 - Defines QMP message types: QMPGreeting, QMPRequest, QMPResponse, QMPEvent
+- `QMPCapability` (`.oob`) is the negotiable half of the greeting; `QMPEventName` names the events with behaviour attached, since a misspelled event name silently never matches
+- `QMPRequest.outOfBand` encodes as `exec-oob`. **Never** the `"control": {"run-oob": true}` form — QEMU 11 rejects it outright (see fix 18)
 - Provides type-safe QMPCommand enum for common commands
 - `QMPMessage` discriminates inbound traffic by its key (`QMP`/`event`/`return`/`error`). **Never** go back to trying each type in turn — every property of `QMPResponse` is optional, so a try-in-sequence decode accepts an event as an empty response (see fix 6)
 
@@ -151,7 +162,7 @@ The codebase includes critical fixes for production reliability:
     - QEMU does not do this, so this is hardening — it matters because a half-written frame should surface as a named error rather than as growing memory and, eventually, a bare `.timeout`. It used to matter more: the socket lived in a world-writable directory until fix 17 moved it into a private one
     - The cap is on **frame size**, not merely on withheld newlines: an over-limit frame is rejected whether or not its newline has arrived. The unterminated branch (`readableBytes > limit`) and the complete-frame branch (`frameLength > limit`) are both reachable and both tested — which arrives depends only on how the peer's bytes land across socket reads
     - 512 KB is far above any real QMP message (`query-block` on a long device list, the largest realistic payload, runs to tens of KB). `testLargeFrameWithinTheLimitIsStillDelivered` exists because a cap that clipped legitimate payloads would be worse than no cap
-    - The cap now lives in `QMPFrameDecoder`, and deliberately **not** in `ByteToMessageHandler(_:maximumBufferSize:)` — see fix 18 for why that knob cannot express it. Fix 18 also removed the ordering rule this fix used to need: waiters were failed *before* the close so the in-flight caller got `frameTooLarge` rather than the `connectionLost` `channelInactive` would latch a moment later, and only one place notices a connection ending now
+    - The cap now lives in `QMPFrameDecoder`, and deliberately **not** in `ByteToMessageHandler(_:maximumBufferSize:)` — see fix 19 for why that knob cannot express it. Fix 19 also removed the ordering rule this fix used to need: waiters were failed *before* the close so the in-flight caller got `frameTooLarge` rather than the `connectionLost` `channelInactive` would latch a moment later, and only one place notices a connection ending now
 
 16. **Hot-Plug on the Default Machine Type**: `machineType` defaults to `q35`, whose `pcie.0` is a PCIe root complex, and `attachDisk` named no bus — so `device_add` landed on `pcie.0` and QEMU answered `Bus 'pcie.0' does not support hotplugging`. `attachDisk`/`detachDisk` were therefore unusable as shipped unless the caller knew to switch to `-machine pc`. A PCIe complex hot-plugs only through a `pcie-root-port`, and a root port **cannot itself be hot-plugged** — it has to be on the command line at launch, which is why this could not be fixed inside `attachDisk`. Now:
     - `QEMUConfiguration.hotplugPorts` (`.automatic`/`.count(n)`/`.disabled`, default `.automatic`) pre-creates root ports, and `QEMUManager` hands one out per `attachDisk`, releasing it on `detachDisk`. A port holds exactly one device — a second `device_add` onto an occupied port is refused with `slot 0 function 0 already occupied` — so the pool is a real capacity limit, `automaticHotplugPortCount` (4) by default, and `QEMUManager.availableHotplugPorts` reports what is left
@@ -169,14 +180,27 @@ The codebase includes critical fixes for production reliability:
     - **The name is a 13-character base-36 token, not a UUID, and this matters**: `sun_path` is 104 bytes on Darwin and `NSTemporaryDirectory()` spends ~50 of them before this library adds anything. A UUID-named directory plus `qmp.sock` does not fit — the injectable-base-directory test hit exactly that and had to be shortened. `QEMUProcess.maxSocketPathLength` is read from `sockaddr_un`, and `start()` throws `QMPError.socketPathTooLong(path:limit:)` rather than letting an over-long path present as a socket that never appears
     - The debug log moved into the same private directory at mode `0600` (with `-nographic` it is the guest console). It is named per *run*, not per instance, so a restart does not overwrite the log being diagnosed — and a directory holding a log is the one thing teardown leaves behind, since a log you cannot read after the VM exits is no use
 
-18. **The Transport Runs on `NIOAsyncChannel`**: `QMPChannelHandler` hand-rolled two things NIO provides — newline framing over an accumulating `ByteBuffer`, and a registry of `CheckedContinuation`s bridging the event loop to async callers. That registry is where fixes 6, 10, 14 and 15 all landed, one guard at a time, because every wait re-implemented the same ordering problem separately. It is now three pieces: `QMPFrameDecoder` (a `ByteToMessageDecoder`), `QMPConnection` (an actor consuming a `NIOAsyncChannel`'s inbound `AsyncSequence`), and `QMPWaiter` (one latch, used by all three kinds of wait). The handler is gone, and with it ~350 lines of per-waiter state machine.
+18. **Events Reach Callers, and the Greeting's Capabilities Are Used**: events were decoded correctly (fix 6) but only `DEVICE_DELETED` was acted on — everything else was logged at debug level and dropped, so `QEMUManager.status` went stale until someone called `getStatus()` and a guest powering itself off was invisible. The greeting's `capabilities` were decoded and discarded in the same way, leaving the protocol's only optional feature permanently off. Now:
+    - `QMPClient.events(bufferSize:)` returns an `AsyncStream<QMPEvent>`. **Per subscriber**, so the manager's own bookkeeping and an application's `for await` do not displace each other; **bounded** at `bufferSize` (default 64) keeping the *newest*, because a blocking yield would stall the loop that also delivers command replies and so wedge QEMU's socket for every waiter; and **finished when the connection ends**, so a `for await` terminates instead of parking. A stream belongs to one connection — reconnecting means resubscribing. Since fix 19 the fan-out is `QMPEventBroadcaster` and the yields happen on the reader loop rather than the event loop; the requirement is the same either way
+    - `DEVICE_DELETED` keeps its dedicated ticket path (a detach needs a targeted, timed wait, not a scan of a shared stream) *and* is published to subscribers. `QMPClientTests.testDeviceDeletedReachesBothItsTicketAndTheStream` is the guard on that
+    - `QEMUManager` consumes the stream in a task started at the end of `createVM`, subscribing *before* the first `updateStatus()` so no transition falls in the gap. `QEMUVMStatus.init?(event:)` is the mapping, pure and testable: `STOP`/`SUSPEND` → `.paused`, `RESUME`/`WAKEUP` → `.running`, `POWERDOWN` → `.shuttingDown`, `SHUTDOWN` → `.stopped`. `RESET` and `GUEST_PANICKED` map to **nothing** — verified on 11.0.2, `system_reset` leaves the run state alone and emits `RESET` *twice*, and what a panic implies depends on `-action panic`
+    - `POWERDOWN` → `.shuttingDown` is a statement about the *request*, not the run state, and QEMU has no run state for it — so a `getStatus()` while the guest is still working through the poweroff reports `.running` again. Same as `shutdown()`, which sets `.shuttingDown` for the same reason and has always had the same property
+    - Event-derived updates apply only while the manager considers itself connected, and the teardown paths stop the monitor before deciding the final status. Otherwise a `SHUTDOWN` still sitting in the buffer could relabel a VM that `destroy()` failed to kill as `.stopped`
+    - `updateStatus()` reports `.stopped` rather than `.unknown` when the query fails against an exited QEMU. Without that, the accurate `.stopped` from a `SHUTDOWN` event was overwritten by the next query, which cannot succeed against a socket that has gone
+    - Capability negotiation sends `qmp_capabilities` with `enable` set to the **intersection** of the greeting's offer and `requestedCapabilities` (default `[.oob]`). Never the wish list: `qmp_capabilities` fails outright on a capability QEMU did not advertise, and a failed negotiation leaves a monitor that answers every later command with "Expecting capabilities negotiation". The reply is now checked for an error, which it previously was not
+    - **An out-of-band request is `{"exec-oob": "<command>", "id": ...}`.** The `{"execute": ..., "control": {"run-oob": true}}` form from the original OOB proposal is rejected by QEMU 11 with `QMP input member 'control' is unexpected` — verified against 11.0.2, including for commands that *are* `allow-oob`. Encoding it that way would have shipped a feature that never worked, so `QMPProtocolTests.testOutOfBandRequestEncoding` asserts the wire form
+    - `executeOutOfBand` refuses with `QMPError.capabilityNotNegotiated(.oob)` rather than letting QEMU answer `QMP input member 'exec-oob' is unexpected`, which names the JSON instead of the problem
+    - QEMU permits OOB only for commands its schema marks `allow-oob`: on 11.0.2 exactly `migrate-pause`, `migrate-recover`, `query-yank`, `yank` — and **not** `quit`. So `yank(instances:outOfBand:)` (plus `queryYank`) is what the capability buys: the recovery path for a monitor blocked on an unresponsive backend
+    - Enabling `oob` carries no in-band cost on any supported QEMU. The old `COMMAND_DROPPED`/queue-full behaviour is gone — the event is absent from 11.0.2's `query-qmp-schema` entirely, and 64 pipelined in-band requests were all answered with `oob` on and off
+
+19. **The Transport Runs on `NIOAsyncChannel`**: `QMPChannelHandler` hand-rolled two things NIO provides — newline framing over an accumulating `ByteBuffer`, and a registry of `CheckedContinuation`s bridging the event loop to async callers. That registry is where fixes 6, 10, 14 and 15 all landed, one guard at a time, because every wait re-implemented the same ordering problem separately. It is now four pieces: `QMPFrameDecoder` (a `ByteToMessageDecoder`), `QMPConnection` (an actor consuming a `NIOAsyncChannel`'s inbound `AsyncSequence`), `QMPWaiter` (one latch, used by all three kinds of wait), and `QMPEventBroadcaster` (fix 18's event fan-out, lifted out of the handler unchanged in behaviour). The handler is gone, and with it ~350 lines of per-waiter state machine.
     - **The ordering hazards collapse into one rule.** A reply, a deadline, or a cancellation arriving before its waiter parks used to be three separate problems with three separate guards (a `Latch` for the greeting, a `seen` flag for deletions, a `cancelled` flag on every record, plus "install the waiter first, arm the deadline second" and an `attachDeadline` to close the remaining window). `QMPWaiter` latches its outcome, so all of them are the same case: **first resolution wins, and a caller that parks afterwards resumes immediately with what was latched.** `attachDeadline` survives only as resource hygiene — a deadline that arrives late finds the waiter resolved and does nothing, so no correctness rests on it any more
     - **One place decides the connection has ended.** Three used to notice — an oversized frame in `channelRead`, `channelInactive`, and `disconnect()` — so `failAllWaiters` had to latch the *first* error to keep `frameTooLarge` from being overwritten by the `connectionLost` that followed a moment later. Now whatever stops the inbound sequence is the error every waiter gets: `QMPFrameDecoder` throws `QMPError.frameTooLarge`, NIO fails the sequence with it, `executeThenClose` closes the channel, and only then are the waiters failed. The latch is gone because the race it arbitrated is
     - **`isConnected` is derived, not tracked.** It reads `Channel.isActive` (an atomic, safe off the event loop) instead of a flag cleared by an `onConnectionLost` callback the handler had to remember to invoke
     - `run()` is one unstructured task per connection. That is deliberate and not avoidable: the public API is a long-lived object with imperative `connect`/`execute`/`disconnect` calls, so there is no caller scope to hold the channel open for. Everything inside the task is structured — `executeThenClose` bounds the channel's lifetime, and the outbound writer it yields is handed to the actor so writes are `await`-ed with real backpressure
     - **`NIOExtras.LineBasedFrameDecoder` was evaluated and rejected**, contrary to what issue #21 assumed. Two findings: (a) its `maximumBufferSize` does *not* subsume fix 15 — that cap is checked only on bytes the decoder refused to consume (`Codec.swift`, `decoderResult == .needMoreData`), so a *complete* over-limit frame is decoded and delivered before the check ever runs, and `testCompleteButOversizedFrameFailsTheConnection` would fail; a downstream size check would be needed anyway. And (b) swift-nio-extras 1.32 pulls in 13 transitive packages — swift-nio-ssl, swift-nio-http2, swift-certificates, swift-crypto, swift-service-lifecycle among them — which is a steep graph for a library that talks to a local process over a Unix socket. `QMPFrameDecoder` is ~30 lines, states the cap exactly, and `ByteToMessageHandler` still owns the buffer, the partial-frame carry-over and the reclaiming
     - The regression tests from #8/#10/#15 are the acceptance criteria and pass **unchanged**: the greeting landing before anyone waits, a peer that accepts and never speaks, a stale reply after a timeout, an event interleaved with a reply, cancellation on either side of the park, and both frame-limit branches. The extracted pieces also get direct coverage they could not have before (`QMPWaiterTests`, `QMPFrameDecoderTests`), because the hazards are now stateable against a value instead of provoked through a scripted server
-    - Splitting inbound messages into replies and events is now the natural shape rather than an addition, which is what the event-stream follow-up needs
+    - Fix 18's event streams and capability negotiation came across **unchanged in behaviour and in public API**, and their tests pass unchanged too. Two things got simpler in the process: the greeting is the *value* the greeting waiter carries, so negotiation no longer fetches it from a separate field written "under the same lock as the latch"; and `disconnect()` waits for the reader loop, so a stream is finished by the time it returns rather than at whichever moment the handler noticed
 
 ### Known Gaps
 
@@ -184,6 +208,8 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 
 - **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` and `QEMUHotplugTests` drive the manager against a real QEMU for the create → start → attach → destroy paths (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake, since `QMPClient` is created in `init`
 - **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. This is documented on the API and its timeout is now a parameter, but nothing can make a guest-less VM release a device
+- **The manager does not reconcile `isConnected` when QEMU exits on its own**: a guest-initiated poweroff now moves `status` to `.stopped` via the `SHUTDOWN` event, but `isConnected` stays true and the process record and socket file are only released by an explicit `shutdown()`/`destroy()`. Commands in that window fail from the client as `.notConnected` rather than being refused up front
+- **Event subscriptions do not survive a reconnect** and do not replay: a stream belongs to one connection, and events emitted before `events()` was called are gone. Subscribe first, then read state
 
 ### Configuration Types
 
@@ -203,13 +229,13 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 - QEMUManager is an actor for thread-safe state management
 - QEMUProcess is an actor. Its `Process`/`Pipe` state is genuinely thread-unsafe, which is the reason it is isolated rather than annotated (see fix 12)
 - QMPClient is `Sendable`, holding the current connection and its reader task in one lock-guarded box
-- QMPConnection is an actor. Inbound messages arrive as an `AsyncSequence` from `NIOAsyncChannel`, so the registries are touched only from isolated methods and there is no lock at this layer (see fix 18)
-- QMPWaiter has the one remaining lock in the QMP layer, because it is resolved from event-loop timers as well as from tasks
+- QMPConnection is an actor. Inbound messages arrive as an `AsyncSequence` from `NIOAsyncChannel`, so the registries are touched only from isolated methods and there is no lock at this layer (see fix 19)
+- QMPWaiter and QMPEventBroadcaster hold the only locks left in the QMP layer, and for stated reasons: a waiter is resolved from event-loop timers as well as from tasks, and subscribing to events has to stay synchronous
 - All async operations use Swift's async/await and structured concurrency
 
 ### Dependencies
 
-- swift-nio: Async networking for QMP socket communication (`NIOCore`, `NIOPosix`; `NIOEmbedded` for tests only). `swift-nio-extras` was evaluated for framing and rejected — see fix 18
+- swift-nio: Async networking for QMP socket communication (`NIOCore`, `NIOPosix`; `NIOEmbedded` for tests only). `swift-nio-extras` was evaluated for framing and rejected — see fix 19
 - swift-log: Structured logging throughout the library
 
 ## Development Notes
@@ -246,9 +272,21 @@ qemu-system-x86_64 -accel help
 qemu-system-x86_64 -machine help
 ```
 
+Three more tests need a real QEMU for the same reason — the fake server accepts whatever it is sent, so only QEMU can say whether a request is *valid*:
+
+- `QEMUVMStatusTests.testCreatedVMReportsPausedAndBecomesRunningOnStart` — the run state comes from QEMU, not the test
+- `QEMUVMStatusTests.testEventsFromARealQEMUReachTheManagersSubscribers` — real event names and ordering (`RESUME` then `STOP`), and that `oob` negotiation succeeds
+- `QMPClientTests.testOutOfBandCommandIsAcceptedByARealQEMU` — an `exec-oob` request QEMU actually answers, which is the only check that would have caught the rejected `control` spelling
+
+Which commands a given QEMU allows out-of-band is in its own schema, and is the
+only trustworthy source: negotiate, send `query-qmp-schema` over the QMP socket,
+and collect the entries with `"allow-oob": true` (11.0.2 answers with
+`migrate-pause`, `migrate-recover`, `query-yank`, `yank`). Note that `-qmp stdio`
+truncates a reply that large — use a Unix socket for this.
+
 ### Transport Tests
 
-Three layers, deliberately separate:
+Three layers below `QMPClientTests`, deliberately separate:
 
 - `QMPFrameDecoderTests` drives `QMPFrameDecoder` through an `EmbeddedChannel`: several frames in one read, a frame split across reads, a frame exactly on the limit, and both over-limit branches. No socket, no client
 - `QMPWaiterTests` states the ordering hazards directly against `QMPWaiter` — a result, a deadline or a cancellation landing before the waiter parks — instead of provoking them through a scripted server and hoping the race lands the interesting way
@@ -315,6 +353,37 @@ Dropping a `QEMUManager` without shutting it down no longer leaks the VM —
 `QEMUProcess.deinit` SIGKILLs the child — but that is a backstop, not a shutdown:
 the guest gets no chance to power itself off.
 
+`status` is kept current from QMP events while connected, so a guest that pauses,
+resumes or powers itself off is reflected without polling. Watch the events
+directly to react to the rest:
+
+```swift
+// Bounded (newest kept), one stream per subscriber, finished when the connection
+// ends — so this loop terminates on shutdown rather than parking.
+for await event in try await manager.events() {
+    switch event.event {
+    case QMPEventName.shutdown:
+        print("guest powered off:", event.data?["reason"]?.stringValue ?? "?")
+    case "BLOCK_IO_ERROR", QMPEventName.guestPanicked:
+        print("needs attention:", event.event)
+    default:
+        break
+    }
+}
+```
+
+Out-of-band execution is negotiated by default where QEMU offers it, for the few
+commands that accept it:
+
+```swift
+if await manager.negotiatedCapabilities.contains(.oob) {
+    // Reaches a monitor blocked on an unresponsive backend, which an in-band
+    // command would queue behind. `quit` is *not* allow-oob; `yank` is.
+    let instances = try await client.queryYank(outOfBand: true)
+    try await client.yank(instances: instances, outOfBand: true)
+}
+```
+
 QMP payloads come back as `JSONValue`:
 
 ```swift
@@ -338,6 +407,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - timeout (createVM operation exceeded timeout)
 - frameTooLarge(limit:) (an inbound QMP frame exceeded `maximumFrameSize`, so the connection was closed)
 - invalidResponse, invalidConfiguration
+- capabilityNotNegotiated(QMPCapability) (an out-of-band request on a connection without `oob`)
 - qmpError(class, description) for QMP-specific errors
 
 ### Logging
