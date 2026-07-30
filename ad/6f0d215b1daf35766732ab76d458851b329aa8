@@ -1,0 +1,57 @@
+Sources/SwiftQEMU/QMPError.swift
+  s_2498bf37aeb7ee::t_c6f1ec4e0c53c0 20-28
+  s_2498bf37aeb7ee::t_3af64ca3d86ddb 60-80
+Sources/SwiftQEMU/QEMUManager.swift
+  s_2498bf37aeb7ee::t_6230b23c667490 99
+  s_2498bf37aeb7ee::t_3b3fc249a39e8e 202
+  s_2498bf37aeb7ee::t_fcf3581cfd062f 293-300,305-317,322-324,330-331,339,343-349,355-369,379-383
+  s_2498bf37aeb7ee::t_2a422997c048f5 252
+  s_2498bf37aeb7ee::t_63fe7285b5bc9a 45-46
+  s_2498bf37aeb7ee::t_1db3ce86011233 10-19
+  s_2498bf37aeb7ee::t_f730a6ee2d9e6a 398-470,472,476-485,493,496,498-500,502,504-507
+  s_2498bf37aeb7ee::t_baa0d5a6382cce 471,473-475,486-492,494-495,497,501,503
+Sources/SwiftQEMU/QEMUProcess.swift
+  s_2498bf37aeb7ee::t_d4426acebc3798 820-832,839-879
+  s_2498bf37aeb7ee::t_e53de77e66d357 505-515
+  s_2498bf37aeb7ee::t_d23033f785fb6a 758-791
+  s_f5876c85f52ac4::t_58315c42173d13 880
+Tests/SwiftQEMUTests/QEMUHotplugTests.swift
+  s_2498bf37aeb7ee::t_90a2a992cfff32 395,397
+  s_2498bf37aeb7ee::t_4f278d49452499 333,335
+  s_2498bf37aeb7ee::t_05656c2a2e73a0 1-237,239-332,334,336-347,350-394,396,398-400
+  s_2498bf37aeb7ee::t_9b8e0b8c7f73aa 238
+  s_2498bf37aeb7ee::t_28707012f94bc8 348-349
+CLAUDE.md
+  s_2498bf37aeb7ee::t_f47954decf8eda 194-196
+  s_2498bf37aeb7ee::t_c426dc8b02a7c4 32
+  s_2498bf37aeb7ee::t_48af8802967ddd 138-139
+  s_2498bf37aeb7ee::t_b56a6ef14e500c 267-268
+  s_2498bf37aeb7ee::t_4e9b187da4f729 191-193,197-198
+  s_2498bf37aeb7ee::t_d5fbc792d2ff1b 124-131
+  s_2498bf37aeb7ee::t_a6fcd3b099acd2 229-236
+  s_2498bf37aeb7ee::t_3de901cdaeee2c 150
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "ad6f0d215b1daf35766732ab76d458851b329aa8",
+  "prompts": {},
+  "sessions": {
+    "s_2498bf37aeb7ee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc11b1a8-4d4f-4d7a-bafa-ff7668c6b556",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    },
+    "s_f5876c85f52ac4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e3f1a729-0f85-436e-bcb2-83838456a6ac",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
