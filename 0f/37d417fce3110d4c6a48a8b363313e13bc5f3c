@@ -1,0 +1,49 @@
+Sources/SwiftQEMU/QEMUManager.swift
+  s_5da57eb784df90::t_74fc2d92e42bd3 14-19,22,26-30
+Sources/SwiftQEMU/QEMUProcess.swift
+  s_5da57eb784df90::t_d8befb420bd54f 29-31
+  s_5da57eb784df90::t_cad8d3cc2a20fc 320
+  s_5da57eb784df90::t_2d84a0cae539d6 40-55,63-70
+  s_5da57eb784df90::t_26ce827fe2d681 377-382,394-395,397-398
+  s_5da57eb784df90::t_1e07125e3dd03a 95-105,109,112-115,117-122,125-134
+  s_5da57eb784df90::t_41401164e614b3 384-392,396
+  s_5da57eb784df90::t_49306e05d28ff9 284
+  s_5da57eb784df90::t_43d9570cc77faf 468-588
+  s_5da57eb784df90::t_8cc88c724ee83a 140-161,163,168,174,176-177
+  s_5da57eb784df90::t_a33b68cdf84201 71
+  s_5da57eb784df90::t_354dd62d1944e5 383
+Sources/SwiftQEMU/QMPError.swift
+  s_5da57eb784df90::t_e3369732516b9e 55-59
+  s_5da57eb784df90::t_e5026e0558cc7c 20-23
+Tests/SwiftQEMUTests/QEMUProcessTests.swift
+  s_5da57eb784df90::t_e081fa4ad12d92 605-607
+  s_5da57eb784df90::t_f467256abc4e5a 5-12
+  s_5da57eb784df90::t_d7f2ed1e502e0a 78-93
+  s_5da57eb784df90::t_876ccfdff03ccd 535-604,608-737
+CLAUDE.md
+  s_5da57eb784df90::t_a1e3faac28f734 259
+  s_5da57eb784df90::t_15e6cf09173bcd 129-136
+  s_5da57eb784df90::t_d188f2e6027e34 121
+  s_5da57eb784df90::t_93743416b59cac 40,42
+  s_5da57eb784df90::t_cb9870d878050f 120
+  s_5da57eb784df90::t_78c1e9bb6c5d40 209-211
+  s_5da57eb784df90::t_ff6e6a135a2315 199-201
+  s_5da57eb784df90::t_b063dfac4c731c 174,178
+  s_5da57eb784df90::t_b6170d84357bb6 72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "0f37d417fce3110d4c6a48a8b363313e13bc5f3c",
+  "prompts": {},
+  "sessions": {
+    "s_5da57eb784df90": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ac444d5c-736d-4497-b7b7-0ec5d3774b23",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
