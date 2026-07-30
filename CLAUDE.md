@@ -48,11 +48,18 @@ swift test --filter QMPProtocolTests
 - **Critical fix**: Implements exponential backoff retry logic (up to 10 attempts) for socket connection timing issues
 - Handles QMP greeting, capability negotiation, and command execution
 - Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit
+- Connection state (channel, handler, connected flag) lives in one lock-guarded box, so the type is honestly `Sendable` rather than `@unchecked Sendable`. Losing the channel clears the connected flag, so the next command fails fast instead of being written into a dead socket
+- `disconnect()` is idempotent and treats an already-closed channel as success
 
 **QMPProtocol** (Sources/SwiftQEMU/QMPProtocol.swift)
 - Defines QMP message types: QMPGreeting, QMPRequest, QMPResponse, QMPEvent
 - Provides type-safe QMPCommand enum for common commands
-- Includes AnyCodable wrapper for type-erased JSON encoding/decoding
+- `QMPMessage` discriminates inbound traffic by its key (`QMP`/`event`/`return`/`error`). **Never** go back to trying each type in turn — every property of `QMPResponse` is optional, so a try-in-sequence decode accepts an event as an empty response (see fix 6)
+
+**JSONValue** (Sources/SwiftQEMU/JSONValue.swift)
+- Typed JSON enum used for all command arguments and response payloads, replacing the previous `AnyCodable` (`Any` + `@unchecked Sendable`)
+- Literal conformances let nested arguments read as plain JSON: `["driver": "qcow2", "file": ["driver": "file", "filename": path]]`
+- Read with `stringValue`/`intValue`/`boolValue`/`objectValue`/`arrayValue` and the `[key]`/`[index]` subscripts. Integers stay integers on the wire — QEMU rejects an integer field that arrives as `1.0`
 
 ### Critical Reliability Fixes
 
@@ -81,6 +88,29 @@ The codebase includes critical fixes for production reliability:
    - The socket wait polls process liveness and bails out as soon as QEMU exits, instead of waiting out the full 10 seconds
    - `QMPError.processExited(exitCode:killedBySignal:stderr:)` carries the stderr tail, and its `errorDescription` includes the last 10 lines — so the thrown error alone names the cause
    - `QEMUProcess.capturedStderr` stays readable after `stop()` for post-mortem reporting
+
+6. **Event/Response Discrimination**: Inbound messages are decoded through `QMPMessage`, keyed on the discriminating field. Trying `QMPResponse` before `QMPEvent` accepted every event as an all-`nil` response, which had two consequences:
+   - The event branch was unreachable, so `DEVICE_DELETED` never reached its waiter and `detachDisk` always failed with a timeout
+   - An event arriving mid-command was handed to that command as its reply. QEMU really does interleave them — `cont` emits `RESUME` *before* its `{"return": {}}` — so what a caller received depended on event timing
+   - `deviceDel` now registers its interest in `DEVICE_DELETED` *before* sending the command, and each registration is scoped to that one `device_del` (keyed by ticket, not device name), so neither event ordering nor a repeat detach of a re-added device can go wrong
+
+7. **Tolerant Status Parsing**: `query-status` returns only `status` reliably. `singlestep` is gone from modern QEMU (verified absent on 11.0.2), and requiring it failed every status query — which `updateStatus()` swallows into `.unknown`, making a healthy VM indistinguishable from a broken one. Only `status` is required now; `running` is derived when absent, `singlestep` is optional.
+
+8. **Teardown That Cannot Orphan the Process**: QEMU exits in response to `quit`, closing the channel from its end, so `disconnect()`'s close failed with `ChannelError.alreadyClosed`. That error propagated out of `destroy()` *before* `process.stop()` ran, leaving exactly the orphaned QEMU the cleanup path exists to prevent. Two independent guards now: `disconnect()` does not treat an already-closed peer as a failure, and `destroy()` cannot skip process termination on a teardown error.
+
+9. **Cancellable Exit Wait**: `waitUntilExit()` is cancellation-aware. Parked on a bare `withCheckedContinuation` around `terminationHandler` it ignored cancellation, so when `shutdown()`'s timeout leg won, the task group's implicit drain waited forever on it — a shutdown that hung *past its own timeout*, never reaching the forced termination meant to follow. `ExitWaiter` handles the three orderings that each used to hang: exit before anyone waits, several waiters at once, and cancellation arriving before a waiter parks. `shutdown(timeout:)` is now configurable.
+
+### Known Gaps
+
+Reviewed and deliberately left for follow-up work — do not assume these are handled:
+
+- **`enableKVM` defaults to `true`** while `Package.swift` declares macOS only, so the default configuration fails with `invalid accelerator kvm`. The accelerator wants to be an enum (`.kvm`/`.hvf`/`.tcg`) rather than a Bool, with `hvf` on macOS. `cpuType = "host"` has the same problem without an accelerator
+- **`stop()` neither waits nor escalates**: `terminate()` (SIGTERM) is followed immediately by `process = nil`, so `isRunning` reports false while QEMU may still be alive, the socket file is removed under a live process, the child is never reaped, and there is no SIGKILL escalation. There is also no `deinit`, so dropping a manager leaks a running VM
+- **`QEMUProcess` is `@unchecked Sendable` and genuinely raced**: `createVM` mutates its state from a task-group child while the actor's failure path reads `capturedStderr`/`isRunning`. Making it an `actor` would remove the class of bug
+- **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
+- **`prelaunch` maps to `.creating`**: a VM created with `startPaused: true` reports `.creating` rather than `.paused` until it is started, because QEMU reports `prelaunch` for both cases
+- **No end-to-end `QEMUManager` coverage**: its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. Covering the manager needs an injectable QMP-speaking fake
+- **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
 
 ### Configuration Types
 
@@ -145,6 +175,7 @@ var config = QEMUConfiguration()
 config.memoryMB = 2048
 config.cpuCount = 2
 config.disks.append(QEMUDisk(path: "/path/to/disk.qcow2"))
+config.enableKVM = false  // Required on macOS; see Known Gaps
 
 // Create VM (starts QEMU process in paused state by default)
 // Optional timeout parameter (default 30 seconds)
@@ -154,8 +185,18 @@ try await manager.createVM(config: config)
 // Start VM execution
 try await manager.start()
 
-// Later: gracefully shutdown (30 second timeout, then force quit)
+// Later: gracefully shutdown (default 30 second timeout, then force quit)
 try await manager.shutdown()
+// Or with a custom budget: try await manager.shutdown(timeout: 10)
+```
+
+QMP payloads come back as `JSONValue`:
+
+```swift
+for disk in try await manager.listDisks() {
+    let name = disk["device"]?.stringValue
+    let size = disk["inserted"]?["image"]?["virtual-size"]?.intValue
+}
 ```
 
 ### Error Handling

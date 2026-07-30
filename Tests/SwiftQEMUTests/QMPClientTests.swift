@@ -29,7 +29,21 @@ final class QMPClientTests: XCTestCase {
         /// an id belonging to no outstanding request. Models QEMU finally
         /// replying to a request that already timed out.
         case greetThenReplyWithStaleID
+        /// Behave the way a real QEMU 11 does, which is the case the naive
+        /// message decoding got wrong: interleave asynchronous events with
+        /// replies (`RESUME` arrives *before* the reply to `cont`), answer
+        /// `query-status` without the long-removed `singlestep`, emit
+        /// `DEVICE_DELETED` after a `device_del`, and close the connection after
+        /// answering `quit` the way an exiting process does.
+        case greetAndBehaveLikeQEMU
+        /// As above, but `DEVICE_DELETED` arrives *before* the reply to
+        /// `device_del` — the ordering that loses the event if the waiter is only
+        /// installed once the command has been answered.
+        case greetAndDeleteBeforeReplying
     }
+
+    private static let deviceDeletedEvent = #"{"timestamp": {"seconds": 1745000000, "microseconds": 1}, "event": "DEVICE_DELETED", "data": {"device": "vdb", "path": "/machine/peripheral/vdb"}}"#
+    private static let resumeEvent = #"{"timestamp": {"seconds": 1745000000, "microseconds": 2}, "event": "RESUME"}"#
 
     private static let greeting = #"{"QMP": {"version": {"qemu": {"major": 8, "minor": 0, "micro": 0}, "package": ""}, "capabilities": []}}"#
 
@@ -78,6 +92,11 @@ final class QMPClientTests: XCTestCase {
                 // Echo back a success response per newline-delimited request,
                 // preserving the request's `id` the way QEMU does.
                 while let line = readLine(&buffer) {
+                    if behaviour == .greetAndBehaveLikeQEMU || behaviour == .greetAndDeleteBeforeReplying {
+                        replyLikeQEMU(to: line, context: context)
+                        continue
+                    }
+
                     var id = Self.extractID(from: line)
                     if behaviour == .greetThenReplyWithStaleID {
                         // Negotiation must still succeed, so only corrupt the
@@ -90,6 +109,38 @@ final class QMPClientTests: XCTestCase {
                     }
                     let idField = id.map { ", \"id\": \"\($0)\"" } ?? ""
                     write("{\"return\": {}\(idField)}", context: context)
+                }
+            }
+
+            /// Answer one command with the payloads and event ordering QEMU 11
+            /// actually uses.
+            private func replyLikeQEMU(to line: String, context: ChannelHandlerContext) {
+                let idField = Self.extractID(from: line).map { ", \"id\": \"\($0)\"" } ?? ""
+                let reply = { (payload: String) in
+                    self.write("{\"return\": \(payload)\(idField)}", context: context)
+                }
+
+                if line.contains("query-status") {
+                    // No `singlestep`: removed from QEMU's StatusInfo.
+                    reply("{\"status\": \"running\", \"running\": true}")
+                } else if line.contains("\"cont\"") {
+                    // The event genuinely precedes the reply.
+                    write(QMPClientTests.resumeEvent, context: context)
+                    reply("{}")
+                } else if line.contains("device_del") {
+                    if behaviour == .greetAndDeleteBeforeReplying {
+                        write(QMPClientTests.deviceDeletedEvent, context: context)
+                        reply("{}")
+                    } else {
+                        reply("{}")
+                        write(QMPClientTests.deviceDeletedEvent, context: context)
+                    }
+                } else if line.contains("\"quit\"") {
+                    reply("{}")
+                    // An exiting QEMU closes the socket from its end.
+                    context.close(promise: nil)
+                } else {
+                    reply("{}")
                 }
             }
 
@@ -262,6 +313,142 @@ final class QMPClientTests: XCTestCase {
         let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
         try await client.connectUnix(path: server.socketPath)
         _ = try await client.execute(.cont)
+        try await client.disconnect()
+    }
+
+    // MARK: - Events vs. replies
+
+    /// `DEVICE_DELETED` must reach the waiter that asked for it.
+    ///
+    /// Every property of `QMPResponse` is optional, so decoding response-first
+    /// accepted this event as an all-`nil` response and consumed it. The event
+    /// branch was unreachable, the waiter was never resumed, and detaching a disk
+    /// therefore always failed with a timeout — against a server doing everything
+    /// right.
+    func testDeviceDeletedEventReachesItsWaiter() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        try await client.deviceDel(deviceId: "vdb", timeout: 3)
+
+        try await client.disconnect()
+    }
+
+    /// The same, with the event arriving before the reply to `device_del`. The
+    /// waiter is installed only after the command is answered, so this ordering
+    /// is only survivable because an unclaimed deletion is latched.
+    func testDeviceDeletedArrivingBeforeTheReplyIsNotLost() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndDeleteBeforeReplying)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        try await client.deviceDel(deviceId: "vdb", timeout: 3)
+
+        try await client.disconnect()
+    }
+
+    /// An event that arrives while a command is in flight must not be handed
+    /// over as that command's reply.
+    ///
+    /// QEMU emits `RESUME` before it answers `cont`, and the untagged-response
+    /// fallback used to hand that event straight to the waiting request — the
+    /// caller got an empty payload while the real reply was discarded as
+    /// unmatched.
+    func testEventDoesNotStealACommandReply() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let result = try await client.execute(.cont)
+        XCTAssertNotNil(
+            result?.objectValue,
+            "cont must return QEMU's `{}` reply, not the RESUME event that preceded it"
+        )
+
+        // And the connection is still correlated correctly afterwards.
+        let status = try await client.queryStatus()
+        XCTAssertEqual(status.status, "running")
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Status parsing
+
+    /// `query-status` on a modern QEMU carries no `singlestep`; requiring it made
+    /// every status query fail, which surfaced as a permanently `.unknown` VM.
+    func testQueryStatusAcceptsModernQEMUShape() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let status = try await client.queryStatus()
+        XCTAssertEqual(status.status, "running")
+        XCTAssertTrue(status.running)
+        XCTAssertNil(status.singlestep, "The field is absent, not false")
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Teardown
+
+    /// A peer that has already closed is a completed disconnect, not a failed
+    /// one.
+    ///
+    /// QEMU exits in response to `quit`, closing the channel from its end, so the
+    /// close here fails with `ChannelError.alreadyClosed`. That error used to
+    /// escape `disconnect()` and propagate out of `QEMUManager.destroy()` before
+    /// it could terminate the process — leaving an orphaned QEMU behind.
+    func testDisconnectAfterPeerClosedIsNotAFailure() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        _ = try await client.execute(.quit)
+        try await Task.sleep(nanoseconds: 500_000_000) // let the close land
+
+        try await client.disconnect()
+        XCTAssertFalse(client.isConnected)
+
+        // Idempotent: tearing down twice is not an error either.
+        try await client.disconnect()
+    }
+
+    /// Losing the connection must clear the connected flag, so the next command
+    /// fails as not-connected instead of being written into a dead channel and
+    /// waiting out its timeout.
+    func testConnectionLossClearsConnectedState() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+        XCTAssertTrue(client.isConnected)
+
+        _ = try await client.execute(.quit)
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertFalse(client.isConnected, "A closed channel is not a connection")
+
+        do {
+            _ = try await client.execute(.queryStatus)
+            XCTFail("Expected a command on a lost connection to fail")
+        } catch let error as QMPError {
+            guard case .notConnected = error else {
+                return XCTFail("Expected .notConnected, got \(error)")
+            }
+        }
+
         try await client.disconnect()
     }
 }

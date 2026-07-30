@@ -8,6 +8,7 @@ public final class QEMUProcess: @unchecked Sendable {
     private let qmpSocketPath: String
     private var stderrPipe: Pipe?
     private var stderrCapture: StderrCapture?
+    private var exitWaiter: ExitWaiter?
 
     /// QEMU binary path
     public let qemuPath: String
@@ -110,6 +111,12 @@ public final class QEMUProcess: @unchecked Sendable {
         let devNullInput = FileHandle(forReadingAtPath: "/dev/null")
         process.standardInput = devNullInput
 
+        // Installed before `run()`, which closes the window where a process that
+        // exits immediately terminates before anyone is listening for it.
+        let exitWaiter = ExitWaiter()
+        self.exitWaiter = exitWaiter
+        process.terminationHandler = { _ in exitWaiter.processDidExit() }
+
         // Start process
         do {
             try process.run()
@@ -187,19 +194,41 @@ public final class QEMUProcess: @unchecked Sendable {
         return qmpSocketPath
     }
     
-    /// Wait for process to exit
+    /// Wait for the process to exit.
+    ///
+    /// Cancellable, and that matters: this used to park on a bare
+    /// `withCheckedContinuation` around `terminationHandler`, which ignores
+    /// cancellation. When a caller raced this against a timeout — as
+    /// `QEMUManager.shutdown()` does — the timeout leg winning left this task
+    /// parked forever, and the task group's implicit drain waited on it. The
+    /// result was a shutdown that hung *past its own timeout*, with the forced
+    /// termination that should have followed never reached.
+    ///
+    /// Returns immediately if the process has already exited, and throws
+    /// `CancellationError` if the waiting task is cancelled.
     public func waitUntilExit() async throws {
-        guard let process = process else {
+        guard let process = process, let exitWaiter = exitWaiter else {
             throw QMPError.processNotRunning
         }
-        
-        await withCheckedContinuation { continuation in
-            process.terminationHandler = { _ in
-                continuation.resume()
+
+        guard process.isRunning else { return }
+
+        let token = exitWaiter.nextToken()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                exitWaiter.install(token: token, continuation: continuation)
             }
+        } onCancel: {
+            // Resumes only this waiter. Latching the whole waiter as finished
+            // would make a later `waitUntilExit()` return immediately for a
+            // process that is still very much alive.
+            exitWaiter.cancel(token: token)
         }
+
+        try Task.checkCancellation()
     }
-    
+
+
     // MARK: - Private Methods
 
     /// Release the pipe and its reader. The `StderrCapture` is deliberately kept so
@@ -340,6 +369,75 @@ public final class QEMUProcess: @unchecked Sendable {
         args.append(contentsOf: config.additionalArgs)
         
         return args
+    }
+}
+
+// MARK: - Exit Waiter
+
+/// Parking spot for the child process's exit, shared by every caller of
+/// `waitUntilExit()`.
+///
+/// Three orderings have to work, and each one used to be a hang:
+/// the exit landing before anyone waits (latched by `hasExited`), several
+/// callers waiting at once (a list, not a single slot, so nobody's continuation
+/// is overwritten and abandoned), and a waiter being cancelled before it has
+/// parked (`cancelledTokens`, since `onCancel` can run before the operation
+/// body). Continuations are removed under the lock and resumed after unlocking,
+/// which is what guarantees exactly one resume each.
+final class ExitWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiters: [(token: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
+    private var cancelledTokens: Set<UInt64> = []
+    private var lastToken: UInt64 = 0
+    private var hasExited = false
+
+    func nextToken() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        lastToken += 1
+        return lastToken
+    }
+
+    func install(token: UInt64, continuation: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        if hasExited || cancelledTokens.remove(token) != nil {
+            lock.unlock()
+            continuation.resume()
+            return
+        }
+        waiters.append((token: token, continuation: continuation))
+        lock.unlock()
+    }
+
+    func cancel(token: UInt64) {
+        lock.lock()
+        if let waiter = removeLocked(token) {
+            lock.unlock()
+            waiter.resume()
+            return
+        }
+        // Cancelled before it parked; `install` will resume it on arrival.
+        cancelledTokens.insert(token)
+        lock.unlock()
+    }
+
+    func processDidExit() {
+        lock.lock()
+        hasExited = true
+        let resumed = waiters
+        waiters.removeAll()
+        cancelledTokens.removeAll()
+        lock.unlock()
+
+        for waiter in resumed {
+            waiter.continuation.resume()
+        }
+    }
+
+    /// Caller must hold `lock`.
+    private func removeLocked(_ token: UInt64) -> CheckedContinuation<Void, Never>? {
+        guard let index = waiters.firstIndex(where: { $0.token == token }) else { return nil }
+        return waiters.remove(at: index).continuation
     }
 }
 

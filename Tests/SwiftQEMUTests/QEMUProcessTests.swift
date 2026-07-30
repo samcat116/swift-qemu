@@ -25,6 +25,20 @@ final class QEMUProcessTests: XCTestCase {
         return path
     }
 
+    /// A stand-in QEMU that creates its QMP socket file the way QEMU does — from
+    /// the `-qmp unix:<path>,server,wait=off` argument — and then runs `body`.
+    /// Anything testing behaviour *after* startup has to get past the socket wait.
+    private func makeSocketCreatingQEMU(body: String) throws -> String {
+        try makeFakeQEMU(body: """
+        for arg in "$@"; do
+            case "$arg" in
+                unix:*) touch "$(echo "$arg" | sed 's/^unix://; s/,.*$//')" ;;
+            esac
+        done
+        \(body)
+        """)
+    }
+
     override func tearDown() {
         for path in scriptPaths {
             try? FileManager.default.removeItem(atPath: path)
@@ -171,16 +185,7 @@ final class QEMUProcessTests: XCTestCase {
     /// A process that comes up normally still starts, and stderr capture does
     /// not interfere with the socket wait.
     func testStartSucceedsWhenTheSocketAppears() async throws {
-        // The socket path is passed as `-qmp unix:<path>,server,wait=off`; pick it
-        // out of the arguments and create the file the way QEMU would.
-        let fake = try makeFakeQEMU(body: """
-        for arg in "$@"; do
-            case "$arg" in
-                unix:*) touch "$(echo "$arg" | sed 's/^unix://; s/,.*$//')" ;;
-            esac
-        done
-        sleep 30
-        """)
+        let fake = try makeSocketCreatingQEMU(body: "sleep 30")
         let (process, socketPath) = makeProcess(qemuPath: fake)
         defer { try? FileManager.default.removeItem(atPath: socketPath) }
 
@@ -189,6 +194,88 @@ final class QEMUProcessTests: XCTestCase {
         XCTAssertEqual(process.capturedStderr, "", "A healthy start writes nothing to stderr")
 
         process.stop()
+    }
+
+    // MARK: - Waiting for exit
+
+    /// `waitUntilExit()` returns when the process actually exits.
+    func testWaitUntilExitReturnsWhenTheProcessExits() async throws {
+        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 0.5"))
+        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+
+        try await process.start(with: Self.defaultConfig)
+        try await process.waitUntilExit()
+
+        XCTAssertFalse(process.isRunning)
+    }
+
+    /// A process that has already gone is a completed wait, not a wait forever.
+    func testWaitUntilExitReturnsImmediatelyForAnExitedProcess() async throws {
+        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "exit 0"))
+        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+
+        try await process.start(with: Self.defaultConfig)
+        try await Task.sleep(nanoseconds: 300_000_000) // certainly gone
+
+        let started = Date()
+        try await process.waitUntilExit()
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1)
+    }
+
+    /// The wait must be cancellable, and this is the shape that matters:
+    /// `QEMUManager.shutdown()` races it against a timeout in a task group.
+    ///
+    /// Parked on a bare `withCheckedContinuation`, the wait ignored cancellation,
+    /// so when the timeout leg won, the group's implicit drain waited on a task
+    /// that would never finish — a shutdown that hung *past its own timeout*,
+    /// never reaching the forced termination meant to follow. Left unbounded this
+    /// test hangs rather than fails, so it asserts against a wall-clock budget.
+    func testWaitUntilExitIsCancellableSoATimedWaitCanFinish() async throws {
+        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 120"))
+        defer {
+            process.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await process.start(with: Self.defaultConfig)
+
+        let started = Date()
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { try? await Task.sleep(nanoseconds: 500_000_000) }
+            group.addTask { try? await process.waitUntilExit() }
+            await group.next()
+            group.cancelAll()
+        }
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertLessThan(elapsed, 10, "Leaving the group took \(elapsed)s; the cancelled wait never returned")
+        XCTAssertTrue(process.isRunning, "The process outlives a cancelled wait")
+    }
+
+    /// Cancelling one wait must not satisfy a later one — otherwise a subsequent
+    /// `waitUntilExit()` reports a live process as finished.
+    func testCancellingOneWaitDoesNotSatisfyTheNext() async throws {
+        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 120"))
+        defer {
+            process.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
+
+        try await process.start(with: Self.defaultConfig)
+
+        let first = Task { try await process.waitUntilExit() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        first.cancel()
+        _ = try? await first.value
+
+        // The second wait must still be waiting on a process that is still alive.
+        let second = Task { try await process.waitUntilExit() }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertFalse(second.isCancelled)
+        XCTAssertTrue(process.isRunning)
+
+        second.cancel()
+        _ = try? await second.value
     }
 
     /// A process that lives but never creates the socket still reports the

@@ -2,7 +2,15 @@ import XCTest
 @testable import SwiftQEMU
 
 final class QMPProtocolTests: XCTestCase {
-    
+
+    private let decoder = JSONDecoder()
+
+    private func decodeMessage(_ json: String) throws -> QMPMessage {
+        try decoder.decode(QMPMessage.self, from: Data(json.utf8))
+    }
+
+    // MARK: - Greeting
+
     func testQMPGreetingDecoding() throws {
         let json = """
         {
@@ -15,35 +23,63 @@ final class QMPProtocolTests: XCTestCase {
             }
         }
         """
-        
-        let data = json.data(using: .utf8)!
-        let decoder = JSONDecoder()
-        
-        let greeting = try decoder.decode(QMPGreeting.self, from: data)
-        
+
+        let greeting = try decoder.decode(QMPGreeting.self, from: Data(json.utf8))
+
         XCTAssertEqual(greeting.QMP.version.qemu.major, 7)
         XCTAssertEqual(greeting.QMP.version.qemu.minor, 0)
         XCTAssertEqual(greeting.QMP.version.qemu.micro, 0)
         XCTAssertEqual(greeting.QMP.capabilities.count, 0)
+
+        guard case .greeting = try decodeMessage(json) else {
+            return XCTFail("A greeting must be discriminated as a greeting")
+        }
     }
-    
+
+    // MARK: - Request encoding
+
     func testQMPRequestEncoding() throws {
         let request = QMPRequest(
             execute: "query-status",
             arguments: nil,
-            id: AnyCodable(1)
+            id: "swiftqemu-1"
         )
-        
+
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        
-        let data = try encoder.encode(request)
-        let json = String(data: data, encoding: .utf8)!
-        
+
+        let json = String(decoding: try encoder.encode(request), as: UTF8.self)
+
         XCTAssertTrue(json.contains("\"execute\":\"query-status\""))
-        XCTAssertTrue(json.contains("\"id\":1"))
+        XCTAssertTrue(json.contains("\"id\":\"swiftqemu-1\""))
     }
-    
+
+    /// Nested arguments must go out as the JSON QEMU expects, and integers must
+    /// stay integers — QEMU rejects an integer field that arrives as `1.0`.
+    func testNestedArgumentEncoding() throws {
+        let request = QMPRequest(
+            execute: "blockdev-add",
+            arguments: [
+                "driver": "qcow2",
+                "node-name": "drive-vdb",
+                "file": ["driver": "file", "filename": "/disks/vdb.qcow2"],
+                "read-only": false,
+                "size": 1024
+            ]
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let json = String(decoding: try encoder.encode(request), as: UTF8.self)
+
+        XCTAssertTrue(json.contains("\"filename\":\"\\/disks\\/vdb.qcow2\""), json)
+        XCTAssertTrue(json.contains("\"read-only\":false"), json)
+        XCTAssertTrue(json.contains("\"size\":1024"), json)
+        XCTAssertFalse(json.contains("1024.0"), "Integers must not be widened to doubles: \(json)")
+    }
+
+    // MARK: - Response decoding
+
     func testQMPResponseDecoding() throws {
         let json = """
         {
@@ -52,27 +88,22 @@ final class QMPProtocolTests: XCTestCase {
                 "singlestep": false,
                 "running": true
             },
-            "id": 1
+            "id": "swiftqemu-1"
         }
         """
-        
-        let data = json.data(using: .utf8)!
-        let decoder = JSONDecoder()
-        
-        let response = try decoder.decode(QMPResponse.self, from: data)
-        
+
+        guard case .response(let response) = try decodeMessage(json) else {
+            return XCTFail("A payload carrying `return` is a response")
+        }
+
         XCTAssertNotNil(response.return)
         XCTAssertNil(response.error)
-        
-        if let returnValue = response.return?.value as? [String: Any] {
-            XCTAssertEqual(returnValue["status"] as? String, "running")
-            XCTAssertEqual(returnValue["running"] as? Bool, true)
-            XCTAssertEqual(returnValue["singlestep"] as? Bool, false)
-        } else {
-            XCTFail("Failed to decode return value")
-        }
+        XCTAssertEqual(response.id?.stringValue, "swiftqemu-1")
+        XCTAssertEqual(response.return?["status"]?.stringValue, "running")
+        XCTAssertEqual(response.return?["running"]?.boolValue, true)
+        XCTAssertEqual(response.return?["singlestep"]?.boolValue, false)
     }
-    
+
     func testQMPErrorResponseDecoding() throws {
         let json = """
         {
@@ -80,42 +111,125 @@ final class QMPProtocolTests: XCTestCase {
                 "class": "CommandNotFound",
                 "desc": "The command invalid-command has not been found"
             },
-            "id": 1
+            "id": "swiftqemu-1"
         }
         """
-        
-        let data = json.data(using: .utf8)!
-        let decoder = JSONDecoder()
-        
-        let response = try decoder.decode(QMPResponse.self, from: data)
-        
+
+        guard case .response(let response) = try decodeMessage(json) else {
+            return XCTFail("A payload carrying `error` is a response")
+        }
+
         XCTAssertNil(response.return)
-        XCTAssertNotNil(response.error)
         XCTAssertEqual(response.error?.class, "CommandNotFound")
         XCTAssertTrue(response.error?.desc.contains("invalid-command") ?? false)
     }
-    
-    func testAnyCodableEncoding() throws {
+
+    // MARK: - Event/response discrimination
+
+    /// The bug this exists for: every property of `QMPResponse` is optional, so
+    /// trying response-then-event decoded an *event* as an all-nil response.
+    /// `DEVICE_DELETED` then never reached its waiter (disk detach always timed
+    /// out), and an event arriving mid-command was handed over as that command's
+    /// reply.
+    func testEventIsNotDecodedAsAResponse() throws {
+        let json = """
+        {
+            "event": "DEVICE_DELETED",
+            "data": {"device": "vdb", "path": "/machine/peripheral/vdb"},
+            "timestamp": {"seconds": 1745000000, "microseconds": 123456}
+        }
+        """
+
+        guard case .event(let event) = try decodeMessage(json) else {
+            return XCTFail("An event must be discriminated as an event, not a response")
+        }
+
+        XCTAssertEqual(event.event, "DEVICE_DELETED")
+        XCTAssertEqual(event.data?["device"]?.stringValue, "vdb")
+        XCTAssertEqual(event.timestamp?.seconds, 1745000000)
+    }
+
+    /// Events QEMU sends with no `data` still have to decode; a decode failure is
+    /// a dropped event.
+    func testEventWithoutDataOrTimestampStillDecodes() throws {
+        guard case .event(let event) = try decodeMessage(#"{"event": "SHUTDOWN"}"#) else {
+            return XCTFail("Expected an event")
+        }
+        XCTAssertEqual(event.event, "SHUTDOWN")
+        XCTAssertNil(event.data)
+        XCTAssertNil(event.timestamp)
+    }
+
+    /// An object carrying none of the discriminating keys is not a response with
+    /// nothing in it — it is not a message we understand, and accepting it as an
+    /// empty response is what let events be mistaken for replies.
+    func testObjectWithNoDiscriminatingKeyIsRejected() {
+        XCTAssertThrowsError(try decodeMessage(#"{"unrelated": 1}"#))
+    }
+
+    // MARK: - Status parsing
+
+    /// Modern QEMU (verified on 11.0.2) answers `query-status` without
+    /// `singlestep`. Requiring it made every status query fail.
+    func testStatusResponseDecodesWithoutSinglestep() throws {
+        let status = try decoder.decode(
+            QMPStatusResponse.self,
+            from: Data(#"{"status": "running", "running": true}"#.utf8)
+        )
+
+        XCTAssertEqual(status.status, "running")
+        XCTAssertTrue(status.running)
+        XCTAssertNil(status.singlestep)
+    }
+
+    // MARK: - JSONValue
+
+    func testJSONValueEncoding() throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
-        
-        // Test various types
-        let intValue = AnyCodable(42)
-        let stringValue = AnyCodable("test")
-        let boolValue = AnyCodable(true)
-        let dictValue = AnyCodable(["key": "value", "number": 123])
-        
-        let intData = try encoder.encode(intValue)
-        let stringData = try encoder.encode(stringValue)
-        let boolData = try encoder.encode(boolValue)
-        let dictData = try encoder.encode(dictValue)
-        
-        XCTAssertEqual(String(data: intData, encoding: .utf8), "42")
-        XCTAssertEqual(String(data: stringData, encoding: .utf8), "\"test\"")
-        XCTAssertEqual(String(data: boolData, encoding: .utf8), "true")
-        
-        let dictJson = String(data: dictData, encoding: .utf8)!
-        XCTAssertTrue(dictJson.contains("\"key\":\"value\""))
-        XCTAssertTrue(dictJson.contains("\"number\":123"))
+
+        XCTAssertEqual(String(decoding: try encoder.encode(JSONValue.int(42)), as: UTF8.self), "42")
+        XCTAssertEqual(String(decoding: try encoder.encode(JSONValue.string("test")), as: UTF8.self), "\"test\"")
+        XCTAssertEqual(String(decoding: try encoder.encode(JSONValue.bool(true)), as: UTF8.self), "true")
+        XCTAssertEqual(String(decoding: try encoder.encode(JSONValue.null), as: UTF8.self), "null")
+
+        let object: JSONValue = ["key": "value", "number": 123]
+        let json = String(decoding: try encoder.encode(object), as: UTF8.self)
+        XCTAssertTrue(json.contains("\"key\":\"value\""))
+        XCTAssertTrue(json.contains("\"number\":123"))
+    }
+
+    func testJSONValueRoundTrip() throws {
+        let original: JSONValue = [
+            "string": "s",
+            "int": 7,
+            "double": 1.5,
+            "bool": true,
+            "null": nil,
+            "array": [1, "two", false],
+            "object": ["nested": 1]
+        ]
+
+        let encoded = try JSONEncoder().encode(original)
+        let decoded = try decoder.decode(JSONValue.self, from: encoded)
+
+        XCTAssertEqual(decoded, original)
+    }
+
+    func testJSONValueAccessors() {
+        let value: JSONValue = ["list": [10, 20], "flag": false, "name": "vdb"]
+
+        XCTAssertEqual(value["name"]?.stringValue, "vdb")
+        XCTAssertEqual(value["flag"]?.boolValue, false)
+        XCTAssertEqual(value["list"]?[1]?.intValue, 20)
+        XCTAssertNil(value["missing"])
+        XCTAssertNil(value["name"]?.intValue, "A string is not an integer")
+        XCTAssertTrue(JSONValue.null.isNull)
+
+        // QEMU emits sizes as JSON numbers; a whole number that arrived as a
+        // double is still an integer to the caller.
+        XCTAssertEqual(JSONValue.double(4096).intValue, 4096)
+        XCTAssertNil(JSONValue.double(1.5).intValue)
+        XCTAssertEqual(JSONValue.int(3).doubleValue, 3.0)
     }
 }
