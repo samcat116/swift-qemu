@@ -1,0 +1,26 @@
+CLAUDE.md
+  s_2498bf37aeb7ee::t_832ebf8ff2e4e1 124-129
+  s_2498bf37aeb7ee::t_6f4a8dc01fa459 32
+  s_2498bf37aeb7ee::t_5d6b85fc06ccba 142
+Sources/SwiftQEMU/QEMUManager.swift
+  s_2498bf37aeb7ee::t_8540a55d8bcaba 34-41,279-281,513,515-521,523-524,526-529,531-532,534-536,540-577
+  s_2498bf37aeb7ee::t_e6a095f7e5697d 578-579
+Tests/SwiftQEMUTests/QEMUVMStatusTests.swift
+  s_2498bf37aeb7ee::t_8540a55d8bcaba 1-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "ba6a72203d214610a53e9bc5fc819ed7fcac08db",
+  "prompts": {},
+  "sessions": {
+    "s_2498bf37aeb7ee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc11b1a8-4d4f-4d7a-bafa-ff7668c6b556",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
