@@ -35,12 +35,30 @@ import Glibc
 /// and `StderrCapture`. Neither is reachable from the actor's isolation domain by
 /// reference alone, which is also what lets `deinit` — outside the actor, reaching
 /// stored properties under the rule that a deinitializing actor has no other
-/// references left to race against — still take a running child down.
+/// references left to race against — still take a running child down. That rule
+/// is also why the on-disk cleanup `deinit` shares with `stop()` lives in
+/// `nonisolated static` helpers taking their paths as arguments.
 public actor QEMUProcess {
     private let logger: Logger
     private let qmpSocketPath: String
     private var child: ChildProcess?
     private var stderrCapture: StderrCapture?
+
+    /// Private per-instance directory, created with mode `0700`, that holds the QMP
+    /// socket and the debug log. See `createInstanceDirectoryIfNeeded()`.
+    private let instanceDirectory: String
+
+    /// Whether the QMP socket lives inside `instanceDirectory`. `false` when the
+    /// caller named a path of its own, which this type binds to but does not own.
+    private let socketIsManaged: Bool
+
+    /// Set once `instanceDirectory` has actually been created, which is what makes
+    /// removing it on teardown safe: nothing else can be at that path.
+    private var createdInstanceDirectory = false
+
+    /// Path of the debug log for the current run, when log files are enabled.
+    /// Its presence is what keeps `instanceDirectory` alive past teardown.
+    private var logFilePath: String?
 
     /// QEMU binary path
     public let qemuPath: String
@@ -48,6 +66,15 @@ public actor QEMUProcess {
     /// How long `stop()` waits for the child to honour SIGTERM before escalating,
     /// and how long it then waits after SIGKILL.
     public static let defaultTerminationTimeout: TimeInterval = 5
+
+    /// The kernel's limit on the length of a unix socket path, taken from
+    /// `sockaddr_un.sun_path`: 104 bytes on Darwin, 108 on Linux, including the
+    /// terminating NUL.
+    ///
+    /// Worth checking rather than discovering: an over-long path makes QEMU fail to
+    /// bind, which reaches a caller as a socket that simply never appears — the
+    /// least informative failure this type has.
+    public static let maxSocketPathLength: Int = MemoryLayout.size(ofValue: sockaddr_un().sun_path)
 
     /// Is the QEMU process running
     public var isRunning: Bool {
@@ -72,24 +99,72 @@ public actor QEMUProcess {
         stderrCapture?.text ?? ""
     }
 
+    /// - Parameters:
+    ///   - qemuPath: The QEMU binary to run.
+    ///   - qmpSocketPath: An explicit path for the QMP socket. Leave this `nil` —
+    ///     the default puts the socket in a private per-instance directory, which
+    ///     is the only thing that actually restricts access to it. A caller that
+    ///     names a path owns whatever protects it, and takes on the same problem
+    ///     this type used to have.
+    ///   - runtimeDirectory: Base directory for the private per-instance
+    ///     directory. Defaults to `NSTemporaryDirectory()`, which on macOS is
+    ///     already per-user. Unix socket paths are limited to about 100 bytes in
+    ///     total (`maxSocketPathLength`), so a deeply nested base will not fit.
     public init(
         qemuPath: String = "/usr/bin/qemu-system-x86_64",
         qmpSocketPath: String? = nil,
+        runtimeDirectory: String? = nil,
         logger: Logger = Logger(label: "SwiftQEMU.QEMUProcess")
     ) {
+        let directory = URL(fileURLWithPath: runtimeDirectory ?? NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("qemu-\(Self.pathToken())", isDirectory: true)
+            .path
+
         self.qemuPath = qemuPath
-        self.qmpSocketPath = qmpSocketPath ?? "/tmp/qemu-\(UUID().uuidString).sock"
+        self.instanceDirectory = directory
+        self.socketIsManaged = qmpSocketPath == nil
+        // A fixed, short socket name inside a per-instance directory. The old
+        // `/tmp/qemu-<uuid>.sock` spent 41 characters of a ~104-byte budget on the
+        // name alone, and spent them in a directory shared with the whole host.
+        self.qmpSocketPath = qmpSocketPath ?? directory + "/qmp.sock"
         self.logger = logger
     }
-    
+
+    /// An unguessable path component, short enough to leave room in `sun_path`.
+    ///
+    /// A UUID string is 36 characters and `NSTemporaryDirectory()` on macOS is
+    /// around 50 more, which together crowd a limit that is only 104 bytes wide.
+    /// This is 64 bits of entropy in at most 13.
+    private static func pathToken() -> String {
+        String(UInt64.random(in: UInt64.min ... UInt64.max), radix: 36)
+    }
+
     /// Start QEMU process with given configuration
     public func start(with config: QEMUConfiguration) async throws {
         if let child = child, !child.hasExited {
             throw QMPError.processAlreadyRunning
         }
 
-        // Clean up any existing socket
-        try? FileManager.default.removeItem(atPath: qmpSocketPath)
+        guard qmpSocketPath.utf8.count < Self.maxSocketPathLength else {
+            throw QMPError.socketPathTooLong(path: qmpSocketPath, limit: Self.maxSocketPathLength)
+        }
+
+        // ENABLE_QEMU_PROCESS_LOG_FILES controls whether stdout goes to a log file
+        // or /dev/null. Read before the directory is prepared, because the log
+        // lives in that directory too.
+        let enableLogFiles = ProcessInfo.processInfo.environment["ENABLE_QEMU_PROCESS_LOG_FILES"]
+        let shouldLogToFile = enableLogFiles?.lowercased() == "true" ||
+                              enableLogFiles?.lowercased() == "yes" ||
+                              enableLogFiles == "1"
+
+        if socketIsManaged || shouldLogToFile {
+            try createInstanceDirectoryIfNeeded()
+        }
+
+        // QEMU cannot bind over an existing entry, so a leftover socket has to go
+        // first. Under the default layout there is nothing to remove — the
+        // directory is ours and fresh.
+        Self.removeSocketFile(at: qmpSocketPath, logger: logger)
 
         let arguments = buildArguments(from: config)
 
@@ -98,7 +173,7 @@ public actor QEMUProcess {
             "arguments": .array(arguments.map { .string($0) })
         ])
 
-        let output = try openStandardOutput()
+        let output = try openStandardOutput(logToFile: shouldLogToFile)
 
         // Redirect stdin to /dev/null to prevent job control issues. Inheriting the
         // TTY triggers SIGSTOP/SIGTTOU and leaves QEMU in T (stopped) state with an
@@ -169,36 +244,56 @@ public actor QEMUProcess {
     }
 
     /// Where QEMU's stdout goes, and — when log files are enabled — the parent's
-    /// own handle on the same file so stderr can be teed into it.
+    /// own descriptor on the same file so stderr can be teed into it.
     ///
     /// The child's descriptor is a `dup` rather than a second `open` so the two
     /// share a file offset, which is what keeps the teed stderr interleaved with
     /// stdout instead of overwriting it.
-    private func openStandardOutput() throws -> StandardOutputTarget {
-        // ENABLE_QEMU_PROCESS_LOG_FILES controls whether output goes to log files
-        // or /dev/null.
-        let enableLogFiles = ProcessInfo.processInfo.environment["ENABLE_QEMU_PROCESS_LOG_FILES"]
-        let shouldLogToFile = enableLogFiles?.lowercased() == "true" ||
-                              enableLogFiles?.lowercased() == "yes" ||
-                              enableLogFiles == "1"
-
-        guard shouldLogToFile else {
-            logger.debug("QEMU output redirected to /dev/null")
-            return StandardOutputTarget(
-                childDescriptor: try FileDescriptor.open("/dev/null", .writeOnly),
-                logFile: nil
-            )
+    ///
+    /// Falls back to /dev/null if the log file cannot be opened, rather than
+    /// handing QEMU nothing to write to.
+    private func openStandardOutput(logToFile: Bool) throws -> StandardOutputTarget {
+        if logToFile, let logFile = makeLogFile() {
+            if let childDescriptor = try? logFile.duplicate() {
+                return StandardOutputTarget(childDescriptor: childDescriptor, logFile: logFile)
+            }
+            // Nothing will be written to it, so do not claim it as this run's log.
+            try? logFile.close()
+            logFilePath = nil
         }
 
-        let logPath = "/tmp/qemu-\(UUID().uuidString).log"
-        let logFile = try FileDescriptor.open(
-            logPath,
-            .writeOnly,
-            options: [.create, .truncate],
-            permissions: .ownerReadWrite
+        logger.debug("QEMU output redirected to /dev/null")
+        return StandardOutputTarget(
+            childDescriptor: try FileDescriptor.open("/dev/null", .writeOnly),
+            logFile: nil
         )
-        logger.info("QEMU output redirected to: \(logPath)")
-        return StandardOutputTarget(childDescriptor: try logFile.duplicate(), logFile: logFile)
+    }
+
+    /// Open this run's debug log inside the private directory, or `nil` if it could
+    /// not be created.
+    ///
+    /// Named per run, not per instance, so restarting a `QEMUProcess` does not
+    /// overwrite the log of the run being diagnosed. Mode `0600` for the same
+    /// reason the directory around it is `0700`: with `-nographic` this file is the
+    /// guest console.
+    private func makeLogFile() -> FileDescriptor? {
+        let path = instanceDirectory + "/qemu-\(Self.pathToken()).log"
+
+        guard let descriptor = try? FileDescriptor.open(
+            path,
+            .writeOnly,
+            options: [.create, .exclusiveCreate],
+            permissions: [.ownerRead, .ownerWrite]
+        ) else {
+            logger.warning("Could not create QEMU log file, falling back to /dev/null", metadata: [
+                "path": .string(path)
+            ])
+            return nil
+        }
+
+        logFilePath = path
+        logger.info("QEMU output redirected to: \(path)")
+        return descriptor
     }
 
     /// Run QEMU to completion, publishing everything the actor needs as it goes.
@@ -283,7 +378,7 @@ public actor QEMUProcess {
     public func stop(timeout: TimeInterval = QEMUProcess.defaultTerminationTimeout) async {
         guard let child = child else {
             logger.debug("QEMU process not running, nothing to stop")
-            removeSocketFile()
+            removeRuntimeFiles()
             return
         }
 
@@ -323,7 +418,7 @@ public actor QEMUProcess {
 
         self.child = nil
 
-        removeSocketFile()
+        removeRuntimeFiles()
 
         logger.info("QEMU process stopped")
     }
@@ -381,19 +476,128 @@ public actor QEMUProcess {
     /// because the detached task running QEMU holds the only other reference to it
     /// and will happily outlive this actor.
     deinit {
-        guard let child = child, let pid = child.signallablePID else { return }
+        if let child = child, let pid = child.signallablePID {
+            logger.warning("QEMUProcess released while QEMU was still running; killing it", metadata: [
+                "pid": .stringConvertible(pid)
+            ])
+            kill(pid, SIGKILL)
+        }
 
-        logger.warning("QEMUProcess released while QEMU was still running; killing it", metadata: [
-            "pid": .stringConvertible(pid)
-        ])
-        kill(pid, SIGKILL)
-        try? FileManager.default.removeItem(atPath: qmpSocketPath)
+        // Spelled out rather than folded into one `&&`: the short-circuit makes the
+        // second operand an autoclosure, which is nonisolated and so cannot reach a
+        // stored property here.
+        var directoryToRemove: String?
+        if createdInstanceDirectory {
+            if logFilePath == nil {
+                directoryToRemove = instanceDirectory
+            }
+        }
+
+        Self.removeRuntimeFiles(
+            socketPath: qmpSocketPath,
+            directory: directoryToRemove,
+            logger: logger
+        )
     }
 
     // MARK: - Private Methods
 
-    private func removeSocketFile() {
-        try? FileManager.default.removeItem(atPath: qmpSocketPath)
+    /// Create the private directory that holds the QMP socket and the debug log.
+    ///
+    /// The directory's mode is what protects a unix socket: a socket file's own
+    /// permission bits are not portably honoured, so `0700` here is the access
+    /// control, not decoration. `/tmp` — where the socket used to live directly —
+    /// is world-writable and shared with every user on the host, and a QMP socket
+    /// is a full control channel for the VM: whoever reaches it can `quit` the
+    /// guest, hot-plug devices, or read block device state.
+    ///
+    /// `withIntermediateDirectories: false` so that anything already sitting at
+    /// this path is an error rather than something to be adopted. Nothing should
+    /// be: the name carries 64 bits of randomness.
+    private func createInstanceDirectoryIfNeeded() throws {
+        // Already ours from an earlier `start()` on this instance — see
+        // `removeRuntimeFiles()` for the one case that leaves it behind.
+        guard !createdInstanceDirectory else { return }
+
+        let fileManager = FileManager.default
+        let parent = (instanceDirectory as NSString).deletingLastPathComponent
+        try fileManager.createDirectory(atPath: parent, withIntermediateDirectories: true)
+
+        try fileManager.createDirectory(
+            atPath: instanceDirectory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        // Foundation does not promise the attribute above reaches `mkdir(2)` rather
+        // than being applied after the fact, and the mode is the whole point.
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: instanceDirectory)
+
+        createdInstanceDirectory = true
+        logger.debug("Created private QEMU runtime directory", metadata: [
+            "path": .string(instanceDirectory)
+        ])
+    }
+
+    /// Remove what this run left on disk: the socket, and the private directory
+    /// around it.
+    ///
+    /// The directory goes only if this instance created it, which is what makes
+    /// removing a whole directory tree safe — under the old scheme teardown deleted
+    /// whatever happened to be at a caller-supplied path.
+    ///
+    /// One exception: a directory holding a debug log is left in place. Log files
+    /// are opt-in via `ENABLE_QEMU_PROCESS_LOG_FILES`, and a caller who asks for
+    /// one wants to read it after the VM is gone.
+    private func removeRuntimeFiles() {
+        Self.removeRuntimeFiles(
+            socketPath: qmpSocketPath,
+            directory: (createdInstanceDirectory && logFilePath == nil) ? instanceDirectory : nil,
+            logger: logger
+        )
+
+        if let logFilePath = logFilePath {
+            logger.debug("Keeping QEMU runtime directory for its log", metadata: [
+                "log": .string(logFilePath)
+            ])
+        }
+    }
+
+    /// `nonisolated` so `deinit` — which is outside the actor by language rule —
+    /// can run the same cleanup.
+    private nonisolated static func removeRuntimeFiles(
+        socketPath: String,
+        directory: String?,
+        logger: Logger
+    ) {
+        removeSocketFile(at: socketPath, logger: logger)
+        if let directory = directory {
+            try? FileManager.default.removeItem(atPath: directory)
+        }
+    }
+
+    /// Delete the socket file, and nothing else.
+    ///
+    /// Deliberately narrow. `qmpSocketPath` can come from a caller, and
+    /// `removeItem` on a directory takes everything under it — so a mistyped path
+    /// used to mean this type would quietly delete a directory tree it was never
+    /// asked to touch.
+    private nonisolated static func removeSocketFile(at path: String, logger: Logger) {
+        let fileManager = FileManager.default
+        // `attributesOfItem` does not follow symlinks, so a link is reported as a
+        // link and removing it removes the link rather than its target.
+        guard let type = (try? fileManager.attributesOfItem(atPath: path))?[.type] as? FileAttributeType else {
+            return
+        }
+
+        switch type {
+        case .typeSocket, .typeRegular, .typeSymbolicLink:
+            try? fileManager.removeItem(atPath: path)
+        default:
+            logger.warning("Refusing to remove QMP socket path: it is not a socket", metadata: [
+                "path": .string(path),
+                "type": .string(type.rawValue)
+            ])
+        }
     }
 
     /// Build the error for a QEMU process that died before the QMP socket appeared,

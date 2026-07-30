@@ -2,6 +2,14 @@ import XCTest
 import Logging
 @testable import SwiftQEMU
 
+// `setenv`/`unsetenv` and the signal constants come from the POSIX layer, which
+// Foundation does not promise to re-export on every platform.
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Tests for `QEMUProcess` stderr capture, driven by a stand-in binary rather
 /// than a real QEMU so they run anywhere.
 ///
@@ -65,6 +73,22 @@ final class QEMUProcessTests: XCTestCase {
             try? FileManager.default.removeItem(atPath: socketPath)
         }
         return (process, socketPath)
+    }
+
+    /// Build a process that places its own socket, the way a caller who does not
+    /// name a path gets one, and register its cleanup.
+    private func makeManagedProcess(qemuPath: String, runtimeDirectory: String? = nil) -> QEMUProcess {
+        let process = QEMUProcess(
+            qemuPath: qemuPath,
+            runtimeDirectory: runtimeDirectory,
+            logger: Logger(label: "test")
+        )
+        let directory = Self.directory(containing: process.getQMPSocketPath())
+        addTeardownBlock {
+            await process.stop()
+            try? FileManager.default.removeItem(atPath: directory)
+        }
+        return process
     }
 
     /// The stock configuration — which now starts on every supported host, so
@@ -506,6 +530,209 @@ final class QEMUProcessTests: XCTestCase {
         (try? String(contentsOfFile: path, encoding: .utf8))?
             .split(separator: "\n")
             .count ?? 0
+    }
+
+    private static func directory(containing path: String) -> String {
+        (path as NSString).deletingLastPathComponent
+    }
+
+    /// The permission bits of a filesystem entry, or `nil` if it is not there.
+    private static func mode(of path: String) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        return (attributes[.posixPermissions] as? NSNumber)?.intValue
+    }
+
+    // MARK: - Socket placement
+    //
+    // The socket used to be `/tmp/qemu-<uuid>.sock` — a full control channel for
+    // the VM, sitting in a world-writable directory shared with every user on the
+    // host. A socket file's own mode is not portably honoured, so the directory
+    // around it is what actually restricts access.
+
+    /// The default socket goes in a private per-instance directory, not loose in
+    /// the temporary directory.
+    func testDefaultSocketLivesInAPrivateDirectory() async throws {
+        let process = makeManagedProcess(qemuPath: try makeSocketCreatingQEMU(body: Self.stayAlive))
+        let socketPath = process.getQMPSocketPath()
+        let directory = Self.directory(containing: socketPath)
+
+        XCTAssertEqual(
+            (socketPath as NSString).lastPathComponent, "qmp.sock",
+            "A short fixed name inside a private directory, not a UUID in a shared one"
+        )
+        XCTAssertNotEqual(
+            directory, (NSTemporaryDirectory() as NSString).standardizingPath,
+            "The socket must not sit directly in the shared temporary directory"
+        )
+
+        try await process.start(with: Self.defaultConfig)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socketPath))
+        XCTAssertEqual(
+            Self.mode(of: directory), 0o700,
+            "Directory permissions are the access control for a unix socket"
+        )
+    }
+
+    /// Teardown removes the whole private directory, not just the socket inside it.
+    func testPrivateSocketDirectoryIsRemovedOnStop() async throws {
+        let process = makeManagedProcess(qemuPath: try makeSocketCreatingQEMU(body: Self.stayAlive))
+        let directory = Self.directory(containing: process.getQMPSocketPath())
+
+        try await process.start(with: Self.defaultConfig)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory))
+
+        await process.stop(timeout: 5)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: directory),
+            "The directory this instance created is its own to remove"
+        )
+    }
+
+    /// Two instances must not share a directory, or one VM's teardown would delete
+    /// the other's socket.
+    func testEachInstanceGetsItsOwnDirectory() {
+        let first = QEMUProcess(qemuPath: "/nonexistent/qemu", logger: Logger(label: "test"))
+        let second = QEMUProcess(qemuPath: "/nonexistent/qemu", logger: Logger(label: "test"))
+
+        XCTAssertNotEqual(first.getQMPSocketPath(), second.getQMPSocketPath())
+    }
+
+    /// The base directory is injectable, for callers who want the socket somewhere
+    /// other than the temporary directory — `XDG_RUNTIME_DIR`, say.
+    func testRuntimeDirectoryIsInjectable() async throws {
+        // Short on purpose: a UUID here and the socket beneath it no longer fits in
+        // `sun_path` on macOS, which is the budget this whole scheme is working to.
+        let base = NSTemporaryDirectory() + "qemu-rt-\(UInt32.random(in: .min ... .max))"
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: base) }
+
+        let process = makeManagedProcess(
+            qemuPath: try makeSocketCreatingQEMU(body: Self.stayAlive),
+            runtimeDirectory: base
+        )
+        let socketPath = process.getQMPSocketPath()
+        XCTAssertTrue(socketPath.hasPrefix(base + "/"), "Got \(socketPath)")
+
+        // The base does not have to exist beforehand.
+        try await process.start(with: Self.defaultConfig)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: socketPath))
+    }
+
+    /// The whole point of dropping the UUID from the filename: a unix socket path
+    /// has about 100 bytes to work with, and macOS spends half of them on the
+    /// temporary directory before this library adds anything.
+    func testDefaultSocketPathFitsInSunPath() {
+        let process = QEMUProcess(qemuPath: "/nonexistent/qemu", logger: Logger(label: "test"))
+        let length = process.getQMPSocketPath().utf8.count
+
+        XCTAssertLessThan(
+            length, QEMUProcess.maxSocketPathLength,
+            "Path is \(length) bytes: \(process.getQMPSocketPath())"
+        )
+    }
+
+    /// An over-long path is named as such, rather than presenting as a socket that
+    /// never appears — which is how a bind failure otherwise reaches a caller.
+    func testOverLongSocketPathIsRejectedWithItsOwnError() async throws {
+        let process = QEMUProcess(
+            qemuPath: "/nonexistent/qemu",
+            runtimeDirectory: NSTemporaryDirectory() + String(repeating: "d", count: 200),
+            logger: Logger(label: "test")
+        )
+
+        do {
+            try await process.start(with: Self.defaultConfig)
+            XCTFail("Expected start to be refused")
+        } catch let error as QMPError {
+            guard case .socketPathTooLong(_, let limit) = error else {
+                return XCTFail("Expected .socketPathTooLong, got \(error)")
+            }
+            XCTAssertEqual(limit, QEMUProcess.maxSocketPathLength)
+        }
+    }
+
+    /// A caller-supplied path is bound and cleaned up, but never treated as
+    /// something to delete recursively. `removeItem` on a directory takes
+    /// everything under it, and this path comes from outside.
+    func testCallerSuppliedPathThatIsADirectoryIsNotDeleted() async throws {
+        let directory = NSTemporaryDirectory() + "qemu-not-a-socket-\(UUID().uuidString)"
+        let bystander = directory + "/precious.txt"
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        try "do not delete".write(toFile: bystander, atomically: true, encoding: .utf8)
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: directory) }
+
+        let process = QEMUProcess(
+            qemuPath: try makeFakeQEMU(body: "exit 1"),
+            qmpSocketPath: directory,
+            logger: Logger(label: "test")
+        )
+
+        try? await process.start(with: Self.defaultConfig)
+        await process.stop()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bystander), "The directory was deleted")
+    }
+
+    /// Dropping the process cleans up its directory too, not just the socket.
+    func testDroppingTheProcessRemovesItsPrivateDirectory() async throws {
+        let fake = try makeSocketCreatingQEMU(body: Self.stayAlive)
+
+        var process: QEMUProcess? = QEMUProcess(qemuPath: fake, logger: Logger(label: "test"))
+        let directory = Self.directory(containing: process!.getQMPSocketPath())
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: directory) }
+
+        try await process?.start(with: Self.defaultConfig)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory))
+
+        process = nil
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory))
+    }
+
+    // MARK: - Debug log files
+
+    /// The debug log is guest output — with `-nographic` it is the guest console —
+    /// so it belongs in the private directory too, and not in a world-readable
+    /// `/tmp/qemu-*.log`.
+    ///
+    /// It also has to outlive the VM: a log you cannot read after the thing you
+    /// were debugging exits is no use, so this is the one case where teardown
+    /// leaves the directory behind.
+    func testLogFileIsPrivateAndOutlivesTheVM() async throws {
+        setenv("ENABLE_QEMU_PROCESS_LOG_FILES", "true", 1)
+        defer { unsetenv("ENABLE_QEMU_PROCESS_LOG_FILES") }
+
+        let fake = try makeSocketCreatingQEMU(body: """
+        echo "guest console output"
+        \(Self.stayAlive)
+        """)
+        let process = makeManagedProcess(qemuPath: fake)
+        let directory = Self.directory(containing: process.getQMPSocketPath())
+
+        try await process.start(with: Self.defaultConfig)
+        await process.stop(timeout: 5)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: directory),
+            "A directory holding a log the caller asked for must survive teardown"
+        )
+        XCTAssertEqual(Self.mode(of: directory), 0o700)
+
+        let logs = try FileManager.default.contentsOfDirectory(atPath: directory)
+            .filter { $0.hasSuffix(".log") }
+        XCTAssertEqual(logs.count, 1, "Expected exactly one log, got \(logs)")
+
+        let logPath = directory + "/" + (logs.first ?? "")
+        XCTAssertEqual(Self.mode(of: logPath), 0o600, "The log is guest output; keep it to the owner")
+        XCTAssertTrue(
+            (try String(contentsOfFile: logPath, encoding: .utf8)).contains("guest console output"),
+            "stdout should still be reaching the log"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: process.getQMPSocketPath()),
+            "The socket still goes, even when the directory stays"
+        )
     }
 
     // MARK: - Concurrent access

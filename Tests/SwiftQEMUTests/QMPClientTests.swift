@@ -1,5 +1,6 @@
 import XCTest
 import NIOCore
+import NIOConcurrencyHelpers
 import NIOPosix
 import Logging
 @testable import SwiftQEMU
@@ -54,6 +55,11 @@ final class QMPClientTests: XCTestCase {
         /// Negotiate normally, then reply with a payload that is large but still
         /// inside the cap — the case the cap must not break.
         case greetThenReplyWithLargePayload
+        /// Greet and negotiate normally, then answer `system_reset` with a burst of
+        /// `floodedEventCount` numbered events before its reply. Models an event
+        /// source faster than its consumer, which a bounded buffer has to survive
+        /// without stalling the connection.
+        case greetAndFloodEvents
     }
 
     /// Padding sizes for the frame-limit tests. The flood is far past any cap a
@@ -63,21 +69,45 @@ final class QMPClientTests: XCTestCase {
     private static let oversizedFramePadding = 400
     private static let largeLegalPadding = 60_000
 
+    /// How many events `.greetAndFloodEvents` emits per `system_reset`.
+    static let floodedEventCount = 200
+
     private static let deviceDeletedEvent = #"{"timestamp": {"seconds": 1745000000, "microseconds": 1}, "event": "DEVICE_DELETED", "data": {"device": "vdb", "path": "/machine/peripheral/vdb"}}"#
     private static let resumeEvent = #"{"timestamp": {"seconds": 1745000000, "microseconds": 2}, "event": "RESUME"}"#
 
-    private static let greeting = #"{"QMP": {"version": {"qemu": {"major": 8, "minor": 0, "micro": 0}, "package": ""}, "capabilities": []}}"#
+    private static func greeting(capabilities: [String]) -> String {
+        let list = capabilities.map { "\"\($0)\"" }.joined(separator: ", ")
+        return #"{"QMP": {"version": {"qemu": {"major": 8, "minor": 0, "micro": 0}, "package": ""}, "capabilities": [\#(list)]}}"#
+    }
 
     final class FakeQMPServer: Sendable {
         private let channel: Channel
         let socketPath: String
+        /// Every request line the server received. Asserting on the wire form is the
+        /// only way to tell a correctly encoded request from one that happens to
+        /// produce the same result against a lenient fake.
+        private let received: NIOLockedValueBox<[String]>
 
-        init(behaviour: ServerBehaviour) async throws {
+        var receivedRequests: [String] {
+            received.withLockedValue { $0 }
+        }
+
+        /// - Parameter capabilities: what the greeting advertises. QEMU 11 offers
+        ///   `["oob"]`; the empty default keeps the older tests unchanged.
+        init(behaviour: ServerBehaviour, capabilities: [String] = []) async throws {
             self.socketPath = NSTemporaryDirectory() + "qmp-test-\(UUID().uuidString).sock"
+            let received = NIOLockedValueBox<[String]>([])
+            self.received = received
 
             let bootstrap = ServerBootstrap(group: MultiThreadedEventLoopGroup.singleton)
                 .childChannelInitializer { channel in
-                    channel.pipeline.addHandler(ServerHandler(behaviour: behaviour))
+                    channel.pipeline.addHandler(
+                        ServerHandler(
+                            behaviour: behaviour,
+                            capabilities: capabilities,
+                            received: received
+                        )
+                    )
                 }
             self.channel = try await bootstrap.bind(unixDomainSocketPath: socketPath).get()
         }
@@ -92,16 +122,24 @@ final class QMPClientTests: XCTestCase {
             typealias OutboundOut = ByteBuffer
 
             private let behaviour: ServerBehaviour
+            private let capabilities: [String]
+            private let received: NIOLockedValueBox<[String]>
             private var buffer = ByteBuffer()
             private var negotiated = false
 
-            init(behaviour: ServerBehaviour) {
+            init(
+                behaviour: ServerBehaviour,
+                capabilities: [String],
+                received: NIOLockedValueBox<[String]>
+            ) {
                 self.behaviour = behaviour
+                self.capabilities = capabilities
+                self.received = received
             }
 
             func channelActive(context: ChannelHandlerContext) {
                 guard behaviour != .silent else { return }
-                write(QMPClientTests.greeting, context: context)
+                write(QMPClientTests.greeting(capabilities: capabilities), context: context)
             }
 
             func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -113,7 +151,11 @@ final class QMPClientTests: XCTestCase {
                 // Echo back a success response per newline-delimited request,
                 // preserving the request's `id` the way QEMU does.
                 while let line = readLine(&buffer) {
-                    if behaviour == .greetAndBehaveLikeQEMU || behaviour == .greetAndDeleteBeforeReplying {
+                    received.withLockedValue { $0.append(line) }
+
+                    if behaviour == .greetAndBehaveLikeQEMU
+                        || behaviour == .greetAndDeleteBeforeReplying
+                        || behaviour == .greetAndFloodEvents {
                         replyLikeQEMU(to: line, context: context)
                         continue
                     }
@@ -160,6 +202,13 @@ final class QMPClientTests: XCTestCase {
                 if line.contains("query-status") {
                     // No `singlestep`: removed from QEMU's StatusInfo.
                     reply("{\"status\": \"running\", \"running\": true}")
+                } else if line.contains("system_reset"), behaviour == .greetAndFloodEvents {
+                    // Numbered so a test can tell *which* events a bounded buffer
+                    // kept when it could not keep them all.
+                    for sequence in 0..<QMPClientTests.floodedEventCount {
+                        write(#"{"event": "RESET", "data": {"seq": \#(sequence)}}"#, context: context)
+                    }
+                    reply("{}")
                 } else if line.contains("\"cont\"") {
                     // The event genuinely precedes the reply.
                     write(QMPClientTests.resumeEvent, context: context)
@@ -665,6 +714,395 @@ final class QMPClientTests: XCTestCase {
         XCTAssertEqual(status.status, "running")
         XCTAssertTrue(status.running)
         XCTAssertNil(status.singlestep, "The field is absent, not false")
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Event stream
+
+    /// Take up to `count` events, giving up after `timeout`.
+    ///
+    /// A bare `for await` would hang the whole suite if delivery regressed, which
+    /// turns a failing assertion into a stuck test run.
+    private static func collect(
+        _ count: Int,
+        from stream: AsyncStream<QMPEvent>,
+        timeout: TimeInterval = 5
+    ) async -> [QMPEvent] {
+        await withTaskGroup(of: [QMPEvent]?.self) { group in
+            group.addTask {
+                var collected: [QMPEvent] = []
+                for await event in stream {
+                    collected.append(event)
+                    if collected.count == count { break }
+                }
+                return collected
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? []
+        }
+    }
+
+    /// Drain a stream until it *finishes*, returning `nil` if it has not within
+    /// `timeout`.
+    ///
+    /// The distinction matters: a stream that never ends and a stream that ends
+    /// having produced nothing both look like "no events", and only the second one
+    /// is correct. Anything asserting on completion has to be able to tell them
+    /// apart.
+    private static func drainUntilFinished(
+        _ stream: AsyncStream<QMPEvent>,
+        timeout: TimeInterval = 3
+    ) async -> [QMPEvent]? {
+        await withTaskGroup(of: [QMPEvent]?.self) { group in
+            group.addTask {
+                var collected: [QMPEvent] = []
+                for await event in stream {
+                    collected.append(event)
+                }
+                return collected
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+
+    /// The events QEMU announces have to reach a subscriber. Before there was a
+    /// stream, everything except `DEVICE_DELETED` was logged at debug level and
+    /// dropped, leaving callers to poll `query-status` for things QEMU had already
+    /// reported.
+    func testEventsReachASubscriber() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let events = try client.events()
+        _ = try await client.execute(.cont)
+
+        let received = await Self.collect(1, from: events)
+        XCTAssertEqual(received.map(\.event), ["RESUME"])
+
+        try await client.disconnect()
+    }
+
+    /// Several consumers can watch one connection: the manager keeps its own status
+    /// bookkeeping while an application watches the same events.
+    func testEverySubscriberSeesEveryEvent() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let first = try client.events()
+        let second = try client.events()
+        _ = try await client.execute(.cont)
+
+        async let pendingFirst = Self.collect(1, from: first)
+        async let pendingSecond = Self.collect(1, from: second)
+        let firstReceived = await pendingFirst
+        let secondReceived = await pendingSecond
+
+        XCTAssertEqual(firstReceived.map(\.event), ["RESUME"])
+        XCTAssertEqual(secondReceived.map(\.event), ["RESUME"])
+
+        try await client.disconnect()
+    }
+
+    /// `disconnect()` must finish the stream, or a `for await` over it parks forever
+    /// on a connection that no longer exists.
+    func testEventStreamFinishesOnDisconnect() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let events = try client.events()
+        try await client.disconnect()
+
+        let received = await Self.drainUntilFinished(events)
+        XCTAssertNotNil(received, "The stream must be over, not merely silent")
+        XCTAssertEqual(received?.count, 0)
+    }
+
+    /// The same for a peer that goes away on its own — QEMU exiting in response to
+    /// `quit` is the ordinary case, not an exceptional one.
+    func testEventStreamFinishesWhenThePeerGoesAway() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let events = try client.events()
+        _ = try await client.execute(.quit)
+
+        // The fake server closes the socket after answering `quit`.
+        let received = await Self.drainUntilFinished(events)
+        XCTAssertNotNil(received, "The stream must finish when the peer closes the connection")
+
+        try await client.disconnect()
+    }
+
+    func testSubscribingWithoutAConnectionThrows() throws {
+        let client = QMPClient(logger: Logger(label: "test"))
+        XCTAssertThrowsError(try client.events()) { error in
+            guard case QMPError.notConnected = error else {
+                return XCTFail("Expected .notConnected, got \(error)")
+            }
+        }
+    }
+
+    /// A subscriber that stops reading must not stall the event loop, so the buffer
+    /// is bounded and drops the *oldest* events. The connection has to stay fully
+    /// usable while that happens — a blocking yield here would wedge QEMU's socket
+    /// for every other waiter too.
+    func testSlowSubscriberDropsOldestEventsWithoutStallingTheConnection() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndFloodEvents)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let bufferSize = 4
+        let events = try client.events(bufferSize: bufferSize)
+
+        // Nothing is read until the reply lands, by which point every event has been
+        // yielded and the buffer has had to make its choice.
+        _ = try await client.execute(.systemReset)
+
+        // The connection is still alive and correlating replies.
+        let status = try await client.queryStatus()
+        XCTAssertEqual(status.status, "running")
+
+        let received = await Self.collect(bufferSize, from: events)
+        XCTAssertEqual(received.count, bufferSize)
+        XCTAssertEqual(
+            received.compactMap { $0.data?["seq"]?.intValue },
+            Array((Self.floodedEventCount - bufferSize)..<Self.floodedEventCount),
+            "A full buffer keeps the newest events and discards the oldest"
+        )
+
+        try await client.disconnect()
+    }
+
+    /// `DEVICE_DELETED` keeps its dedicated ticket path — a detach needs a targeted,
+    /// timed wait, not a scan of a shared stream — and publishing it to subscribers
+    /// must not consume it on the way.
+    func testDeviceDeletedReachesBothItsTicketAndTheStream() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let events = try client.events()
+        try await client.deviceDel(deviceId: "vdb", timeout: 3)
+
+        let received = await Self.collect(1, from: events)
+        XCTAssertEqual(received.map(\.event), ["DEVICE_DELETED"])
+        XCTAssertEqual(received.first?.data?["device"]?.stringValue, "vdb")
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Capability negotiation
+
+    /// The greeting's capabilities were decoded and thrown away, so `oob` stayed off
+    /// however new the QEMU was. What it offers and we support must be asked for by
+    /// name.
+    func testOfferedCapabilitiesAreNegotiated() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU, capabilities: ["oob"])
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        XCTAssertEqual(client.negotiatedCapabilities, [.oob])
+        XCTAssertEqual(client.greeting?.QMP.capabilities, ["oob"], "The greeting is kept, not discarded")
+        XCTAssertEqual(client.greeting?.QMP.version.qemu.major, 8)
+
+        let negotiation = try XCTUnwrap(server.receivedRequests.first { $0.contains("qmp_capabilities") })
+        XCTAssertTrue(negotiation.contains("\"enable\""), negotiation)
+        XCTAssertTrue(negotiation.contains("\"oob\""), negotiation)
+
+        try await client.disconnect()
+
+        XCTAssertEqual(client.negotiatedCapabilities, [], "Capabilities belong to a connection")
+        XCTAssertNil(client.greeting)
+    }
+
+    /// Asking for a capability QEMU did not offer fails the negotiation outright,
+    /// which leaves a monitor that refuses every later command. So the request is the
+    /// intersection, never the wish list.
+    func testNoEnableListWhenTheGreetingOffersNothingWeSupport() async throws {
+        let server = try await FakeQMPServer(
+            behaviour: .greetAndBehaveLikeQEMU,
+            capabilities: ["something-qemu-invents-later"]
+        )
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        XCTAssertEqual(client.negotiatedCapabilities, [])
+
+        let negotiation = try XCTUnwrap(server.receivedRequests.first { $0.contains("qmp_capabilities") })
+        XCTAssertFalse(
+            negotiation.contains("\"enable\""),
+            "A capability we do not implement must not be requested: \(negotiation)"
+        )
+
+        try await client.disconnect()
+    }
+
+    /// Opting out has to be possible, and has to mean nothing is enabled even when
+    /// QEMU offers it.
+    func testCapabilitiesAreNotNegotiatedWhenNoneAreRequested() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU, capabilities: ["oob"])
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(
+            logger: Logger(label: "test"),
+            requestTimeout: 5,
+            connectTimeout: 5,
+            requestedCapabilities: []
+        )
+        try await client.connectUnix(path: server.socketPath)
+
+        XCTAssertEqual(client.negotiatedCapabilities, [])
+        let negotiation = try XCTUnwrap(server.receivedRequests.first { $0.contains("qmp_capabilities") })
+        XCTAssertFalse(negotiation.contains("\"enable\""), negotiation)
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Out-of-band execution
+
+    /// An out-of-band request is spelled `exec-oob`, not `execute` plus a `control`
+    /// member: QEMU 11 rejects the latter with "QMP input member 'control' is
+    /// unexpected" (verified against 11.0.2), so only the wire form proves this.
+    func testOutOfBandRequestUsesTheExecOOBKey() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU, capabilities: ["oob"])
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        _ = try await client.queryYank(outOfBand: true)
+
+        let sent = try XCTUnwrap(server.receivedRequests.first { $0.contains("query-yank") })
+        XCTAssertTrue(sent.contains("\"exec-oob\":\"query-yank\""), sent)
+        XCTAssertFalse(sent.contains("\"execute\""), sent)
+        XCTAssertFalse(sent.contains("control"), "The `control` form is rejected by QEMU: \(sent)")
+        XCTAssertTrue(sent.contains("\"id\""), "An out-of-band request must be correlatable: \(sent)")
+
+        try await client.disconnect()
+    }
+
+    /// Without the capability, QEMU answers an `exec-oob` request with "QMP input
+    /// member 'exec-oob' is unexpected", which names the JSON rather than the
+    /// problem. Caught before it goes out instead.
+    func testOutOfBandExecuteRequiresTheCapability() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        do {
+            _ = try await client.executeOutOfBand(.queryYank)
+            XCTFail("Expected an out-of-band request to be refused without the capability")
+        } catch let error as QMPError {
+            guard case .capabilityNotNegotiated(.oob) = error else {
+                return XCTFail("Expected .capabilityNotNegotiated(.oob), got \(error)")
+            }
+        }
+
+        XCTAssertFalse(
+            server.receivedRequests.contains { $0.contains("exec-oob") },
+            "Nothing should have reached the wire"
+        )
+
+        try await client.disconnect()
+    }
+
+    /// In-band execution is unaffected by having the capability, and still goes out
+    /// under `execute`.
+    func testInBandRequestsStillUseExecute() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU, capabilities: ["oob"])
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        _ = try await client.queryYank()
+
+        let sent = try XCTUnwrap(server.receivedRequests.first { $0.contains("query-yank") })
+        XCTAssertTrue(sent.contains("\"execute\":\"query-yank\""), sent)
+        XCTAssertFalse(sent.contains("exec-oob"), sent)
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Against a real QEMU
+
+    /// The out-of-band path end to end against a real QEMU.
+    ///
+    /// The fake server accepts whatever it is sent, so it can only prove the shape
+    /// this library *intends* to send. QEMU is the authority on whether that shape
+    /// is accepted at all — and it rejects the plausible-looking alternative with
+    /// `QMP input member 'control' is unexpected`. Skipped where QEMU is not
+    /// installed.
+    func testOutOfBandCommandIsAcceptedByARealQEMU() async throws {
+        let candidates = [
+            "/opt/homebrew/bin/qemu-system-x86_64",
+            "/usr/local/bin/qemu-system-x86_64",
+            "/usr/bin/qemu-system-x86_64"
+        ]
+        guard let qemuPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("qemu-system-x86_64 not installed")
+        }
+
+        // The socket path is left to `QEMUProcess`, which puts it in a private
+        // directory and keeps it inside `sun_path`'s ~104 bytes. A hand-built
+        // `NSTemporaryDirectory() + UUID` path is about 100 of those on macOS —
+        // close enough to the limit to be worth not doing.
+        let process = QEMUProcess(qemuPath: qemuPath, logger: Logger(label: "test"))
+        let socketPath = process.getQMPSocketPath()
+        addTeardownBlock { await process.stop() }
+
+        var config = QEMUConfiguration()
+        config.memoryMB = 128
+        try await process.start(with: config)
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: socketPath)
+
+        XCTAssertEqual(client.negotiatedCapabilities, [.oob], "QEMU 11 offers oob")
+
+        // `query-yank` is one of the four commands QEMU marks `allow-oob`. A reply at
+        // all is the assertion: a malformed out-of-band request is answered with an
+        // error, which `executeOutOfBand` throws.
+        let instances = try await client.queryYank(outOfBand: true)
+        XCTAssertFalse(instances.isEmpty, "The monitor's own chardev is always yankable")
+
+        // And an in-band command still works on the same connection afterwards.
+        let status = try await client.queryStatus()
+        XCTAssertEqual(status.status, "prelaunch")
 
         try await client.disconnect()
     }

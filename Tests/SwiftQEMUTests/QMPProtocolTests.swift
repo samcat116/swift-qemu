@@ -54,6 +54,72 @@ final class QMPProtocolTests: XCTestCase {
         XCTAssertTrue(json.contains("\"id\":\"swiftqemu-1\""))
     }
 
+    /// An out-of-band request names its command under `exec-oob`.
+    ///
+    /// This is the only spelling QEMU 11 accepts. The `"execute"` +
+    /// `"control": {"run-oob": true}` form from the original OOB proposal is
+    /// rejected with `QMP input member 'control' is unexpected` (verified against
+    /// 11.0.2), so encoding it that way would produce a feature that never works.
+    func testOutOfBandRequestEncoding() throws {
+        let request = QMPRequest(execute: "yank", arguments: ["instances": []], id: "swiftqemu-1", outOfBand: true)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let json = String(decoding: try encoder.encode(request), as: UTF8.self)
+
+        XCTAssertTrue(json.contains("\"exec-oob\":\"yank\""), json)
+        XCTAssertFalse(json.contains("\"execute\""), json)
+        XCTAssertFalse(json.contains("control"), json)
+        // OOB requests have to be correlatable: they are answered out of order by
+        // definition, so the id is what matches the reply to the caller.
+        XCTAssertTrue(json.contains("\"id\":\"swiftqemu-1\""), json)
+    }
+
+    func testRequestRoundTripPreservesOutOfBand() throws {
+        let encoder = JSONEncoder()
+
+        for outOfBand in [true, false] {
+            let original = QMPRequest(
+                execute: "query-yank",
+                arguments: ["k": 1],
+                id: "swiftqemu-2",
+                outOfBand: outOfBand
+            )
+            let decoded = try decoder.decode(QMPRequest.self, from: try encoder.encode(original))
+
+            XCTAssertEqual(decoded.execute, "query-yank")
+            XCTAssertEqual(decoded.id, "swiftqemu-2")
+            XCTAssertEqual(decoded.arguments?["k"]?.intValue, 1)
+            XCTAssertEqual(decoded.outOfBand, outOfBand)
+        }
+    }
+
+    /// A request is in-band unless asked otherwise; nothing existing changes shape.
+    func testRequestsAreInBandByDefault() throws {
+        XCTAssertFalse(QMPRequest(execute: "quit").outOfBand)
+    }
+
+    // MARK: - Capabilities
+
+    /// QEMU 11 advertises exactly this, and the greeting's list is what negotiation
+    /// has to be driven from rather than discarded.
+    func testGreetingCapabilitiesAreDecoded() throws {
+        let json = """
+        {"QMP": {"version": {"qemu": {"micro": 2, "minor": 0, "major": 11}, "package": ""},
+         "capabilities": ["oob"]}}
+        """
+
+        let greeting = try decoder.decode(QMPGreeting.self, from: Data(json.utf8))
+
+        XCTAssertEqual(greeting.QMP.capabilities, ["oob"])
+        XCTAssertEqual(greeting.QMP.capabilities.compactMap(QMPCapability.init(rawValue:)), [.oob])
+    }
+
+    /// A capability QEMU invents later must not decode into one we claim to support.
+    func testUnknownCapabilityIsNotMistakenForASupportedOne() {
+        XCTAssertNil(QMPCapability(rawValue: "something-qemu-invents-later"))
+    }
+
     /// Nested arguments must go out as the JSON QEMU expects, and integers must
     /// stay integers — QEMU rejects an integer field that arrives as `1.0`.
     func testNestedArgumentEncoding() throws {
