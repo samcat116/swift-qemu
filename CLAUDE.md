@@ -120,13 +120,17 @@ The codebase includes critical fixes for production reliability:
     - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties; anything computed or any method call would not compile there
     - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is `await`-ed and `defer` bodies cannot await. That also reaches cleanup on failure paths, which the hand-written `await process.stop()` calls it replaced did not
 
+13. **A Created VM Reports `.paused`, Not `.creating`**: `startPaused` defaults to `true`, so the stock `createVM` launches QEMU with `-S`, and QEMU reports that run state as `prelaunch` — which mapped to `.creating`. A VM that was fully created and waiting to be started therefore read as still being created, and `.creating` meant two things at once, so a caller could not tell "still coming up" from "waiting for me". Now:
+    - `prelaunch` maps to `.paused`. It is a stopped-but-live VM that `start()` resumes, which is what `.paused` means everywhere else in the API
+    - `.creating` is left to the window before `createVM` returns. `inmigrate` keeps it — an incoming migration really is a VM still being constructed — and nothing else QEMU reports maps to it
+    - The mapping moved out of `updateStatus()` into `QEMUVMStatus.init?(_ response: QMPStatusResponse)`, a pure function testable without a process or a socket. It returns `nil` for an unrecognised run state so the manager still logs the raw string before falling back to `.unknown`
+
 ### Known Gaps
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
 - **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
-- **`prelaunch` maps to `.creating`**: a VM created with `startPaused: true` reports `.creating` rather than `.paused` until it is started, because QEMU reports `prelaunch` for both cases
-- **No end-to-end `QEMUManager` coverage**: its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. Covering the manager needs an injectable QMP-speaking fake
+- **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` drives the manager against a real QEMU for the create → start → destroy path (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake
 - **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
 
 ### Configuration Types
