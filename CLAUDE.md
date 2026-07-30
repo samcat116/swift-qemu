@@ -29,6 +29,7 @@ swift test --filter QMPProtocolTests
 **QEMUManager** (Sources/SwiftQEMU/QEMUManager.swift)
 - High-level API that coordinates process and QMP management
 - Manages VM lifecycle: create, start, pause, reset, shutdown, destroy
+- Owns the running VM's hot-plug topology: it keeps the `QEMUConfiguration` the VM was started with, and a `HotplugPortPool` of the `pcie-root-port` devices from its command line, because which bus `device_add` may target is decided at launch and not at attach time (see fix 13)
 - Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown)
 - Actor-based for thread-safe concurrent access
 
@@ -120,14 +121,22 @@ The codebase includes critical fixes for production reliability:
     - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties; anything computed or any method call would not compile there
     - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is `await`-ed and `defer` bodies cannot await. That also reaches cleanup on failure paths, which the hand-written `await process.stop()` calls it replaced did not
 
+13. **Hot-Plug on the Default Machine Type**: `machineType` defaults to `q35`, whose `pcie.0` is a PCIe root complex, and `attachDisk` named no bus — so `device_add` landed on `pcie.0` and QEMU answered `Bus 'pcie.0' does not support hotplugging`. `attachDisk`/`detachDisk` were therefore unusable as shipped unless the caller knew to switch to `-machine pc`. A PCIe complex hot-plugs only through a `pcie-root-port`, and a root port **cannot itself be hot-plugged** — it has to be on the command line at launch, which is why this could not be fixed inside `attachDisk`. Now:
+    - `QEMUConfiguration.hotplugPorts` (`.automatic`/`.count(n)`/`.disabled`, default `.automatic`) pre-creates root ports, and `QEMUManager` hands one out per `attachDisk`, releasing it on `detachDisk`. A port holds exactly one device — a second `device_add` onto an occupied port is refused with `slot 0 function 0 already occupied` — so the pool is a real capacity limit, `automaticHotplugPortCount` (4) by default, and `QEMUManager.availableHotplugPorts` reports what is left
+    - **`chassis` is mandatory and must be unique.** Two root ports that both leave it unset stop QEMU from starting with `Can't add chassis slot, error -16`. The emitted arguments are `pcie-root-port,id=swiftqemu-hotplug<i>,chassis=<i+1>`, and deliberately carry **no `bus=`**: the machine's own default root complex is the right parent, verified on q35, `pc` and arm `virt` alike
+    - `.automatic` is gated on the machine type by allowlist (`q35`, `pc-q35-*`, `virt`, `virt-*`), because a root port is only valid where there is a PCI bus to put it on — on `microvm` the argument alone is fatal (`No 'PCI' bus found for device 'pcie-root-port'`). Being wrong in that direction costs a launch; being wrong the other way costs one clear error at attach time, so unknown machine types get no ports
+    - `pc` deliberately gets none: its `pci.0` hot-plugs directly, and `attachDisk` names no bus there
+    - Both failure modes now name their cause: `QMPError.noHotplugPortAvailable(machineType:portCount:inUse:)` when there is no free port (thrown *before* `blockdev-add`, so a refused attach leaves no orphaned backend node), and `QMPError.hotplugNotSupported(bus:machineType:)` in place of QEMU's bare `GenericError`. `attachDisk(bus:)` lets a caller with its own topology bypass the pool entirely
+    - Every QEMU behaviour above was checked over a raw QMP socket against QEMU 11.0.2 before being encoded, and `QEMUHotplugTests` starts real VMs to cover both sides of the gate: default-config attach, all four ports, pool exhaustion, `pc` with no ports, and `.disabled` on q35 (which is the pre-fix state, and must fail with the named error)
+
 ### Known Gaps
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
 - **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
 - **`prelaunch` maps to `.creating`**: a VM created with `startPaused: true` reports `.creating` rather than `.paused` until it is started, because QEMU reports `prelaunch` for both cases
-- **No end-to-end `QEMUManager` coverage**: its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. Covering the manager needs an injectable QMP-speaking fake
-- **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
+- **`QEMUManager` is only covered against a real QEMU**: `QEMUHotplugTests` drives it end to end (create → attach → query → destroy), but only where QEMU is installed, and it still cannot be tested against a *misbehaving* QMP peer — its `QMPClient` is created in `init` and cannot be injected. Those cases are covered at the `QMPClient`/`QEMUProcess` level instead
+- **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. This is documented on the API and its timeout is now a parameter, but nothing can make a guest-less VM release a device
 
 ### Configuration Types
 
@@ -138,6 +147,7 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 - Disks (QEMUDisk): path, format (qcow2/raw), interface (virtio/ide)
 - Networks (QEMUNetwork): backend (user/tap/bridge), model (virtio-net-pci)
 - Kernel, initrd, and kernel arguments for direct kernel boot
+- **Hot-plug ports** (`QEMUHotplugPorts`: `.automatic`/`.count(n)`/`.disabled`), emitted as `-device pcie-root-port,...`. Defaults to `.automatic`, which provides `automaticHotplugPortCount` (4) ports on machine types whose default bus refuses hot-plug and none on the rest — see Hot-Plug on the Default Machine Type above. `hotplugPortIDs` is the single source of both the launch arguments and the manager's pool
 - Display options (noGraphic flag)
 - Start paused option for controlled initialization
 
@@ -178,6 +188,14 @@ qemu-system-x86_64 -accel help
 
 `QEMUConfigurationTests.testDefaultConfigurationStartsRealQEMU` starts a real QEMU with the stock configuration when one is installed, and skips otherwise. It is the only test that can confirm the accelerator and CPU model are actually accepted.
 
+`QEMUHotplugTests` goes further and drives `QEMUManager` end to end against a real QEMU — create, `attachDisk`, `query-block`, destroy — because whether a `device_add` lands anywhere is a fact about QEMU's PCI topology that no fake can answer. It needs `qemu-img` as well (each test hot-plugs a real 16M qcow2) and skips when either binary is missing. Each VM boots paused with 128MB under TCG, so the whole suite is under a second per VM.
+
+```bash
+# Machine types this binary provides. The name is what decides whether root ports
+# are pre-created, versioned aliases (pc-q35-10.0) included
+qemu-system-x86_64 -machine help
+```
+
 ### QMP Socket Debugging
 
 When debugging QMP issues:
@@ -207,6 +225,14 @@ try await manager.createVM(config: config)
 
 // Start VM execution
 try await manager.start()
+
+// Hot-plug a disk. On q35 this goes into one of the pcie-root-port devices
+// `config.hotplugPorts` put on the command line — four by default, one per disk.
+try await manager.attachDisk(path: "/path/to/extra.qcow2", deviceName: "vdb")
+// await manager.availableHotplugPorts  // 3, or nil where the default bus hot-plugs
+// Detach needs the *guest* to release the device; a VM with no guest OS never does,
+// and this times out with nothing removed.
+try await manager.detachDisk(deviceName: "vdb", timeout: 30)
 
 // Later: gracefully shutdown (default 30 second timeout, then force quit)
 try await manager.shutdown()
@@ -238,6 +264,8 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - socketCreationFailed (QMP socket not created within timeout, process still alive)
 - processExited(exitCode:killedBySignal:stderr:) (QEMU died before the socket was ready; carries its stderr)
 - processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
+- noHotplugPortAvailable(machineType:portCount:inUse:) (nowhere to hot-plug the disk: the machine type refuses hot-plug on its default bus and no free `pcie-root-port` was left. Thrown before anything reaches QEMU)
+- hotplugNotSupported(bus:machineType:) (QEMU refused `device_add` because the target bus does not support hot-plug, in place of its own bare `GenericError`)
 - timeout (createVM operation exceeded timeout)
 - invalidResponse, invalidConfiguration
 - qmpError(class, description) for QMP-specific errors

@@ -17,6 +17,15 @@ public enum QMPError: Error, LocalizedError {
     /// The QEMU process outlived both SIGTERM and SIGKILL, so a force quit could not
     /// deliver what it promises. Carries the pid of the survivor.
     case processTerminationFailed(pid: Int32?)
+    /// There was nowhere to hot-plug the device: the machine type refuses hot-plug
+    /// on its default bus and no free `pcie-root-port` was left to target. Thrown
+    /// before anything is sent to QEMU, and names the configuration knob that fixes
+    /// it — which is the whole point, since QEMU's own answer
+    /// (`Bus 'pcie.0' does not support hotplugging`) names nothing actionable.
+    case noHotplugPortAvailable(machineType: String, portCount: Int, inUse: Int)
+    /// QEMU refused `device_add` because the target bus does not support hot-plug.
+    /// The `qmpError` this replaces said which bus, but not what to do about it.
+    case hotplugNotSupported(bus: String, machineType: String)
 
     public var errorDescription: String? {
         switch self {
@@ -48,6 +57,27 @@ public enum QMPError: Error, LocalizedError {
         case .processTerminationFailed(let pid):
             let which = pid.map { "process \($0)" } ?? "process"
             return "QEMU \(which) is still running after SIGTERM and SIGKILL"
+        case .noHotplugPortAvailable(let machineType, let portCount, let inUse):
+            guard portCount > 0 else {
+                return """
+                    Machine type '\(machineType)' does not support hot-plug on its default bus, \
+                    and this VM was started with no PCIe root ports to plug into. \
+                    Set QEMUConfiguration.hotplugPorts to .automatic or .count(n) before \
+                    starting the VM, or pass an explicit `bus` to attachDisk.
+                    """
+            }
+            return """
+                All \(portCount) pre-created PCIe root ports are in use (\(inUse) attached device\
+                \(inUse == 1 ? "" : "s")), and machine type '\(machineType)' cannot hot-plug onto \
+                its default bus. Detach a disk, or start the VM with \
+                QEMUConfiguration.hotplugPorts = .count(\(portCount + 1)) or more.
+                """
+        case .hotplugNotSupported(let bus, let machineType):
+            return """
+                QEMU refused to hot-plug onto bus '\(bus)' of machine type '\(machineType)': \
+                that bus does not support hot-plug. Pre-create PCIe root ports with \
+                QEMUConfiguration.hotplugPorts, or target a bus that accepts hot-plug.
+                """
         }
     }
 
