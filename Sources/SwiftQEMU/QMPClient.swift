@@ -9,13 +9,13 @@ public final class QMPClient: Sendable {
     /// Default time budget for a single QMP round-trip. A live QEMU answers in
     /// milliseconds; the bound exists so a wedged or silent peer surfaces as an
     /// error instead of parking the caller forever.
-    public static let defaultRequestTimeout: TimeInterval = 10
+    public static let defaultRequestTimeout: Duration = .seconds(10)
 
     /// Default time budget for the greeting + capability negotiation that
     /// follows a successful connect. A socket that accepts but never speaks
     /// (e.g. a stale socket file outliving its QEMU process) is the case this
     /// bounds.
-    public static let defaultConnectTimeout: TimeInterval = 10
+    public static let defaultConnectTimeout: Duration = .seconds(10)
 
     /// Default cap on a single inbound QMP frame, terminating newline included.
     ///
@@ -29,8 +29,8 @@ public final class QMPClient: Sendable {
 
     private let logger: Logger
     private let eventLoopGroup: EventLoopGroup
-    private let requestTimeout: TimeInterval
-    private let connectTimeout: TimeInterval
+    private let requestTimeout: Duration
+    private let connectTimeout: Duration
     private let maximumFrameSize: Int
 
     /// The capabilities to enable when QEMU offers them.
@@ -57,8 +57,8 @@ public final class QMPClient: Sendable {
 
     public init(
         logger: Logger = Logger(label: "SwiftQEMU.QMPClient"),
-        requestTimeout: TimeInterval = QMPClient.defaultRequestTimeout,
-        connectTimeout: TimeInterval = QMPClient.defaultConnectTimeout,
+        requestTimeout: Duration = QMPClient.defaultRequestTimeout,
+        connectTimeout: Duration = QMPClient.defaultConnectTimeout,
         maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize,
         requestedCapabilities: Set<QMPCapability> = [.oob]
     ) {
@@ -131,20 +131,20 @@ public final class QMPClient: Sendable {
     ///   read the current state afterwards if you need both.
     ///
     /// - Throws: `QMPError.notConnected` if there is no connection to subscribe to.
-    public func events(bufferSize: Int = QMPClient.defaultEventBufferSize) throws -> AsyncStream<QMPEvent> {
+    public func events(bufferSize: Int = QMPClient.defaultEventBufferSize) throws(QMPError) -> AsyncStream<QMPEvent> {
         try connectedConnection().events.subscribe(bufferSize: bufferSize)
     }
 
     // MARK: - Connection Management
 
     /// Connect to QEMU via Unix domain socket
-    public func connectUnix(path: String) async throws {
+    public func connectUnix(path: String) async throws(QMPError) {
         logger.info("Connecting to QEMU via Unix socket", metadata: ["path": .string(path)])
 
         // Retry connection with exponential backoff
         var retries = 0
         let maxRetries = 10
-        var lastError: Error?
+        var lastError: (any Error)?
 
         while retries < maxRetries {
             do {
@@ -164,19 +164,21 @@ public final class QMPClient: Sendable {
                 retries += 1
 
                 if retries < maxRetries {
-                    let delay = UInt64(min(100_000_000 * (1 << retries), 1_000_000_000)) // Exponential backoff, max 1 second
-                    logger.debug("QMP connection attempt \(retries) failed, retrying in \(Double(delay) / 1_000_000_000)s: \(error)")
-                    try await Task.sleep(nanoseconds: delay)
+                    // Exponential backoff, capped at one second.
+                    let delay = min(Duration.milliseconds(100) * (1 << retries), .seconds(1))
+                    logger.debug("QMP connection attempt \(retries) failed, retrying in \(delay): \(error)")
+                    try await sleepOrCancel(for: delay)
                 }
             }
         }
 
         logger.error("Failed to connect to QMP after \(maxRetries) retries: \(lastError?.localizedDescription ?? "unknown error")")
-        throw lastError ?? QMPError.notConnected
+        guard let lastError else { throw QMPError.notConnected }
+        throw QMPClient.connectionError(endpoint: "unix:\(path)", lastError)
     }
 
     /// Connect to QEMU via TCP socket
-    public func connectTCP(host: String, port: Int) async throws {
+    public func connectTCP(host: String, port: Int) async throws(QMPError) {
         logger.info("Connecting to QEMU via TCP", metadata: [
             "host": .string(host),
             "port": .stringConvertible(port)
@@ -188,10 +190,23 @@ public final class QMPClient: Sendable {
             }
         } catch {
             await teardownFailedAttempt()
-            throw error
+            throw QMPClient.connectionError(endpoint: "\(host):\(port)", error)
         }
 
         logger.info("Connected to QEMU successfully")
+    }
+
+    /// Name a failed connect attempt in this library's own vocabulary.
+    ///
+    /// A negotiation failure is already a `QMPError` and says more than the
+    /// wrapper would — a silent peer stays `.timeout` rather than becoming a
+    /// generic "could not connect". Everything else is somebody else's error
+    /// (NIO, POSIX) and gets the endpoint attached, since a bare
+    /// `connection refused` names nothing.
+    private static func connectionError(endpoint: String, _ error: any Error) -> QMPError {
+        if let error = error as? QMPError { return error }
+        if error is CancellationError { return .cancelled }
+        return .connectionFailed(endpoint: endpoint, underlying: error)
     }
 
     /// One connect attempt: connect, start consuming inbound messages, negotiate.
@@ -243,7 +258,7 @@ public final class QMPClient: Sendable {
     /// Waits for the reader loop to finish, so anything parked on the connection
     /// has been failed by the time this returns rather than left to time out
     /// against a channel nobody owns any more.
-    public func disconnect() async throws {
+    public func disconnect() async throws(QMPError) {
         let previous = takeState()
         guard let connection = previous.connection else { return }
 
@@ -274,7 +289,7 @@ public final class QMPClient: Sendable {
     // MARK: - QMP Commands
 
     /// Execute a QMP command
-    public func execute(_ command: QMPCommand, arguments: [String: JSONValue]? = nil) async throws -> JSONValue? {
+    public func execute(_ command: QMPCommand, arguments: [String: JSONValue]? = nil) async throws(QMPError) -> JSONValue? {
         try await send(command, arguments: arguments, outOfBand: false)
     }
 
@@ -293,7 +308,7 @@ public final class QMPClient: Sendable {
     public func executeOutOfBand(
         _ command: QMPCommand,
         arguments: [String: JSONValue]? = nil
-    ) async throws -> JSONValue? {
+    ) async throws(QMPError) -> JSONValue? {
         guard negotiatedCapabilities.contains(.oob) else {
             throw QMPError.capabilityNotNegotiated(.oob)
         }
@@ -304,7 +319,7 @@ public final class QMPClient: Sendable {
         _ command: QMPCommand,
         arguments: [String: JSONValue]?,
         outOfBand: Bool
-    ) async throws -> JSONValue? {
+    ) async throws(QMPError) -> JSONValue? {
         let connection = try connectedConnection()
 
         let request = QMPRequest(execute: command.name, arguments: arguments, outOfBand: outOfBand)
@@ -323,7 +338,7 @@ public final class QMPClient: Sendable {
     /// single dropped field failed the whole query — and `singlestep` is gone
     /// from modern QEMU, so the query failed always, leaving the manager to
     /// report `.unknown` for a perfectly healthy VM.
-    public func queryStatus() async throws -> QMPStatusResponse {
+    public func queryStatus() async throws(QMPError) -> QMPStatusResponse {
         guard let result = try await execute(.queryStatus),
               let status = result["status"]?.stringValue else {
             throw QMPError.invalidResponse
@@ -337,27 +352,27 @@ public final class QMPClient: Sendable {
     }
 
     /// Continue VM execution
-    public func cont() async throws {
+    public func cont() async throws(QMPError) {
         _ = try await execute(.cont)
     }
 
     /// Stop/pause VM execution
-    public func stop() async throws {
+    public func stop() async throws(QMPError) {
         _ = try await execute(.stop)
     }
 
     /// Power down the VM
-    public func systemPowerdown() async throws {
+    public func systemPowerdown() async throws(QMPError) {
         _ = try await execute(.systemPowerdown)
     }
 
     /// Reset the VM
-    public func systemReset() async throws {
+    public func systemReset() async throws(QMPError) {
         _ = try await execute(.systemReset)
     }
 
     /// Quit QEMU
-    public func quit() async throws {
+    public func quit() async throws(QMPError) {
         _ = try await execute(.quit)
     }
 
@@ -368,7 +383,7 @@ public final class QMPClient: Sendable {
     ///   - nodeName: Unique identifier for the block device (e.g., "drive-vdb")
     ///   - filename: Path to the disk image
     ///   - readOnly: Whether the disk is read-only
-    public func blockdevAdd(nodeName: String, filename: String, readOnly: Bool = false) async throws {
+    public func blockdevAdd(nodeName: String, filename: String, readOnly: Bool = false) async throws(QMPError) {
         let arguments: [String: JSONValue] = [
             "driver": "qcow2",
             "node-name": .string(nodeName),
@@ -383,7 +398,7 @@ public final class QMPClient: Sendable {
 
     /// Remove a block device backend
     /// - Parameter nodeName: The node name used when adding the device
-    public func blockdevDel(nodeName: String) async throws {
+    public func blockdevDel(nodeName: String) async throws(QMPError) {
         _ = try await execute(.blockdevDel, arguments: ["node-name": .string(nodeName)])
     }
 
@@ -398,7 +413,7 @@ public final class QMPClient: Sendable {
         deviceId: String,
         driveId: String,
         bus: String? = nil
-    ) async throws {
+    ) async throws(QMPError) {
         var arguments: [String: JSONValue] = [
             "driver": .string(driver),
             "id": .string(deviceId),
@@ -414,7 +429,7 @@ public final class QMPClient: Sendable {
     /// - Parameters:
     ///   - deviceId: The device ID to remove
     ///   - timeout: Timeout in seconds for waiting on DEVICE_DELETED event
-    public func deviceDel(deviceId: String, timeout: TimeInterval = 5) async throws {
+    public func deviceDel(deviceId: String, timeout: Duration = .seconds(5)) async throws(QMPError) {
         let connection = try connectedConnection()
 
         // Registered before the command goes out: QEMU can emit DEVICE_DELETED
@@ -431,7 +446,7 @@ public final class QMPClient: Sendable {
     }
 
     /// Query attached block devices
-    public func queryBlock() async throws -> [JSONValue] {
+    public func queryBlock() async throws(QMPError) -> [JSONValue] {
         try await execute(.queryBlock)?.arrayValue ?? []
     }
 
@@ -444,7 +459,7 @@ public final class QMPClient: Sendable {
     /// - Parameter outOfBand: Run the query out-of-band. Requires the `oob`
     ///   capability, and is the point of it: the answer arrives even when the
     ///   monitor is blocked.
-    public func queryYank(outOfBand: Bool = false) async throws -> [JSONValue] {
+    public func queryYank(outOfBand: Bool = false) async throws(QMPError) -> [JSONValue] {
         let result = outOfBand
             ? try await executeOutOfBand(.queryYank)
             : try await execute(.queryYank)
@@ -461,7 +476,7 @@ public final class QMPClient: Sendable {
     ///
     /// Yanking a chardev instance can close this monitor's own socket, so treat a
     /// lost connection afterwards as expected rather than as a failure.
-    public func yank(instances: [JSONValue], outOfBand: Bool = false) async throws {
+    public func yank(instances: [JSONValue], outOfBand: Bool = false) async throws(QMPError) {
         let arguments: [String: JSONValue] = ["instances": .array(instances)]
         if outOfBand {
             _ = try await executeOutOfBand(.yank, arguments: arguments)
@@ -472,7 +487,7 @@ public final class QMPClient: Sendable {
 
     // MARK: - Private Methods
 
-    private func connectedConnection() throws -> QMPConnection {
+    private func connectedConnection() throws(QMPError) -> QMPConnection {
         guard let connection = state.withLockedValue({ $0.connection }), connection.isActive else {
             throw QMPError.notConnected
         }
@@ -487,7 +502,7 @@ public final class QMPClient: Sendable {
     /// requested: `qmp_capabilities` fails outright on a capability QEMU did not
     /// advertise, and a failed negotiation leaves a monitor that refuses every
     /// subsequent command.
-    private func negotiateCapabilities(_ connection: QMPConnection) async throws {
+    private func negotiateCapabilities(_ connection: QMPConnection) async throws(QMPError) {
         // The greeting comes back from the wait rather than being fetched
         // afterwards, so there is no question of whether the value is visible yet.
         let greeting = try await connection.waitForGreeting()

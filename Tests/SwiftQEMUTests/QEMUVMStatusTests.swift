@@ -200,7 +200,7 @@ final class QEMUVMStatusTests: XCTestCase {
     private static func collect(
         _ count: Int,
         from stream: AsyncStream<QMPEvent>,
-        timeout: TimeInterval = 10
+        timeout: Duration = .seconds(10)
     ) async -> [QMPEvent] {
         await withTaskGroup(of: [QMPEvent]?.self) { group in
             group.addTask {
@@ -212,7 +212,7 @@ final class QEMUVMStatusTests: XCTestCase {
                 return collected
             }
             group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                try? await Task.sleep(for: timeout)
                 return nil
             }
             let first = await group.next() ?? nil

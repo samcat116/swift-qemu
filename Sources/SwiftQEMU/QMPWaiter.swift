@@ -28,9 +28,14 @@ final class QMPWaiter<Value: Sendable>: Sendable {
         case pending
         /// Resolved before anyone waited. The next `value` hands this straight
         /// over rather than parking.
-        case latched(Result<Value, Error>)
+        case latched(Result<Value, QMPError>)
         /// A caller is parked on this continuation.
-        case waiting(CheckedContinuation<Value, Error>)
+        ///
+        /// Untyped, unavoidably: `withCheckedThrowingContinuation` hands out a
+        /// `CheckedContinuation<_, any Error>` and is not generic over the error
+        /// type. Only the resume crosses back out of this domain, and `value`
+        /// narrows it again on the way to the caller.
+        case waiting(CheckedContinuation<Value, any Error>)
         /// Resolved *and* delivered.
         case done
     }
@@ -53,26 +58,26 @@ final class QMPWaiter<Value: Sendable>: Sendable {
     private let storage = NIOLockedValueBox(Storage())
 
     /// - Parameters:
-    ///   - timeout: Budget in seconds. A non-positive budget resolves the waiter
-    ///     as already timed out — zero must fail immediately, not never.
+    ///   - timeout: The budget. A non-positive budget resolves the waiter as
+    ///     already timed out — zero must fail immediately, not never.
     ///   - eventLoop: The loop the deadline runs on. Deliberately an event-loop
     ///     timer rather than a task: it cannot inherit the caller's cancellation
     ///     (a deadline that did, and so skipped firing, used to strand its
     ///     waiter), it costs no thread, and it is cancellable.
     ///   - timeoutError: What the deadline resolves the waiter with.
     init(
-        timeout: TimeInterval,
+        timeout: Duration,
         on eventLoop: EventLoop,
-        timeoutError: Error = QMPError.timeout
+        timeoutError: QMPError = .timeout
     ) {
-        guard timeout > 0 else {
+        guard timeout > .zero else {
             storage.withLockedValue { $0.state = .latched(.failure(timeoutError)) }
             return
         }
-        // Clamped so an absurd budget cannot overflow the conversion; the bound
-        // is a few centuries, which is indistinguishable from "no deadline".
-        let nanoseconds = Int64(min(timeout, 9_000_000_000) * 1_000_000_000)
-        let deadline = eventLoop.scheduleTask(in: .nanoseconds(nanoseconds)) { [weak self] () -> Void in
+        // `TimeAmount(_:)` truncates to nanoseconds and clamps at `Int64.max`, so
+        // an absurd budget cannot overflow the conversion; the bound is a few
+        // centuries, which is indistinguishable from "no deadline".
+        let deadline = eventLoop.scheduleTask(in: TimeAmount(timeout)) { [weak self] () -> Void in
             self?.expire(with: timeoutError)
         }
         attach(deadline)
@@ -81,9 +86,9 @@ final class QMPWaiter<Value: Sendable>: Sendable {
     /// Resolve the waiter. The first caller wins; later ones are no-ops, which is
     /// what lets delivery, timeout, cancellation and teardown all call this
     /// blindly.
-    func resolve(_ result: Result<Value, Error>) {
+    func resolve(_ result: Result<Value, QMPError>) {
         let (waiter, deadline) = storage.withLockedValue {
-            storage -> (CheckedContinuation<Value, Error>?, Scheduled<Void>?) in
+            storage -> (CheckedContinuation<Value, any Error>?, Scheduled<Void>?) in
             switch storage.state {
             case .pending:
                 storage.state = .latched(result)
@@ -97,7 +102,7 @@ final class QMPWaiter<Value: Sendable>: Sendable {
         }
         deadline?.cancel()
         // Resumed after the lock is dropped, so this never calls out while held.
-        waiter?.resume(with: result)
+        waiter?.resume(with: result.mapError { $0 as any Error })
     }
 
     /// The resolved value, waiting for it if it has not arrived yet.
@@ -106,32 +111,46 @@ final class QMPWaiter<Value: Sendable>: Sendable {
     /// error, not a race, and is reported rather than allowed to displace the
     /// first.
     var value: Value {
-        get async throws {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation {
-                    (continuation: CheckedContinuation<Value, Error>) in
-                    let (immediate, deadline) = storage.withLockedValue {
-                        storage -> (Result<Value, Error>?, Scheduled<Void>?) in
-                        switch storage.state {
-                        case .pending:
-                            storage.state = .waiting(continuation)
-                            return (nil, nil)
-                        case .latched(let result):
-                            storage.state = .done
-                            return (result, storage.takeDeadline())
-                        case .waiting, .done:
-                            return (.failure(QMPError.invalidResponse), nil)
+        get async throws(QMPError) {
+            // `resolve` only ever takes a `QMPError`, so this narrowing cannot
+            // lose anything — it is here because the continuation and
+            // `withTaskCancellationHandler` both deal in `any Error`. Nothing
+            // actually reaches `QMPError.underlying(_:)`; having it is what keeps
+            // the mapping total without inventing a case for an error we did not
+            // throw.
+            do {
+                return try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation {
+                        (continuation: CheckedContinuation<Value, any Error>) in
+                        let (immediate, deadline) = storage.withLockedValue {
+                            storage -> (Result<Value, QMPError>?, Scheduled<Void>?) in
+                            switch storage.state {
+                            case .pending:
+                                storage.state = .waiting(continuation)
+                                return (nil, nil)
+                            case .latched(let result):
+                                storage.state = .done
+                                return (result, storage.takeDeadline())
+                            case .waiting, .done:
+                                return (.failure(QMPError.invalidResponse), nil)
+                            }
+                        }
+                        deadline?.cancel()
+                        if let immediate {
+                            continuation.resume(with: immediate.mapError { $0 as any Error })
                         }
                     }
-                    deadline?.cancel()
-                    if let immediate {
-                        continuation.resume(with: immediate)
-                    }
+                } onCancel: {
+                    // Just another resolver. Whether this lands before or after the
+                    // continuation is installed no longer matters.
+                    //
+                    // `.cancelled` rather than `CancellationError`: `resolve` is
+                    // typed to this library's error, which a typed-throws API
+                    // cannot smuggle a foreign error past.
+                    resolve(.failure(.cancelled))
                 }
-            } onCancel: {
-                // Just another resolver. Whether this lands before or after the
-                // continuation is installed no longer matters.
-                resolve(.failure(CancellationError()))
+            } catch {
+                throw QMPError.wrapping(error)
             }
         }
     }
@@ -152,7 +171,7 @@ final class QMPWaiter<Value: Sendable>: Sendable {
 
     /// The deadline is firing, so there is nothing left to cancel — drop the
     /// reference before resolving so `resolve` does not try.
-    private func expire(with error: Error) {
+    private func expire(with error: QMPError) {
         storage.withLockedValue { _ = $0.takeDeadline() }
         resolve(.failure(error))
     }

@@ -17,7 +17,7 @@ final class QMPWaiterTests: XCTestCase {
     /// A generous budget for waiters that are expected to be resolved by something
     /// other than their deadline. Long enough that a test failing to be prompt
     /// fails on its assertion instead of by timing out.
-    private static let neverReachedTimeout: TimeInterval = 60
+    private static let neverReachedTimeout: Duration = .seconds(60)
 
     // MARK: - Resolution before the waiter parks
 
@@ -40,7 +40,7 @@ final class QMPWaiterTests: XCTestCase {
         do {
             _ = try await waiter.value
             XCTFail("Expected the latched failure")
-        } catch let error as QMPError {
+        } catch {
             guard case .connectionLost = error else {
                 return XCTFail("Expected .connectionLost, got \(error)")
             }
@@ -76,12 +76,12 @@ final class QMPWaiterTests: XCTestCase {
 
     /// A waiter nothing resolves fails on its deadline rather than parking.
     func testDeadlineFailsAnUnresolvedWaiter() async throws {
-        let waiter = QMPWaiter<Int>(timeout: 0.05, on: eventLoop)
+        let waiter = QMPWaiter<Int>(timeout: .milliseconds(50), on: eventLoop)
 
         do {
             _ = try await waiter.value
             XCTFail("Expected the deadline to fire")
-        } catch let error as QMPError {
+        } catch {
             guard case .timeout = error else {
                 return XCTFail("Expected .timeout, got \(error)")
             }
@@ -91,13 +91,13 @@ final class QMPWaiterTests: XCTestCase {
     /// A zero budget must fail immediately, not never. Racing the deadline against
     /// the parking task used to make this the ordering most likely to hang.
     func testZeroTimeoutFailsImmediately() async throws {
-        let waiter = QMPWaiter<Int>(timeout: 0, on: eventLoop)
+        let waiter = QMPWaiter<Int>(timeout: .zero, on: eventLoop)
 
         let started = ContinuousClock.now
         do {
             _ = try await waiter.value
             XCTFail("Expected a zero budget to fail")
-        } catch let error as QMPError {
+        } catch {
             guard case .timeout = error else {
                 return XCTFail("Expected .timeout, got \(error)")
             }
@@ -110,11 +110,11 @@ final class QMPWaiterTests: XCTestCase {
     /// ordering gets hit.
     func testTinyDeadlinesNeverStrandTheWaiter() async throws {
         for _ in 0..<50 {
-            let waiter = QMPWaiter<Int>(timeout: 0.001, on: eventLoop)
+            let waiter = QMPWaiter<Int>(timeout: .milliseconds(1), on: eventLoop)
             do {
                 _ = try await waiter.value
                 XCTFail("Expected the deadline to fire")
-            } catch is QMPError {
+            } catch {
                 // Expected.
             }
         }
@@ -122,7 +122,7 @@ final class QMPWaiterTests: XCTestCase {
 
     /// A deadline must not overrule a result that already arrived.
     func testDeadlineDoesNotDisplaceAnEarlierResult() async throws {
-        let waiter = QMPWaiter<Int>(timeout: 0.05, on: eventLoop)
+        let waiter = QMPWaiter<Int>(timeout: .milliseconds(50), on: eventLoop)
         waiter.resolve(.success(3))
         // Well past the deadline: if resolving did not retire it, the value is
         // replaced by a timeout.
@@ -146,7 +146,7 @@ final class QMPWaiterTests: XCTestCase {
         do {
             _ = try await waiting.value
             XCTFail("Expected the cancelled wait to throw")
-        } catch is CancellationError {
+        } catch QMPError.cancelled {
             // Expected.
         }
         XCTAssertLessThan(started.duration(to: .now), .seconds(5))
@@ -166,7 +166,7 @@ final class QMPWaiterTests: XCTestCase {
             do {
                 _ = try await waiting.value
                 XCTFail("Expected the cancelled wait to throw")
-            } catch is CancellationError {
+            } catch QMPError.cancelled {
                 // Expected.
             }
         }
@@ -205,7 +205,7 @@ final class QMPWaiterTests: XCTestCase {
         do {
             _ = try await waiter.value
             XCTFail("Expected the second wait to be refused")
-        } catch let error as QMPError {
+        } catch {
             guard case .invalidResponse = error else {
                 return XCTFail("Expected .invalidResponse, got \(error)")
             }

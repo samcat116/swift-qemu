@@ -109,7 +109,7 @@ final class QEMUProcessTests: XCTestCase {
         do {
             try await process.start(with: Self.defaultConfig)
             XCTFail("Expected start to fail when the process exits immediately")
-        } catch let error as QMPError {
+        } catch {
             guard case .processExited(let exitCode, let killedBySignal, let stderr) = error else {
                 return XCTFail("Expected .processExited, got \(error)")
             }
@@ -147,6 +147,108 @@ final class QEMUProcessTests: XCTestCase {
         }
     }
 
+    // MARK: - Failures that used to escape this library's vocabulary
+
+    /// A binary that cannot be spawned at all is a `QMPError`, not a raw
+    /// `NSError` from Foundation.
+    ///
+    /// `Process.run()`'s error used to propagate untouched, so a caller saw
+    /// `The file “qemu” doesn’t exist.` with nothing to say which file, or that
+    /// launching a VM was what wanted it. The path is now part of the error.
+    func testMissingBinaryIsReportedAsALaunchFailure() async throws {
+        let missing = NSTemporaryDirectory() + "definitely-not-qemu-\(UUID().uuidString)"
+        let (process, _) = makeProcess(qemuPath: missing)
+
+        do {
+            try await process.start(with: Self.defaultConfig)
+            XCTFail("Expected start to fail when the binary does not exist")
+        } catch {
+            guard case .processLaunchFailed(let path, _) = error else {
+                return XCTFail("Expected .processLaunchFailed, got \(error)")
+            }
+            XCTAssertEqual(path, missing)
+            XCTAssertTrue(
+                error.localizedDescription.contains(missing),
+                "The description should name the binary, got: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    /// A runtime directory that cannot be created is named as such, rather than
+    /// surfacing as whatever `FileManager` happened to throw.
+    func testUncreatableRuntimeDirectoryIsReportedAsItsOwnFailure() async throws {
+        // A *file* where the base directory should be: creating anything beneath
+        // it fails, and it fails before QEMU is ever spawned.
+        let blocker = NSTemporaryDirectory() + "qemu-blocker-\(UInt32.random(in: .min ... .max))"
+        try "not a directory".write(toFile: blocker, atomically: true, encoding: .utf8)
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: blocker) }
+
+        let process = QEMUProcess(
+            qemuPath: try makeSocketCreatingQEMU(body: Self.stayAlive),
+            runtimeDirectory: blocker,
+            logger: Logger(label: "test")
+        )
+        addTeardownBlock { await process.stop() }
+
+        do {
+            try await process.start(with: Self.defaultConfig)
+            XCTFail("Expected start to fail when the runtime directory cannot be created")
+        } catch {
+            guard case .runtimeDirectoryCreationFailed(let path, _) = error else {
+                return XCTFail("Expected .runtimeDirectoryCreationFailed, got \(error)")
+            }
+            XCTAssertTrue(path.hasPrefix(blocker + "/"), "Got \(path)")
+        }
+
+        let isRunning = await process.isRunning
+        XCTAssertFalse(isRunning, "Nothing should have been spawned")
+    }
+
+    /// Cancelling a start reports `.cancelled`.
+    ///
+    /// The socket wait is where cancellation lands, and it used to throw
+    /// `CancellationError` straight through an untyped `throws`. A typed-throws
+    /// API cannot do that, so cancellation is a case of this library's own error
+    /// rather than a type beside it.
+    func testCancellingAStartIsReportedAsCancelled() async throws {
+        // Never creates its socket, so the start sits in the retry loop.
+        let (process, _) = makeProcess(qemuPath: try makeFakeQEMU(body: "sleep 30"))
+
+        let config = Self.defaultConfig
+        let start = Task { try await process.start(with: config) }
+        try await Task.sleep(for: .milliseconds(200))
+        start.cancel()
+
+        do {
+            try await start.value
+            XCTFail("Expected the cancelled start to throw")
+        } catch QMPError.cancelled {
+            // Expected.
+        } catch {
+            XCTFail("Expected .cancelled, got \(error)")
+        }
+    }
+
+    /// And so does cancelling a wait for exit.
+    func testCancellingAWaitForExitIsReportedAsCancelled() async throws {
+        let (process, _) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: Self.stayAlive))
+
+        try await process.start(with: Self.defaultConfig)
+
+        let wait = Task { try await process.waitUntilExit() }
+        try await Task.sleep(for: .milliseconds(200))
+        wait.cancel()
+
+        do {
+            try await wait.value
+            XCTFail("Expected the cancelled wait to throw")
+        } catch QMPError.cancelled {
+            // Expected.
+        } catch {
+            XCTFail("Expected .cancelled, got \(error)")
+        }
+    }
+
     /// A process killed by a signal is reported as such rather than as an exit code.
     func testTerminationBySignalIsDistinguishedFromExitCode() async throws {
         let fake = try makeFakeQEMU(body: """
@@ -159,7 +261,7 @@ final class QEMUProcessTests: XCTestCase {
         do {
             try await process.start(with: Self.defaultConfig)
             XCTFail("Expected start to fail")
-        } catch let error as QMPError {
+        } catch {
             guard case .processExited(let exitCode, let killedBySignal, _) = error else {
                 return XCTFail("Expected .processExited, got \(error)")
             }
@@ -182,7 +284,7 @@ final class QEMUProcessTests: XCTestCase {
         do {
             try await process.start(with: Self.defaultConfig)
             XCTFail("Expected start to fail")
-        } catch let error as QMPError {
+        } catch {
             guard case .processExited(let exitCode, _, let stderr) = error else {
                 return XCTFail("Expected .processExited, got \(error)")
             }
@@ -317,7 +419,7 @@ final class QEMUProcessTests: XCTestCase {
         do {
             try await process.start(with: Self.defaultConfig)
             XCTFail("Expected start to fail without a socket")
-        } catch let error as QMPError {
+        } catch {
             guard case .socketCreationFailed = error else {
                 return XCTFail("Expected .socketCreationFailed, got \(error)")
             }
@@ -348,7 +450,7 @@ final class QEMUProcessTests: XCTestCase {
         XCTAssertTrue(startedRunning)
 
         let started = Date()
-        await process.stop(timeout: 10)
+        await process.stop(timeout: .seconds(10))
         let elapsed = Date().timeIntervalSince(started)
 
         let isRunning = await process.isRunning
@@ -380,7 +482,7 @@ final class QEMUProcessTests: XCTestCase {
         XCTAssertTrue(startedRunning)
 
         let started = Date()
-        await process.stop(timeout: 1)
+        await process.stop(timeout: .seconds(1))
         let elapsed = Date().timeIntervalSince(started)
 
         let isRunning = await process.isRunning
@@ -434,7 +536,7 @@ final class QEMUProcessTests: XCTestCase {
 
         try await process.start(with: Self.defaultConfig)
         let firstPID = await process.processIdentifier
-        await process.stop(timeout: 5)
+        await process.stop(timeout: .seconds(5))
 
         try await process.start(with: Self.defaultConfig)
         let isRunning = await process.isRunning
@@ -442,7 +544,7 @@ final class QEMUProcessTests: XCTestCase {
         XCTAssertTrue(isRunning)
         XCTAssertNotEqual(secondPID, firstPID, "The restart should be a new process")
 
-        await process.stop(timeout: 5)
+        await process.stop(timeout: .seconds(5))
     }
 
     /// A second `start()` while the first process is alive is still refused. This is
@@ -457,13 +559,13 @@ final class QEMUProcessTests: XCTestCase {
         do {
             try await process.start(with: Self.defaultConfig)
             XCTFail("Expected the second start to be refused")
-        } catch let error as QMPError {
+        } catch {
             guard case .processAlreadyRunning = error else {
                 return XCTFail("Expected .processAlreadyRunning, got \(error)")
             }
         }
 
-        await process.stop(timeout: 5)
+        await process.stop(timeout: .seconds(5))
     }
 
     /// Dropping a `QEMUProcess` without stopping it used to leave QEMU running for
@@ -582,7 +684,7 @@ final class QEMUProcessTests: XCTestCase {
         try await process.start(with: Self.defaultConfig)
         XCTAssertTrue(FileManager.default.fileExists(atPath: directory))
 
-        await process.stop(timeout: 5)
+        await process.stop(timeout: .seconds(5))
 
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: directory),
@@ -644,7 +746,7 @@ final class QEMUProcessTests: XCTestCase {
         do {
             try await process.start(with: Self.defaultConfig)
             XCTFail("Expected start to be refused")
-        } catch let error as QMPError {
+        } catch {
             guard case .socketPathTooLong(_, let limit) = error else {
                 return XCTFail("Expected .socketPathTooLong, got \(error)")
             }
@@ -711,7 +813,7 @@ final class QEMUProcessTests: XCTestCase {
         let directory = Self.directory(containing: process.getQMPSocketPath())
 
         try await process.start(with: Self.defaultConfig)
-        await process.stop(timeout: 5)
+        await process.stop(timeout: .seconds(5))
 
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: directory),

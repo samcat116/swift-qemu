@@ -62,7 +62,7 @@ actor QMPConnection {
 
     /// Set once the connection has ended, so waits started afterwards fail
     /// immediately instead of parking on a dead connection.
-    private var closeError: Error?
+    private var closeError: QMPError?
     /// Handed over by ``run()`` when it takes scoped ownership of the channel.
     /// Nothing can be sent before then, and nothing needs to be: the first write
     /// is the capability negotiation that follows the greeting, and only the
@@ -87,7 +87,7 @@ actor QMPConnection {
         let token: UInt64
     }
 
-    init(logger: Logger, asyncChannel: QMPAsyncChannel, connectTimeout: TimeInterval) {
+    init(logger: Logger, asyncChannel: QMPAsyncChannel, connectTimeout: Duration) {
         self.logger = logger
         self.asyncChannel = asyncChannel
         self.channel = asyncChannel.channel
@@ -135,7 +135,7 @@ actor QMPConnection {
     /// ``QMPError/frameTooLarge(limit:)``, which NIO delivers by failing the
     /// sequence — and is passed through so the in-flight caller learns the cause
     /// rather than a generic connection loss.
-    private static func endOfConnectionError(_ failure: Error?) -> Error {
+    private static func endOfConnectionError(_ failure: (any Error)?) -> QMPError {
         switch failure {
         case .none: return QMPError.connectionLost
         case .some(let error as QMPError): return error
@@ -228,7 +228,7 @@ actor QMPConnection {
 
     /// Fail everything parked on this connection, and latch the reason so waits
     /// started afterwards fail fast rather than parking on a dead channel.
-    private func finish(with error: Error) {
+    private func finish(with error: QMPError) {
         guard closeError == nil else { return }
         closeError = error
         // `executeThenClose` has finished the writer on its way out; dropping it
@@ -276,13 +276,13 @@ actor QMPConnection {
     // MARK: - Greeting
 
     /// The greeting QEMU sent, waiting for it if it has not arrived yet.
-    func waitForGreeting() async throws -> QMPGreeting {
+    func waitForGreeting() async throws(QMPError) -> QMPGreeting {
         try await greeting.value
     }
 
     // MARK: - Requests
 
-    func sendRequest(_ request: QMPRequest, timeout: TimeInterval) async throws -> QMPResponse {
+    func sendRequest(_ request: QMPRequest, timeout: Duration) async throws(QMPError) -> QMPResponse {
         if let closeError { throw closeError }
         guard let writer else { throw QMPError.notConnected }
 
@@ -302,7 +302,12 @@ actor QMPConnection {
         )
         // Encoded before the waiter is registered, so a failure here cannot leave
         // a registration behind with nothing to resolve it.
-        let payload = try encoder.encode(identified)
+        let payload: Data
+        do {
+            payload = try encoder.encode(identified)
+        } catch {
+            throw QMPError.requestEncodingFailed(command: request.execute, underlying: error)
+        }
         var frame = channel.allocator.buffer(capacity: payload.count + 1)
         frame.writeBytes(payload)
         frame.writeString("\n")
@@ -325,12 +330,13 @@ actor QMPConnection {
 
     /// A write that fails has either lost the channel or lost the writer with it
     /// (`executeThenClose` finishes the writer on its way out), and both mean the
-    /// same thing to a caller. Cancellation is passed through as itself.
-    private static func writeError(_ error: Error) -> Error {
+    /// same thing to a caller. Cancellation keeps its own case rather than being
+    /// reported as a connection that was never lost.
+    private static func writeError(_ error: any Error) -> QMPError {
         switch error {
-        case is CancellationError: return error
+        case is CancellationError: return .cancelled
         case let error as QMPError: return error
-        default: return QMPError.connectionLost
+        default: return .connectionLost
         }
     }
 
@@ -357,7 +363,7 @@ actor QMPConnection {
     ///
     /// The event budget starts here, for the same reason: it covers the whole
     /// detach, command included.
-    func expectDeviceDeleted(deviceId: String, timeout: TimeInterval) -> DeletionTicket {
+    func expectDeviceDeleted(deviceId: String, timeout: Duration) -> DeletionTicket {
         nextTicket += 1
         let waiter = QMPWaiter<Void>(timeout: timeout, on: eventLoop)
         if let closeError {
@@ -372,7 +378,7 @@ actor QMPConnection {
         deviceDeletions.removeValue(forKey: ticket.token)?.waiter.resolve(.failure(QMPError.connectionLost))
     }
 
-    func waitForDeviceDeleted(_ ticket: DeletionTicket) async throws {
+    func waitForDeviceDeleted(_ ticket: DeletionTicket) async throws(QMPError) {
         guard let pending = deviceDeletions[ticket.token] else {
             // Torn down between the command and this wait.
             throw closeError ?? QMPError.connectionLost

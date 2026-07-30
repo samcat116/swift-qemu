@@ -73,7 +73,7 @@ public actor QEMUProcess {
 
     /// How long `stop()` waits for the child to honour SIGTERM before escalating,
     /// and how long it then waits after SIGKILL.
-    public static let defaultTerminationTimeout: TimeInterval = 5
+    public static let defaultTerminationTimeout: Duration = .seconds(5)
 
     /// The kernel's limit on the length of a unix socket path, taken from
     /// `sockaddr_un.sun_path`: 104 bytes on Darwin, 108 on Linux, including the
@@ -147,8 +147,14 @@ public actor QEMUProcess {
         String(UInt64.random(in: UInt64.min ... UInt64.max), radix: 36)
     }
 
-    /// Start QEMU process with given configuration
-    public func start(with config: QEMUConfiguration) async throws {
+    /// Start QEMU process with given configuration.
+    ///
+    /// Everything that can go wrong here is a `QMPError`, including the failures
+    /// that used to escape untranslated: a spawn that fails (now
+    /// `processLaunchFailed`, which at least names the binary it tried), a
+    /// descriptor that will not open, and the `CancellationError` from the socket
+    /// wait (now `cancelled`).
+    public func start(with config: QEMUConfiguration) async throws(QMPError) {
         if let child = child, !child.hasExited {
             throw QMPError.processAlreadyRunning
         }
@@ -181,12 +187,20 @@ public actor QEMUProcess {
             "arguments": .array(arguments.map { .string($0) })
         ])
 
-        let output = try openStandardOutput(logToFile: shouldLogToFile)
+        // Opening either descriptor is part of getting QEMU off the ground, so an
+        // `Errno` from here is reported the same way a refused spawn is.
+        let output: StandardOutputTarget
+        let standardInput: FileDescriptor
+        do {
+            output = try openStandardOutput(logToFile: shouldLogToFile)
 
-        // Redirect stdin to /dev/null to prevent job control issues. Inheriting the
-        // TTY triggers SIGSTOP/SIGTTOU and leaves QEMU in T (stopped) state with an
-        // unresponsive QMP socket.
-        let standardInput = try FileDescriptor.open("/dev/null", .readOnly)
+            // Redirect stdin to /dev/null to prevent job control issues. Inheriting
+            // the TTY triggers SIGSTOP/SIGTTOU and leaves QEMU in T (stopped) state
+            // with an unresponsive QMP socket.
+            standardInput = try FileDescriptor.open("/dev/null", .readOnly)
+        } catch {
+            throw QMPError.processLaunchFailed(path: qemuPath, underlying: error)
+        }
 
         // stderr is streamed rather than discarded so a fatal argument error is
         // reportable. `.sequence` has no fixed-size buffer behind it, which is the
@@ -211,7 +225,15 @@ public actor QEMUProcess {
             )
         }
 
-        let pid = try await child.waitForSpawn()
+        // A spawn that never happened surfaces here, carrying whatever `Subprocess`
+        // said about it — a missing binary, a fork that failed. That error used to
+        // propagate raw, with nothing to say it came from launching QEMU.
+        let pid: pid_t
+        do {
+            pid = try await child.waitForSpawn()
+        } catch {
+            throw QMPError.processLaunchFailed(path: qemuPath, underlying: error)
+        }
         logger.info("QEMU process started", metadata: ["pid": .stringConvertible(pid)])
 
         // Wait for QMP socket to be ready with retry
@@ -221,7 +243,7 @@ public actor QEMUProcess {
             // Check if socket file exists
             if FileManager.default.fileExists(atPath: qmpSocketPath) {
                 // Socket exists, wait a bit more for it to be ready to accept connections
-                try await Task.sleep(nanoseconds: 200_000_000) // 0.2 seconds
+                try await sleepOrCancel(for: .milliseconds(200))
                 logger.info("QMP socket ready", metadata: ["path": .string(qmpSocketPath)])
                 break
             }
@@ -234,7 +256,7 @@ public actor QEMUProcess {
             }
 
             // Wait and retry
-            try await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+            try await sleepOrCancel(for: .milliseconds(500))
             retries += 1
         }
 
@@ -381,9 +403,9 @@ public actor QEMUProcess {
     /// the child down, in which case the process reference is deliberately kept so
     /// `isRunning` stays truthful and a restart is refused rather than colliding.
     ///
-    /// - Parameter timeout: seconds to wait for the child to honour SIGTERM before
+    /// - Parameter timeout: how long to wait for the child to honour SIGTERM before
     ///   escalating to SIGKILL. The same budget applies to the wait after SIGKILL.
-    public func stop(timeout: TimeInterval = QEMUProcess.defaultTerminationTimeout) async {
+    public func stop(timeout: Duration = QEMUProcess.defaultTerminationTimeout) async {
         guard let child = child else {
             logger.debug("QEMU process not running, nothing to stop")
             removeRuntimeFiles()
@@ -406,7 +428,7 @@ public actor QEMUProcess {
             if await child.waitForExit(timeout: timeout) == false {
                 logger.warning("QEMU ignored SIGTERM, escalating to SIGKILL", metadata: [
                     "pid": .stringConvertible(child.processIdentifier ?? -1),
-                    "timeout": .stringConvertible(timeout)
+                    "timeout": .string("\(timeout)")
                 ])
 
                 // `destroy()` is documented as a force quit — a wedged or stopped
@@ -450,8 +472,8 @@ public actor QEMUProcess {
     /// termination that should have followed never reached.
     ///
     /// Returns immediately if the process has already exited, and throws
-    /// `CancellationError` if the waiting task is cancelled.
-    public func waitUntilExit() async throws {
+    /// `QMPError.cancelled` if the waiting task is cancelled.
+    public func waitUntilExit() async throws(QMPError) {
         guard let child = child else {
             throw QMPError.processNotRunning
         }
@@ -460,7 +482,7 @@ public actor QEMUProcess {
 
         await child.waitForExit()
 
-        try Task.checkCancellation()
+        guard !Task.isCancelled else { throw QMPError.cancelled }
     }
 
     // MARK: - Deinitialization
@@ -522,23 +544,28 @@ public actor QEMUProcess {
     /// `withIntermediateDirectories: false` so that anything already sitting at
     /// this path is an error rather than something to be adopted. Nothing should
     /// be: the name carries 64 bits of randomness.
-    private func createInstanceDirectoryIfNeeded() throws {
+    private func createInstanceDirectoryIfNeeded() throws(QMPError) {
         // Already ours from an earlier `start()` on this instance — see
         // `removeRuntimeFiles()` for the one case that leaves it behind.
         guard !createdInstanceDirectory else { return }
 
         let fileManager = FileManager.default
         let parent = (instanceDirectory as NSString).deletingLastPathComponent
-        try fileManager.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        do {
+            try fileManager.createDirectory(atPath: parent, withIntermediateDirectories: true)
 
-        try fileManager.createDirectory(
-            atPath: instanceDirectory,
-            withIntermediateDirectories: false,
-            attributes: [.posixPermissions: 0o700]
-        )
-        // Foundation does not promise the attribute above reaches `mkdir(2)` rather
-        // than being applied after the fact, and the mode is the whole point.
-        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: instanceDirectory)
+            try fileManager.createDirectory(
+                atPath: instanceDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            // Foundation does not promise the attribute above reaches `mkdir(2)`
+            // rather than being applied after the fact, and the mode is the whole
+            // point.
+            try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: instanceDirectory)
+        } catch {
+            throw QMPError.runtimeDirectoryCreationFailed(path: instanceDirectory, underlying: error)
+        }
 
         createdInstanceDirectory = true
         logger.debug("Created private QEMU runtime directory", metadata: [
@@ -639,12 +666,15 @@ public actor QEMUProcess {
 
     /// Wait briefly for the drain to pick up whatever QEMU wrote on its way out —
     /// the last chunk can still be in flight when the exit is reported.
-    private func drainedStderr(timeout: TimeInterval = 0.5) async -> String {
+    ///
+    /// Timed on `ContinuousClock`, not on `Date()`: this is a sub-second deadline,
+    /// and wall-clock time can be stepped by NTP or a clock change while it runs.
+    private func drainedStderr(timeout: Duration = .milliseconds(500)) async -> String {
         guard let capture = stderrCapture else { return "" }
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while !capture.isAtEOF && Date() < deadline {
-            try? await Task.sleep(nanoseconds: 25_000_000) // 0.025 seconds
+        let deadline = ContinuousClock.now + timeout
+        while !capture.isAtEOF && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(25))
         }
 
         return capture.text
@@ -939,14 +969,14 @@ final class ChildProcess: @unchecked Sendable {
     /// clear the child and the socket file — without ever having confirmed
     /// anything. The wait therefore runs in a detached task, which the caller's
     /// cancellation cannot reach.
-    func waitForExit(timeout: TimeInterval) async -> Bool {
+    func waitForExit(timeout: Duration) async -> Bool {
         if hasExited { return true }
 
-        let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+        let budget = max(.zero, timeout)
         let exitWaiter = self.exitWaiter
         await Task.detached {
             await withTaskGroup(of: Void.self) { group in
-                group.addTask { try? await Task.sleep(nanoseconds: nanoseconds) }
+                group.addTask { try? await Task.sleep(for: budget) }
                 group.addTask { await exitWaiter.waitForExit() }
 
                 // Whichever lands first ends the wait; the other returns on

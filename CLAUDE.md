@@ -214,6 +214,16 @@ The codebase includes critical fixes for production reliability:
     - The regression tests from #8/#10/#15 are the acceptance criteria and pass **unchanged**: the greeting landing before anyone waits, a peer that accepts and never speaks, a stale reply after a timeout, an event interleaved with a reply, cancellation on either side of the park, and both frame-limit branches. The extracted pieces also get direct coverage they could not have before (`QMPWaiterTests`, `QMPFrameDecoderTests`), because the hazards are now stateable against a value instead of provoked through a scripted server
     - Fix 18's event streams and capability negotiation came across **unchanged in behaviour and in public API**, and their tests pass unchanged too. Two things got simpler in the process: the greeting is the *value* the greeting waiter carries, so negotiation no longer fetches it from a separate field written "under the same lock as the latch"; and `disconnect()` waits for the reader loop, so a stream is finished by the time it returns rather than at whichever moment the handler noticed
 
+21. **Typed Throws and `Duration`** (issue #23, source-breaking): the whole public surface is now `throws(QMPError)`, and every timeout is a `Duration` rather than a bare `TimeInterval` of seconds. Both are breaking, which is why they landed together.
+    - **Typed throws is only worth anything if the vocabulary is complete**, so the errors that used to escape untranslated were brought in. A failed spawn reached callers as whatever the process layer threw — a raw `NSError` before fix 19, a `Subprocess` error after it — with nothing to say it came from launching QEMU; it is now `processLaunchFailed(path:underlying:)`, which names the binary and keeps the original. Same for the `Errno` from opening the child's stdin/stdout. Likewise `runtimeDirectoryCreationFailed`, `connectionFailed(endpoint:underlying:)` (NIO's own connect error, with the endpoint attached) and `requestEncodingFailed`
+    - **`CancellationError` had to become a case.** A typed-throws signature cannot let it past, so it is `QMPError.cancelled`. `catch is CancellationError` no longer matches — `catch QMPError.cancelled` does, and `Task.isCancelled` is unaffected. Cancellation is just another resolver of a `QMPWaiter`, so this is one line there rather than a per-wait change
+    - **`QMPWaiter` is typed at the latch**, not at its callers: `resolve` takes a `Result<Value, QMPError>`, so a foreign error cannot get in. Its `CheckedContinuation` stays `any Error` — `withCheckedThrowingContinuation` is not generic over the error type (the 6.4 toolchain accepts a typed one, the 6.2 CI does not) — so the narrowing happens once, in `value`, which also has to catch what `withTaskCancellationHandler` `rethrows`
+    - `QMPError.underlying(any Error)` is the catch-all, and is deliberately there rather than folded into a nearer-looking case: `QMPError.wrapping(_:)` has to be *total* at the untyped boundaries (`withTaskCancellationHandler`, task groups), and rewriting a foreign error as one of the named cases would be lying about what happened. `any Error` is itself `Sendable`, so this does not cost `QMPError` its `Sendable` conformance
+    - `createVM` swapped `withThrowingTaskGroup` for a plain group whose children return `QMPError?`. A throwing group rethrows `any Error`, which would mean widening out of the domain and narrowing straight back into it; both legs already speak `QMPError`
+    - `Duration` removes the hand-rolled `UInt64(timeout * 1_000_000_000)` at every wait, and makes the unit part of the call: `shutdown(timeout: .seconds(10))`. NIO's `TimeAmount(_ duration:)` does the deadline conversion (truncating and clamping at `Int64.max` nanoseconds), replacing `QMPWaiter`'s own clamp
+    - `QEMUProcess.drainedStderr` moved from `Date()` to `ContinuousClock`. It is a 500 ms deadline, and wall-clock time can be stepped by NTP underneath it
+    - No deprecated `TimeInterval` overloads were kept. They would be picked silently by every unlabelled numeric literal (`Duration` is not `ExpressibleByIntegerLiteral`), which turns a compile error a caller can fix mechanically into a deprecation warning they can ignore
+
 ### Known Gaps
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
@@ -338,9 +348,9 @@ config.disks.append(QEMUDisk(path: "/path/to/disk.qcow2"))
 // config.accelerator = .hostNative  // .hvf on macOS, .kvm on Linux
 
 // Create VM (starts QEMU process in paused state by default)
-// Optional timeout parameter (default 30 seconds)
+// Every timeout is a Duration, so the unit is at the call site (default 30s)
 try await manager.createVM(config: config)
-// Or with custom timeout: try await manager.createVM(config: config, timeout: 60)
+// Or with custom timeout: try await manager.createVM(config: config, timeout: .seconds(60))
 
 // Start VM execution
 try await manager.start()
@@ -351,11 +361,11 @@ try await manager.attachDisk(path: "/path/to/extra.qcow2", deviceName: "vdb")
 // await manager.availableHotplugPorts  // 3, or nil where the default bus hot-plugs
 // Detach needs the *guest* to release the device; a VM with no guest OS never does,
 // and this times out with nothing removed.
-try await manager.detachDisk(deviceName: "vdb", timeout: 30)
+try await manager.detachDisk(deviceName: "vdb", timeout: .seconds(30))
 
 // Later: gracefully shutdown (default 30 second timeout, then force quit)
 try await manager.shutdown()
-// Or with a custom budget: try await manager.shutdown(timeout: 10)
+// Or with a custom budget: try await manager.shutdown(timeout: .seconds(10))
 
 // Force quit: SIGTERM, then SIGKILL after `terminationTimeout` (default 5s).
 // Throws QMPError.processTerminationFailed if QEMU survives both.
@@ -408,7 +418,12 @@ for disk in try await manager.listDisks() {
 
 ### Error Handling
 
-All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
+Every throwing member of the public API is `throws(QMPError)`, so `QMPError`
+(Sources/SwiftQEMU/QMPError.swift) is the *complete* failure vocabulary and a
+caller's `switch` over it is exhaustiveness-checked. Nothing else escapes — see
+fix 21 for what that cost, and note in particular that **cancellation arrives as
+`QMPError.cancelled`, not `CancellationError`**.
+
 - notConnected, connectionLost
 - processNotRunning, processAlreadyRunning
 - socketCreationFailed (QMP socket not created within timeout, process still alive)
@@ -418,7 +433,13 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - noHotplugPortAvailable(machineType:portCount:inUse:) (nowhere to hot-plug the disk: the machine type refuses hot-plug on its default bus and no free `pcie-root-port` was left. Thrown before anything reaches QEMU)
 - hotplugNotSupported(bus:machineType:) (QEMU refused `device_add` because the target bus does not support hot-plug, in place of its own bare `GenericError`)
 - timeout (createVM operation exceeded timeout)
+- cancelled (the awaiting task was cancelled; this is where `CancellationError` lands)
 - frameTooLarge(limit:) (an inbound QMP frame exceeded `maximumFrameSize`, so the connection was closed)
+- processLaunchFailed(path:underlying:) (`Process.run()` could not spawn QEMU — missing binary, not executable, failed fork. Carries Foundation's own error, which used to propagate raw)
+- runtimeDirectoryCreationFailed(path:underlying:) (the private `0700` directory for the QMP socket could not be created)
+- connectionFailed(endpoint:underlying:) (the QMP socket could not be connected to. For a unix socket, only after the retry budget is spent. A *negotiation* failure keeps its own case — a silent peer is still `.timeout`, not this)
+- requestEncodingFailed(command:underlying:) (a QMP command could not be encoded, so nothing was sent)
+- underlying(any Error) (an error from outside this vocabulary. What `QMPError.wrapping(_:)` falls back to, so the mapping at untyped boundaries is total without misfiling anything)
 - invalidResponse, invalidConfiguration
 - capabilityNotNegotiated(QMPCapability) (an out-of-band request on a connection without `oob`)
 - qmpError(class, description) for QMP-specific errors

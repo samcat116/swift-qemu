@@ -67,8 +67,11 @@ public actor QEMUManager {
     ///
     /// - Parameters:
     ///   - config: The QEMU VM configuration
-    ///   - timeout: Timeout in seconds for the entire operation (default: 30)
-    public func createVM(config: QEMUConfiguration, timeout: TimeInterval = 30) async throws {
+    ///   - timeout: Budget for the entire operation (default: 30 seconds)
+    public func createVM(
+        config: QEMUConfiguration,
+        timeout: Duration = .seconds(30)
+    ) async throws(QMPError) {
         guard !(await process.isRunning) else {
             throw QMPError.processAlreadyRunning
         }
@@ -78,81 +81,89 @@ public actor QEMUManager {
         configuration = config
         hotplugPorts = HotplugPortPool(portIDs: config.hotplugPortIDs)
 
-        do {
-            // Wrap entire operation in a timeout
-            try await withThrowingTaskGroup(of: Void.self) { group in
-                // Timeout task
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                    throw QMPError.timeout
+        // A plain task group returning the failure, rather than a throwing one:
+        // `withThrowingTaskGroup` rethrows `any Error`, which would have to be
+        // widened back out of `QMPError` and narrowed again on the way through.
+        // Both legs already speak this domain, so there is nothing to convert.
+        let failure: QMPError? = await withTaskGroup(of: QMPError?.self) { group in
+            // Timeout leg. Cancelled once the creation leg wins, and a cancelled
+            // sleep is not a timeout.
+            group.addTask {
+                do {
+                    try await sleepOrCancel(for: timeout)
+                } catch {
+                    return nil
                 }
+                return .timeout
+            }
 
-                // Main creation task
-                group.addTask {
+            // Main creation leg.
+            group.addTask {
+                do {
                     // Start QEMU process
                     try await self.process.start(with: config)
 
                     // Connect to QMP
                     let socketPath = self.process.getQMPSocketPath()
                     try await self.qmpClient.connectUnix(path: socketPath)
-                }
-
-                // Wait for first task to complete (either timeout or creation)
-                do {
-                    _ = try await group.next()
-                    group.cancelAll()
+                    return nil
                 } catch {
-                    group.cancelAll()
-                    throw error
+                    return QMPError.wrapping(error)
                 }
             }
 
-            // Success path
+            // Whichever finishes first decides the outcome.
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+
+        guard let failure else {
             isConnected = true
             // Subscribed before the first status query, so no transition can slip
             // through the gap between the two.
             startEventMonitor()
             await updateStatus()
             logger.info("QEMU VM created successfully")
-
-        } catch {
-            // Cleanup on any failure. Read stderr before stopping the process — on a
-            // timeout QEMU is still alive, and its output is usually the only thing
-            // that explains why the socket never showed up.
-            //
-            // These reads and the `start(with:)` above no longer touch the same
-            // state from two concurrency domains: `QEMUProcess` is an actor, so the
-            // group's cancelled child is serialized against this path rather than
-            // relying on `@unchecked Sendable` to hide the overlap.
-            let stderr = await process.capturedStderr
-            logger.error("Failed to create QEMU VM: \(error)", metadata: [
-                "qemuStderr": .string(stderr.isEmpty ? "<empty>" : stderr)
-            ])
-
-            // Reset state
-            isConnected = false
-            stopEventMonitor()
-            status = .stopped
-            forgetHotplugState()
-
-            // Clean up process if it was started. `stop()` waits for the child to
-            // actually go, so what follows this cannot race a half-dead QEMU — and
-            // if it fails to kill it, that is logged rather than thrown, so the
-            // original failure is still what the caller sees.
-            await process.stop()
-            if await process.isRunning {
-                let pid = await process.processIdentifier
-                logger.error("QEMU process could not be terminated during cleanup", metadata: [
-                    "pid": .string(pid.map(String.init) ?? "unknown")
-                ])
-            }
-
-            throw error
+            return
         }
+
+        // Cleanup on any failure. Read stderr before stopping the process — on a
+        // timeout QEMU is still alive, and its output is usually the only thing
+        // that explains why the socket never showed up.
+        //
+        // These reads and the `start(with:)` above no longer touch the same
+        // state from two concurrency domains: `QEMUProcess` is an actor, so the
+        // group's cancelled child is serialized against this path rather than
+        // relying on `@unchecked Sendable` to hide the overlap.
+        let stderr = await process.capturedStderr
+        logger.error("Failed to create QEMU VM: \(failure)", metadata: [
+            "qemuStderr": .string(stderr.isEmpty ? "<empty>" : stderr)
+        ])
+
+        // Reset state
+        isConnected = false
+        stopEventMonitor()
+        status = .stopped
+        forgetHotplugState()
+
+        // Clean up process if it was started. `stop()` waits for the child to
+        // actually go, so what follows this cannot race a half-dead QEMU — and
+        // if it fails to kill it, that is logged rather than thrown, so the
+        // original failure is still what the caller sees.
+        await process.stop()
+        if await process.isRunning {
+            let pid = await process.processIdentifier
+            logger.error("QEMU process could not be terminated during cleanup", metadata: [
+                "pid": .string(pid.map(String.init) ?? "unknown")
+            ])
+        }
+
+        throw failure
     }
     
     /// Start/resume VM execution
-    public func start() async throws {
+    public func start() async throws(QMPError) {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -166,7 +177,7 @@ public actor QEMUManager {
     }
     
     /// Pause VM execution
-    public func pause() async throws {
+    public func pause() async throws(QMPError) {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -180,7 +191,7 @@ public actor QEMUManager {
     }
     
     /// Reset the VM
-    public func reset() async throws {
+    public func reset() async throws(QMPError) {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -196,7 +207,7 @@ public actor QEMUManager {
     /// Shutdown the VM gracefully
     /// - Parameter timeout: How long to wait for the guest to power itself off
     ///   before termination is forced (default: 30 seconds)
-    public func shutdown(timeout: TimeInterval = 30) async throws {
+    public func shutdown(timeout: Duration = .seconds(30)) async throws(QMPError) {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -209,7 +220,7 @@ public actor QEMUManager {
         // Wait for shutdown with timeout
         await withTaskGroup(of: Void.self) { group in
             group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                try? await Task.sleep(for: timeout)
             }
 
             group.addTask {
@@ -250,8 +261,8 @@ public actor QEMUManager {
     /// - Throws: `QMPError.processTerminationFailed` if QEMU outlived both signals.
     ///   A force quit that could not force anything must not report success.
     public func destroy(
-        terminationTimeout: TimeInterval = QEMUProcess.defaultTerminationTimeout
-    ) async throws {
+        terminationTimeout: Duration = QEMUProcess.defaultTerminationTimeout
+    ) async throws(QMPError) {
         logger.info("Destroying VM")
 
         if isConnected {
@@ -296,7 +307,7 @@ public actor QEMUManager {
     }
     
     /// Get current VM status
-    public func getStatus() async throws -> QEMUVMStatus {
+    public func getStatus() async throws(QMPError) -> QEMUVMStatus {
         guard isConnected else {
             return .stopped
         }
@@ -343,7 +354,7 @@ public actor QEMUManager {
     /// - Throws: `QMPError.notConnected` if no VM is connected.
     public func events(
         bufferSize: Int = QMPClient.defaultEventBufferSize
-    ) throws -> AsyncStream<QMPEvent> {
+    ) throws(QMPError) -> AsyncStream<QMPEvent> {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -427,7 +438,7 @@ public actor QEMUManager {
         deviceName: String,
         readOnly: Bool = false,
         bus: String? = nil
-    ) async throws {
+    ) async throws(QMPError) {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -479,7 +490,7 @@ public actor QEMUManager {
     ///   - timeout: How long to wait for `DEVICE_DELETED` before giving up
     ///     (default: 5 seconds). A guest may take considerably longer than this to
     ///     quiesce a disk that is in use.
-    public func detachDisk(deviceName: String, timeout: TimeInterval = 5) async throws {
+    public func detachDisk(deviceName: String, timeout: Duration = .seconds(5)) async throws(QMPError) {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -502,7 +513,7 @@ public actor QEMUManager {
     }
 
     /// List attached block devices
-    public func listDisks() async throws -> [JSONValue] {
+    public func listDisks() async throws(QMPError) -> [JSONValue] {
         guard isConnected else {
             throw QMPError.notConnected
         }
@@ -522,7 +533,7 @@ public actor QEMUManager {
     /// Which bus `device_add` should target, or `nil` for QEMU's default.
     ///
     /// The port is chosen but not claimed — see `attachDisk`.
-    private func hotplugBus(explicit: String?) throws -> String? {
+    private func hotplugBus(explicit: String?) throws(QMPError) -> String? {
         // A caller who has built its own topology knows better than this does.
         if let explicit = explicit { return explicit }
 
@@ -541,8 +552,8 @@ public actor QEMUManager {
 
     /// Replace QEMU's own "does not support hotplugging" with an error that names
     /// the fix. Anything else passes through untouched.
-    private func hotplugFailure(_ error: Error, bus: String?) -> Error {
-        guard case QMPError.qmpError(_, let description) = error,
+    private func hotplugFailure(_ error: QMPError, bus: String?) -> QMPError {
+        guard case .qmpError(_, let description) = error,
               description.lowercased().contains("does not support hotplug") else {
             return error
         }
