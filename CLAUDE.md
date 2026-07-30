@@ -29,7 +29,8 @@ swift test --filter QMPProtocolTests
 **QEMUManager** (Sources/SwiftQEMU/QEMUManager.swift)
 - High-level API that coordinates process and QMP management
 - Manages VM lifecycle: create, start, pause, reset, shutdown, destroy
-- Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown), kept current from QMP events rather than only on demand (see fix 14)
+- Owns the running VM's hot-plug topology: it keeps the `QEMUConfiguration` the VM was started with, and a `HotplugPortPool` of the `pcie-root-port` devices from its command line, because which bus `device_add` may target is decided at launch and not at attach time (see fix 16)
+- Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown), kept current from QMP events rather than only on demand (see fix 17)
 - Re-exposes the event stream as `events(bufferSize:)` for applications, alongside its own subscription
 - Actor-based for thread-safe concurrent access
 
@@ -51,15 +52,17 @@ swift test --filter QMPProtocolTests
 - **Critical fix**: Implements exponential backoff retry logic (up to 10 attempts) for socket connection timing issues
 - Handles QMP greeting, capability negotiation, and command execution
 - Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit, query-yank, yank
-- **Events**: `events(bufferSize:)` hands out an `AsyncStream<QMPEvent>` per subscriber — bounded, oldest-dropped, finished when the connection ends (see fix 14)
+- **Events**: `events(bufferSize:)` hands out an `AsyncStream<QMPEvent>` per subscriber — bounded, oldest-dropped, finished when the connection ends (see fix 17)
 - **Capabilities**: the greeting is kept (`greeting`), and the capabilities it offers that appear in `requestedCapabilities` are enabled and reported as `negotiatedCapabilities`. `executeOutOfBand` sends `exec-oob` requests for the handful of commands QEMU allows out-of-band
 - Connection state (channel, handler, connected flag) lives in one lock-guarded box, so the type is honestly `Sendable` rather than `@unchecked Sendable`. Losing the channel clears the connected flag, so the next command fails fast instead of being written into a dead socket
+- Every wait is bounded by a deadline scheduled on the channel's event loop and cancelled when the waiter resolves, and every wait is cancellation-aware (see fix 14). Both halves have the same ordering hazard — the deadline, or the cancellation, can land before the waiter parks — and both are handled by installing the waiter's record first and resolving against it under the lock
 - `disconnect()` is idempotent and treats an already-closed channel as success
+- Inbound frames are newline-delimited and **bounded**: `maximumFrameSize` (default 512 KB) caps what one frame may buffer, and a peer that exceeds it gets `QMPError.frameTooLarge` and a closed connection (see fix 15)
 
 **QMPProtocol** (Sources/SwiftQEMU/QMPProtocol.swift)
 - Defines QMP message types: QMPGreeting, QMPRequest, QMPResponse, QMPEvent
 - `QMPCapability` (`.oob`) is the negotiable half of the greeting; `QMPEventName` names the events with behaviour attached, since a misspelled event name silently never matches
-- `QMPRequest.outOfBand` encodes as `exec-oob`. **Never** the `"control": {"run-oob": true}` form — QEMU 11 rejects it outright (see fix 14)
+- `QMPRequest.outOfBand` encodes as `exec-oob`. **Never** the `"control": {"run-oob": true}` form — QEMU 11 rejects it outright (see fix 17)
 - Provides type-safe QMPCommand enum for common commands
 - `QMPMessage` discriminates inbound traffic by its key (`QMP`/`event`/`return`/`error`). **Never** go back to trying each type in turn — every property of `QMPResponse` is optional, so a try-in-sequence decode accepts an event as an empty response (see fix 6)
 
@@ -130,7 +133,27 @@ The codebase includes critical fixes for production reliability:
     - `.creating` is left to the window before `createVM` returns. `inmigrate` keeps it — an incoming migration really is a VM still being constructed — and nothing else QEMU reports maps to it
     - The mapping moved out of `updateStatus()` into `QEMUVMStatus.init?(_ response: QMPStatusResponse)`, a pure function testable without a process or a socket. It returns `nil` for an unrecognised run state so the manager still logs the raw string before falling back to `.unknown`
 
-14. **Events Reach Callers, and the Greeting's Capabilities Are Used**: events were decoded correctly (fix 6) but only `DEVICE_DELETED` was acted on — everything else was logged at debug level and dropped, so `QEMUManager.status` went stale until someone called `getStatus()` and a guest powering itself off was invisible. The greeting's `capabilities` were decoded and discarded in the same way, leaving the protocol's only optional feature permanently off. Now:
+14. **Scheduled Deadlines and Cancellable Waits**: every waiter in `QMPChannelHandler` armed its deadline as a `Task.detached` that slept out the *whole* budget, and no wait observed cancellation. So a burst of commands left one task per command idling for the full 10s default long after each resolved, and a cancelled caller had nothing to resume it but the deadline it was trying to escape. Now:
+    - `armDeadline` returns an `EventLoop.scheduleTask` `Scheduled<Void>`, stored on the waiter's record and cancelled the moment the waiter resolves — no task, no sleep, and no deadline outliving what it bounds. It is still armed only *after* the waiter is installed (fix 6's ordering rule), so it either finds the waiter or finds it already resolved; `attachDeadline` closes the remaining window by cancelling a deadline whose waiter resolved while it was being armed. Scheduling on the loop also preserves what `Task.detached` was there for: the deadline is out of reach of caller cancellation, and a deadline that inherited cancellation and skipped `expire` would strand its waiter
+    - All three waits (`waitForGreeting`, `sendRequest`, `waitForDeviceDeleted`) run under `withTaskCancellationHandler` and throw `CancellationError` promptly. The mirror image of the deadline hazard applies — a cancellation can arrive *before* the waiter parks — so each waiter's record is created before the handler is installed and the canceller marks it rather than finding nothing; the parking waiter then resumes itself. This is why `sendRequest` now registers its `PendingRequest` before writing to the channel, and why a cancelled command may never be written at all
+    - A `PendingRequest` without a continuation has not been written yet, so no reply can belong to it. The untagged-response FIFO fallback (old QEMU that does not echo `id`) skips those records rather than taking the head blindly
+
+15. **Bounded Inbound Frames**: `channelRead` accumulated everything it read and only drained on a newline, so a peer that never sent one grew the buffer for as long as it kept writing. Fix 6's `discardReadBytes()` stopped *consumed* frames accumulating; a single unterminated frame was still unbounded. `maximumFrameSize` (default `QMPClient.defaultMaximumFrameSize`, 512 KB, settable per client) now caps one frame including its terminating newline, and exceeding it fails the connection with `QMPError.frameTooLarge(limit:)`.
+    - QEMU does not do this, so this is hardening — it matters because the socket lives in a world-writable directory today, and because a half-written frame should surface as a named error rather than as growing memory and, eventually, a bare `.timeout`
+    - The cap is on **frame size**, not merely on withheld newlines: an over-limit frame is rejected whether or not its newline has arrived. The unterminated branch (`readableBytes > limit`) and the complete-frame branch (`messageLength > limit`) are both reachable and both tested — which arrives depends only on how the peer's bytes land across socket reads
+    - Waiters are failed *before* the close, so the in-flight caller gets `frameTooLarge` rather than the `connectionLost` that `channelInactive` would otherwise latch a moment later. `failAllWaiters` keeps the first error
+    - 512 KB is far above any real QMP message (`query-block` on a long device list, the largest realistic payload, runs to tens of KB). `testLargeFrameWithinTheLimitIsStillDelivered` exists because a cap that clipped legitimate payloads would be worse than no cap
+    - `NIOExtras.LineBasedFrameDecoder` would give this for free via its `maximumBufferSize`; it is deliberately not used here, since adding the dependency belongs with the `NIOAsyncChannel` migration (issue #21)
+
+16. **Hot-Plug on the Default Machine Type**: `machineType` defaults to `q35`, whose `pcie.0` is a PCIe root complex, and `attachDisk` named no bus — so `device_add` landed on `pcie.0` and QEMU answered `Bus 'pcie.0' does not support hotplugging`. `attachDisk`/`detachDisk` were therefore unusable as shipped unless the caller knew to switch to `-machine pc`. A PCIe complex hot-plugs only through a `pcie-root-port`, and a root port **cannot itself be hot-plugged** — it has to be on the command line at launch, which is why this could not be fixed inside `attachDisk`. Now:
+    - `QEMUConfiguration.hotplugPorts` (`.automatic`/`.count(n)`/`.disabled`, default `.automatic`) pre-creates root ports, and `QEMUManager` hands one out per `attachDisk`, releasing it on `detachDisk`. A port holds exactly one device — a second `device_add` onto an occupied port is refused with `slot 0 function 0 already occupied` — so the pool is a real capacity limit, `automaticHotplugPortCount` (4) by default, and `QEMUManager.availableHotplugPorts` reports what is left
+    - **`chassis` is mandatory and must be unique.** Two root ports that both leave it unset stop QEMU from starting with `Can't add chassis slot, error -16`. The emitted arguments are `pcie-root-port,id=swiftqemu-hotplug<i>,chassis=<i+1>`, and deliberately carry **no `bus=`**: the machine's own default root complex is the right parent, verified on q35, `pc` and arm `virt` alike
+    - `.automatic` is gated on the machine type by allowlist (`q35`, `pc-q35-*`, `virt`, `virt-*`), because a root port is only valid where there is a PCI bus to put it on — on `microvm` the argument alone is fatal (`No 'PCI' bus found for device 'pcie-root-port'`). Being wrong in that direction costs a launch; being wrong the other way costs one clear error at attach time, so unknown machine types get no ports
+    - `pc` deliberately gets none: its `pci.0` hot-plugs directly, and `attachDisk` names no bus there
+    - Both failure modes now name their cause: `QMPError.noHotplugPortAvailable(machineType:portCount:inUse:)` when there is no free port (thrown *before* `blockdev-add`, so a refused attach leaves no orphaned backend node), and `QMPError.hotplugNotSupported(bus:machineType:)` in place of QEMU's bare `GenericError`. `attachDisk(bus:)` lets a caller with its own topology bypass the pool entirely
+    - Every QEMU behaviour above was checked over a raw QMP socket against QEMU 11.0.2 before being encoded, and `QEMUHotplugTests` starts real VMs to cover both sides of the gate: default-config attach, all four ports, pool exhaustion, `pc` with no ports, and `.disabled` on q35 (which is the pre-fix state, and must fail with the named error)
+
+17. **Events Reach Callers, and the Greeting's Capabilities Are Used**: events were decoded correctly (fix 6) but only `DEVICE_DELETED` was acted on — everything else was logged at debug level and dropped, so `QEMUManager.status` went stale until someone called `getStatus()` and a guest powering itself off was invisible. The greeting's `capabilities` were decoded and discarded in the same way, leaving the protocol's only optional feature permanently off. Now:
     - `QMPClient.events(bufferSize:)` returns an `AsyncStream<QMPEvent>`. **Per subscriber**, so the manager's own bookkeeping and an application's `for await` do not displace each other; **bounded** at `bufferSize` (default 64) keeping the *newest*, because these are yielded from the NIO event loop and a blocking yield would stall QEMU's socket for every waiter; and **finished when the connection ends**, so a `for await` terminates instead of parking. A stream belongs to one connection — reconnecting means resubscribing
     - `DEVICE_DELETED` keeps its dedicated ticket path (a detach needs a targeted, timed wait, not a scan of a shared stream) *and* is published to subscribers. `QMPClientTests.testDeviceDeletedReachesBothItsTicketAndTheStream` is the guard on that
     - `QEMUManager` consumes the stream in a task started at the end of `createVM`, subscribing *before* the first `updateStatus()` so no transition falls in the gap. `QEMUVMStatus.init?(event:)` is the mapping, pure and testable: `STOP`/`SUSPEND` → `.paused`, `RESUME`/`WAKEUP` → `.running`, `POWERDOWN` → `.shuttingDown`, `SHUTDOWN` → `.stopped`. `RESET` and `GUEST_PANICKED` map to **nothing** — verified on 11.0.2, `system_reset` leaves the run state alone and emits `RESET` *twice*, and what a panic implies depends on `-action panic`
@@ -147,11 +170,10 @@ The codebase includes critical fixes for production reliability:
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
-- **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
-- **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` drives the manager against a real QEMU for the create → start → destroy path (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake
+- **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` and `QEMUHotplugTests` drive the manager against a real QEMU for the create → start → attach → destroy paths (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake, since `QMPClient` is created in `init`
+- **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. This is documented on the API and its timeout is now a parameter, but nothing can make a guest-less VM release a device
 - **The manager does not reconcile `isConnected` when QEMU exits on its own**: a guest-initiated poweroff now moves `status` to `.stopped` via the `SHUTDOWN` event, but `isConnected` stays true and the process record and socket file are only released by an explicit `shutdown()`/`destroy()`. Commands in that window fail from the client as `.notConnected` rather than being refused up front
 - **Event subscriptions do not survive a reconnect** and do not replay: a stream belongs to one connection, and events emitted before `events()` was called are gone. Subscribe first, then read state
-- **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
 
 ### Configuration Types
 
@@ -162,6 +184,7 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 - Disks (QEMUDisk): path, format (qcow2/raw), interface (virtio/ide)
 - Networks (QEMUNetwork): backend (user/tap/bridge), model (virtio-net-pci)
 - Kernel, initrd, and kernel arguments for direct kernel boot
+- **Hot-plug ports** (`QEMUHotplugPorts`: `.automatic`/`.count(n)`/`.disabled`), emitted as `-device pcie-root-port,...`. Defaults to `.automatic`, which provides `automaticHotplugPortCount` (4) ports on machine types whose default bus refuses hot-plug and none on the rest — see Hot-Plug on the Default Machine Type above. `hotplugPortIDs` is the single source of both the launch arguments and the manager's pool
 - Display options (noGraphic flag)
 - Start paused option for controlled initialization
 
@@ -201,6 +224,14 @@ qemu-system-x86_64 -accel help
 ```
 
 `QEMUConfigurationTests.testDefaultConfigurationStartsRealQEMU` starts a real QEMU with the stock configuration when one is installed, and skips otherwise. It is the only test that can confirm the accelerator and CPU model are actually accepted.
+
+`QEMUHotplugTests` goes further and drives `QEMUManager` end to end against a real QEMU — create, `attachDisk`, `query-block`, destroy — because whether a `device_add` lands anywhere is a fact about QEMU's PCI topology that no fake can answer. It needs `qemu-img` as well (each test hot-plugs a real 16M qcow2) and skips when either binary is missing. Each VM boots paused with 128MB under TCG, so the whole suite is under a second per VM.
+
+```bash
+# Machine types this binary provides. The name is what decides whether root ports
+# are pre-created, versioned aliases (pc-q35-10.0) included
+qemu-system-x86_64 -machine help
+```
 
 Three more tests need a real QEMU for the same reason — the fake server accepts whatever it is sent, so only QEMU can say whether a request is *valid*:
 
@@ -243,6 +274,14 @@ try await manager.createVM(config: config)
 
 // Start VM execution
 try await manager.start()
+
+// Hot-plug a disk. On q35 this goes into one of the pcie-root-port devices
+// `config.hotplugPorts` put on the command line — four by default, one per disk.
+try await manager.attachDisk(path: "/path/to/extra.qcow2", deviceName: "vdb")
+// await manager.availableHotplugPorts  // 3, or nil where the default bus hot-plugs
+// Detach needs the *guest* to release the device; a VM with no guest OS never does,
+// and this times out with nothing removed.
+try await manager.detachDisk(deviceName: "vdb", timeout: 30)
 
 // Later: gracefully shutdown (default 30 second timeout, then force quit)
 try await manager.shutdown()
@@ -305,7 +344,10 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - socketCreationFailed (QMP socket not created within timeout, process still alive)
 - processExited(exitCode:killedBySignal:stderr:) (QEMU died before the socket was ready; carries its stderr)
 - processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
+- noHotplugPortAvailable(machineType:portCount:inUse:) (nowhere to hot-plug the disk: the machine type refuses hot-plug on its default bus and no free `pcie-root-port` was left. Thrown before anything reaches QEMU)
+- hotplugNotSupported(bus:machineType:) (QEMU refused `device_add` because the target bus does not support hot-plug, in place of its own bare `GenericError`)
 - timeout (createVM operation exceeded timeout)
+- frameTooLarge(limit:) (an inbound QMP frame exceeded `maximumFrameSize`, so the connection was closed)
 - invalidResponse, invalidConfiguration
 - capabilityNotNegotiated(QMPCapability) (an out-of-band request on a connection without `oob`)
 - qmpError(class, description) for QMP-specific errors
