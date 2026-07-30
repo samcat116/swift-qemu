@@ -30,7 +30,12 @@ final class QMPWaiter<Value: Sendable>: Sendable {
         /// over rather than parking.
         case latched(Result<Value, QMPError>)
         /// A caller is parked on this continuation.
-        case waiting(CheckedContinuation<Value, QMPError>)
+        ///
+        /// Untyped, unavoidably: `withCheckedThrowingContinuation` hands out a
+        /// `CheckedContinuation<_, any Error>` and is not generic over the error
+        /// type. Only the resume crosses back out of this domain, and `value`
+        /// narrows it again on the way to the caller.
+        case waiting(CheckedContinuation<Value, any Error>)
         /// Resolved *and* delivered.
         case done
     }
@@ -83,7 +88,7 @@ final class QMPWaiter<Value: Sendable>: Sendable {
     /// blindly.
     func resolve(_ result: Result<Value, QMPError>) {
         let (waiter, deadline) = storage.withLockedValue {
-            storage -> (CheckedContinuation<Value, QMPError>?, Scheduled<Void>?) in
+            storage -> (CheckedContinuation<Value, any Error>?, Scheduled<Void>?) in
             switch storage.state {
             case .pending:
                 storage.state = .latched(result)
@@ -97,7 +102,7 @@ final class QMPWaiter<Value: Sendable>: Sendable {
         }
         deadline?.cancel()
         // Resumed after the lock is dropped, so this never calls out while held.
-        waiter?.resume(with: result)
+        waiter?.resume(with: result.mapError { $0 as any Error })
     }
 
     /// The resolved value, waiting for it if it has not arrived yet.
@@ -107,15 +112,16 @@ final class QMPWaiter<Value: Sendable>: Sendable {
     /// first.
     var value: Value {
         get async throws(QMPError) {
-            // The continuation is typed, but `withTaskCancellationHandler`
-            // `rethrows` as `any Error`, so the domain is restored on the way out.
-            // Every resolver above is a `QMPError`, so nothing reaches
-            // `QMPError.underlying(_:)` here — it is what keeps the mapping total
-            // without inventing a case for an error we did not throw.
+            // `resolve` only ever takes a `QMPError`, so this narrowing cannot
+            // lose anything — it is here because the continuation and
+            // `withTaskCancellationHandler` both deal in `any Error`. Nothing
+            // actually reaches `QMPError.underlying(_:)`; having it is what keeps
+            // the mapping total without inventing a case for an error we did not
+            // throw.
             do {
                 return try await withTaskCancellationHandler {
                     try await withCheckedThrowingContinuation {
-                        (continuation: CheckedContinuation<Value, QMPError>) in
+                        (continuation: CheckedContinuation<Value, any Error>) in
                         let (immediate, deadline) = storage.withLockedValue {
                             storage -> (Result<Value, QMPError>?, Scheduled<Void>?) in
                             switch storage.state {
@@ -131,16 +137,16 @@ final class QMPWaiter<Value: Sendable>: Sendable {
                         }
                         deadline?.cancel()
                         if let immediate {
-                            continuation.resume(with: immediate)
+                            continuation.resume(with: immediate.mapError { $0 as any Error })
                         }
                     }
                 } onCancel: {
                     // Just another resolver. Whether this lands before or after the
                     // continuation is installed no longer matters.
                     //
-                    // `.cancelled` rather than `CancellationError`: the waiter is
-                    // typed to this library's error, which a typed-throws API cannot
-                    // smuggle a foreign error past.
+                    // `.cancelled` rather than `CancellationError`: `resolve` is
+                    // typed to this library's error, which a typed-throws API
+                    // cannot smuggle a foreign error past.
                     resolve(.failure(.cancelled))
                 }
             } catch {
