@@ -251,7 +251,7 @@ final class QMPClientTests: XCTestCase {
             let server = try await FakeQMPServer(behaviour: .greetImmediately)
             defer { Task { await server.shutdown() } }
 
-            let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+            let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
             try await client.connectUnix(path: server.socketPath)
             try await client.disconnect()
         }
@@ -266,7 +266,7 @@ final class QMPClientTests: XCTestCase {
 
         // connectUnix retries, so keep the per-attempt budget small to bound
         // the test; what matters is that it terminates at all.
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 0.2, connectTimeout: 0.2)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .milliseconds(200), connectTimeout: .milliseconds(200))
 
         do {
             try await client.connectUnix(path: server.socketPath)
@@ -276,12 +276,59 @@ final class QMPClientTests: XCTestCase {
         }
     }
 
+    /// A refused connection is named in this library's own vocabulary, with the
+    /// endpoint attached. NIO's own error says only that the connection failed.
+    func testRefusedConnectionIsReportedAsAConnectionFailure() async throws {
+        // Port 1 on the loopback: privileged, and nothing is listening there.
+        let client = QMPClient(
+            logger: Logger(label: "test"),
+            requestTimeout: .seconds(5),
+            connectTimeout: .seconds(5)
+        )
+
+        do {
+            try await client.connectTCP(host: "127.0.0.1", port: 1)
+            XCTFail("Expected the connect to be refused")
+        } catch {
+            guard case .connectionFailed(let endpoint, _) = error else {
+                return XCTFail("Expected .connectionFailed, got \(error)")
+            }
+            XCTAssertEqual(endpoint, "127.0.0.1:1")
+        }
+
+        XCTAssertFalse(client.isConnected)
+    }
+
+    /// A peer that accepts but never greets fails with the negotiation's own
+    /// error, not with a generic "could not connect" wrapped around it — the
+    /// distinction between "nothing is there" and "something is there and
+    /// wedged" is the whole diagnostic value.
+    func testSilentPeerKeepsItsNegotiationErrorRatherThanBeingWrapped() async throws {
+        let server = try await FakeQMPServer(behaviour: .silent)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(
+            logger: Logger(label: "test"),
+            requestTimeout: .milliseconds(100),
+            connectTimeout: .milliseconds(100)
+        )
+
+        do {
+            try await client.connectUnix(path: server.socketPath)
+            XCTFail("Expected connect to a silent peer to fail")
+        } catch {
+            guard case .timeout = error else {
+                return XCTFail("Expected .timeout, got \(error)")
+            }
+        }
+    }
+
     /// A request whose response never comes must time out rather than park.
     func testRequestToSilentPeerTimesOut() async throws {
         let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
         defer { Task { try? await client.disconnect() } }
 
@@ -290,9 +337,9 @@ final class QMPClientTests: XCTestCase {
         // implementation left its continuation parked, which meant the
         // surrounding task group could never drain — the timeout itself hung.
         do {
-            try await client.deviceDel(deviceId: "vdb", timeout: 0.3)
+            try await client.deviceDel(deviceId: "vdb", timeout: .milliseconds(300))
             XCTFail("Expected deviceDel to time out waiting for DEVICE_DELETED")
-        } catch let error as QMPError {
+        } catch {
             guard case .timeout = error else {
                 return XCTFail("Expected .timeout, got \(error)")
             }
@@ -308,7 +355,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetThenReplyWithStaleID)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 0.4, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .milliseconds(400), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         // The server answers, but under an id nobody is waiting on. The correct
@@ -317,7 +364,7 @@ final class QMPClientTests: XCTestCase {
         do {
             _ = try await client.execute(.cont)
             XCTFail("Expected the command to time out rather than accept a mismatched response")
-        } catch let error as QMPError {
+        } catch {
             guard case .timeout = error else {
                 return XCTFail("Expected .timeout, got \(error)")
             }
@@ -336,13 +383,13 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         do {
-            try await client.deviceDel(deviceId: "vdb", timeout: 0)
+            try await client.deviceDel(deviceId: "vdb", timeout: .zero)
             XCTFail("Expected a zero timeout to fail")
-        } catch let error as QMPError {
+        } catch {
             guard case .timeout = error else {
                 return XCTFail("Expected .timeout, got \(error)")
             }
@@ -357,14 +404,14 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         for _ in 0..<25 {
             do {
-                try await client.deviceDel(deviceId: "vdb", timeout: 0.001)
+                try await client.deviceDel(deviceId: "vdb", timeout: .milliseconds(1))
                 XCTFail("Expected the wait to time out")
-            } catch let error as QMPError {
+            } catch {
                 guard case .timeout = error else {
                     return XCTFail("Expected .timeout, got \(error)")
                 }
@@ -388,7 +435,7 @@ final class QMPClientTests: XCTestCase {
         // A budget far longer than this test is willing to wait for: if
         // cancellation is not honoured, the only other way out is the timeout,
         // and the elapsed-time assertion fails long before it arrives.
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 60, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(60), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         let started = ContinuousClock.now
@@ -401,7 +448,7 @@ final class QMPClientTests: XCTestCase {
         do {
             _ = try await command.value
             XCTFail("Expected the cancelled command to throw")
-        } catch is CancellationError {
+        } catch QMPError.cancelled {
             // Expected.
         }
 
@@ -418,18 +465,18 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         let started = ContinuousClock.now
-        let detach = Task { try await client.deviceDel(deviceId: "vdb", timeout: 60) }
+        let detach = Task { try await client.deviceDel(deviceId: "vdb", timeout: .seconds(60)) }
         try await Task.sleep(for: .milliseconds(100))
         detach.cancel()
 
         do {
             try await detach.value
             XCTFail("Expected the cancelled detach to throw")
-        } catch is CancellationError {
+        } catch QMPError.cancelled {
             // Expected.
         }
 
@@ -449,7 +496,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetThenSwallowCommands)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 60, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(60), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         let started = ContinuousClock.now
@@ -459,7 +506,7 @@ final class QMPClientTests: XCTestCase {
             do {
                 _ = try await command.value
                 XCTFail("Expected the cancelled command to throw")
-            } catch is CancellationError {
+            } catch QMPError.cancelled {
                 // Expected.
             }
         }
@@ -477,7 +524,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetImmediately)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
         _ = try await client.execute(.cont)
         try await client.disconnect()
@@ -496,10 +543,10 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
-        try await client.deviceDel(deviceId: "vdb", timeout: 3)
+        try await client.deviceDel(deviceId: "vdb", timeout: .seconds(3))
 
         try await client.disconnect()
     }
@@ -511,10 +558,10 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetAndDeleteBeforeReplying)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
-        try await client.deviceDel(deviceId: "vdb", timeout: 3)
+        try await client.deviceDel(deviceId: "vdb", timeout: .seconds(3))
 
         try await client.disconnect()
     }
@@ -530,7 +577,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         let result = try await client.execute(.cont)
@@ -561,8 +608,8 @@ final class QMPClientTests: XCTestCase {
         let limit = 8 * 1024
         let client = QMPClient(
             logger: Logger(label: "test"),
-            requestTimeout: 30,
-            connectTimeout: 5,
+            requestTimeout: .seconds(30),
+            connectTimeout: .seconds(5),
             maximumFrameSize: limit
         )
         try await client.connectUnix(path: server.socketPath)
@@ -570,7 +617,7 @@ final class QMPClientTests: XCTestCase {
         do {
             _ = try await client.execute(.cont)
             XCTFail("Expected an unterminated frame to fail the connection")
-        } catch let error as QMPError {
+        } catch {
             guard case .frameTooLarge(let reported) = error else {
                 return XCTFail("Expected .frameTooLarge, got \(error)")
             }
@@ -590,8 +637,8 @@ final class QMPClientTests: XCTestCase {
         let limit = 300
         let client = QMPClient(
             logger: Logger(label: "test"),
-            requestTimeout: 30,
-            connectTimeout: 5,
+            requestTimeout: .seconds(30),
+            connectTimeout: .seconds(5),
             maximumFrameSize: limit
         )
         try await client.connectUnix(path: server.socketPath)
@@ -599,7 +646,7 @@ final class QMPClientTests: XCTestCase {
         do {
             _ = try await client.execute(.cont)
             XCTFail("Expected an oversized frame to fail the connection")
-        } catch let error as QMPError {
+        } catch {
             guard case .frameTooLarge(let reported) = error else {
                 return XCTFail("Expected .frameTooLarge, got \(error)")
             }
@@ -620,8 +667,8 @@ final class QMPClientTests: XCTestCase {
 
         let client = QMPClient(
             logger: Logger(label: "test"),
-            requestTimeout: 10,
-            connectTimeout: 5,
+            requestTimeout: .seconds(10),
+            connectTimeout: .seconds(5),
             maximumFrameSize: 64 * 1024
         )
         try await client.connectUnix(path: server.socketPath)
@@ -641,7 +688,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetThenReplyWithLargePayload)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 10, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(10), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         let result = try await client.execute(.cont)
@@ -658,7 +705,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         let status = try await client.queryStatus()
@@ -682,7 +729,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
 
         _ = try await client.execute(.quit)
@@ -702,7 +749,7 @@ final class QMPClientTests: XCTestCase {
         let server = try await FakeQMPServer(behaviour: .greetAndBehaveLikeQEMU)
         defer { Task { await server.shutdown() } }
 
-        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: .seconds(5), connectTimeout: .seconds(5))
         try await client.connectUnix(path: server.socketPath)
         XCTAssertTrue(client.isConnected)
 
@@ -714,7 +761,7 @@ final class QMPClientTests: XCTestCase {
         do {
             _ = try await client.execute(.queryStatus)
             XCTFail("Expected a command on a lost connection to fail")
-        } catch let error as QMPError {
+        } catch {
             guard case .notConnected = error else {
                 return XCTFail("Expected .notConnected, got \(error)")
             }

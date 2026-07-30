@@ -9,13 +9,13 @@ public final class QMPClient: Sendable {
     /// Default time budget for a single QMP round-trip. A live QEMU answers in
     /// milliseconds; the bound exists so a wedged or silent peer surfaces as an
     /// error instead of parking the caller forever.
-    public static let defaultRequestTimeout: TimeInterval = 10
+    public static let defaultRequestTimeout: Duration = .seconds(10)
 
     /// Default time budget for the greeting + capability negotiation that
     /// follows a successful connect. A socket that accepts but never speaks
     /// (e.g. a stale socket file outliving its QEMU process) is the case this
     /// bounds.
-    public static let defaultConnectTimeout: TimeInterval = 10
+    public static let defaultConnectTimeout: Duration = .seconds(10)
 
     /// Default cap on a single inbound QMP frame, terminating newline included.
     ///
@@ -26,8 +26,8 @@ public final class QMPClient: Sendable {
 
     private let logger: Logger
     private let eventLoopGroup: EventLoopGroup
-    private let requestTimeout: TimeInterval
-    private let connectTimeout: TimeInterval
+    private let requestTimeout: Duration
+    private let connectTimeout: Duration
     private let maximumFrameSize: Int
 
     /// Connection state.
@@ -46,8 +46,8 @@ public final class QMPClient: Sendable {
 
     public init(
         logger: Logger = Logger(label: "SwiftQEMU.QMPClient"),
-        requestTimeout: TimeInterval = QMPClient.defaultRequestTimeout,
-        connectTimeout: TimeInterval = QMPClient.defaultConnectTimeout,
+        requestTimeout: Duration = QMPClient.defaultRequestTimeout,
+        connectTimeout: Duration = QMPClient.defaultConnectTimeout,
         maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize
     ) {
         self.logger = logger
@@ -72,13 +72,13 @@ public final class QMPClient: Sendable {
     // MARK: - Connection Management
 
     /// Connect to QEMU via Unix domain socket
-    public func connectUnix(path: String) async throws {
+    public func connectUnix(path: String) async throws(QMPError) {
         logger.info("Connecting to QEMU via Unix socket", metadata: ["path": .string(path)])
 
         // Retry connection with exponential backoff
         var retries = 0
         let maxRetries = 10
-        var lastError: Error?
+        var lastError: (any Error)?
 
         while retries < maxRetries {
             do {
@@ -95,19 +95,21 @@ public final class QMPClient: Sendable {
                 retries += 1
 
                 if retries < maxRetries {
-                    let delay = UInt64(min(100_000_000 * (1 << retries), 1_000_000_000)) // Exponential backoff, max 1 second
-                    logger.debug("QMP connection attempt \(retries) failed, retrying in \(Double(delay) / 1_000_000_000)s: \(error)")
-                    try await Task.sleep(nanoseconds: delay)
+                    // Exponential backoff, capped at one second.
+                    let delay = min(Duration.milliseconds(100) * (1 << retries), .seconds(1))
+                    logger.debug("QMP connection attempt \(retries) failed, retrying in \(delay): \(error)")
+                    try await sleepOrCancel(for: delay)
                 }
             }
         }
 
         logger.error("Failed to connect to QMP after \(maxRetries) retries: \(lastError?.localizedDescription ?? "unknown error")")
-        throw lastError ?? QMPError.notConnected
+        guard let lastError else { throw QMPError.notConnected }
+        throw QMPClient.connectionError(endpoint: "unix:\(path)", lastError)
     }
 
     /// Connect to QEMU via TCP socket
-    public func connectTCP(host: String, port: Int) async throws {
+    public func connectTCP(host: String, port: Int) async throws(QMPError) {
         logger.info("Connecting to QEMU via TCP", metadata: [
             "host": .string(host),
             "port": .stringConvertible(port)
@@ -119,10 +121,23 @@ public final class QMPClient: Sendable {
             }
         } catch {
             await teardownFailedAttempt()
-            throw error
+            throw QMPClient.connectionError(endpoint: "\(host):\(port)", error)
         }
 
         logger.info("Connected to QEMU successfully")
+    }
+
+    /// Name a failed connect attempt in this library's own vocabulary.
+    ///
+    /// A negotiation failure is already a `QMPError` and says more than the
+    /// wrapper would — a silent peer stays `.timeout` rather than becoming a
+    /// generic "could not connect". Everything else is somebody else's error
+    /// (NIO, POSIX) and gets the endpoint attached, since a bare
+    /// `connection refused` names nothing.
+    private static func connectionError(endpoint: String, _ error: any Error) -> QMPError {
+        if let error = error as? QMPError { return error }
+        if error is CancellationError { return .cancelled }
+        return .connectionFailed(endpoint: endpoint, underlying: error)
     }
 
     /// One connect attempt: fresh handler, connect, negotiate.
@@ -165,7 +180,7 @@ public final class QMPClient: Sendable {
     /// escape meant `QEMUManager.destroy()` threw before terminating the
     /// process, leaving an orphaned QEMU behind — the exact outcome the cleanup
     /// path exists to prevent.
-    public func disconnect() async throws {
+    public func disconnect() async throws(QMPError) {
         let previous = state.withLockedValue { state -> State in
             let previous = state
             state = State()
@@ -184,6 +199,8 @@ public final class QMPClient: Sendable {
             try await previous.channel?.close()
         } catch ChannelError.alreadyClosed {
             logger.debug("QMP channel was already closed by the peer")
+        } catch {
+            throw QMPError.wrapping(error)
         }
 
         logger.info("Disconnected from QEMU")
@@ -205,7 +222,10 @@ public final class QMPClient: Sendable {
     // MARK: - QMP Commands
 
     /// Execute a QMP command
-    public func execute(_ command: QMPCommand, arguments: [String: JSONValue]? = nil) async throws -> JSONValue? {
+    public func execute(
+        _ command: QMPCommand,
+        arguments: [String: JSONValue]? = nil
+    ) async throws(QMPError) -> JSONValue? {
         let handler = try connectedHandler()
 
         let request = QMPRequest(execute: command.name, arguments: arguments)
@@ -227,7 +247,7 @@ public final class QMPClient: Sendable {
     /// single dropped field failed the whole query — and `singlestep` is gone
     /// from modern QEMU, so the query failed always, leaving the manager to
     /// report `.unknown` for a perfectly healthy VM.
-    public func queryStatus() async throws -> QMPStatusResponse {
+    public func queryStatus() async throws(QMPError) -> QMPStatusResponse {
         guard let result = try await execute(.queryStatus),
               let status = result["status"]?.stringValue else {
             throw QMPError.invalidResponse
@@ -241,27 +261,27 @@ public final class QMPClient: Sendable {
     }
 
     /// Continue VM execution
-    public func cont() async throws {
+    public func cont() async throws(QMPError) {
         _ = try await execute(.cont)
     }
 
     /// Stop/pause VM execution
-    public func stop() async throws {
+    public func stop() async throws(QMPError) {
         _ = try await execute(.stop)
     }
 
     /// Power down the VM
-    public func systemPowerdown() async throws {
+    public func systemPowerdown() async throws(QMPError) {
         _ = try await execute(.systemPowerdown)
     }
 
     /// Reset the VM
-    public func systemReset() async throws {
+    public func systemReset() async throws(QMPError) {
         _ = try await execute(.systemReset)
     }
 
     /// Quit QEMU
-    public func quit() async throws {
+    public func quit() async throws(QMPError) {
         _ = try await execute(.quit)
     }
 
@@ -272,7 +292,11 @@ public final class QMPClient: Sendable {
     ///   - nodeName: Unique identifier for the block device (e.g., "drive-vdb")
     ///   - filename: Path to the disk image
     ///   - readOnly: Whether the disk is read-only
-    public func blockdevAdd(nodeName: String, filename: String, readOnly: Bool = false) async throws {
+    public func blockdevAdd(
+        nodeName: String,
+        filename: String,
+        readOnly: Bool = false
+    ) async throws(QMPError) {
         let arguments: [String: JSONValue] = [
             "driver": "qcow2",
             "node-name": .string(nodeName),
@@ -287,7 +311,7 @@ public final class QMPClient: Sendable {
 
     /// Remove a block device backend
     /// - Parameter nodeName: The node name used when adding the device
-    public func blockdevDel(nodeName: String) async throws {
+    public func blockdevDel(nodeName: String) async throws(QMPError) {
         _ = try await execute(.blockdevDel, arguments: ["node-name": .string(nodeName)])
     }
 
@@ -302,7 +326,7 @@ public final class QMPClient: Sendable {
         deviceId: String,
         driveId: String,
         bus: String? = nil
-    ) async throws {
+    ) async throws(QMPError) {
         var arguments: [String: JSONValue] = [
             "driver": .string(driver),
             "id": .string(deviceId),
@@ -317,8 +341,8 @@ public final class QMPClient: Sendable {
     /// Remove a device and wait for DEVICE_DELETED event
     /// - Parameters:
     ///   - deviceId: The device ID to remove
-    ///   - timeout: Timeout in seconds for waiting on DEVICE_DELETED event
-    public func deviceDel(deviceId: String, timeout: TimeInterval = 5) async throws {
+    ///   - timeout: How long to wait for the DEVICE_DELETED event
+    public func deviceDel(deviceId: String, timeout: Duration = .seconds(5)) async throws(QMPError) {
         let handler = try connectedHandler()
 
         // Registered before the command goes out: QEMU can emit DEVICE_DELETED
@@ -335,13 +359,13 @@ public final class QMPClient: Sendable {
     }
 
     /// Query attached block devices
-    public func queryBlock() async throws -> [JSONValue] {
+    public func queryBlock() async throws(QMPError) -> [JSONValue] {
         try await execute(.queryBlock)?.arrayValue ?? []
     }
 
     // MARK: - Private Methods
 
-    private func connectedHandler() throws -> QMPChannelHandler {
+    private func connectedHandler() throws(QMPError) -> QMPChannelHandler {
         let state = self.state.withLockedValue { $0 }
         guard state.isConnected, let handler = state.handler else {
             throw QMPError.notConnected
@@ -349,7 +373,7 @@ public final class QMPClient: Sendable {
         return handler
     }
 
-    private func negotiateCapabilities(handler: QMPChannelHandler) async throws {
+    private func negotiateCapabilities(handler: QMPChannelHandler) async throws(QMPError) {
         // Wait for greeting
         try await handler.waitForGreeting(timeout: connectTimeout)
 
@@ -535,45 +559,56 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         }
     }
 
-    func waitForGreeting(timeout: TimeInterval) async throws {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                lock.lock()
-                guard !greetingCancelled else {
-                    // Cancelled before we parked. The latch is what makes that
-                    // ordering harmless: without it the canceller would find no
-                    // waiter, and this continuation would park behind it.
-                    lock.unlock()
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                switch greeting {
-                case .satisfied:
-                    // The greeting landed before we got here. Latching it is
-                    // what keeps this from parking forever.
-                    lock.unlock()
-                    continuation.resume()
-                    return
-                case .failed(let error):
-                    lock.unlock()
-                    continuation.resume(throwing: error)
-                    return
-                case .pending:
-                    guard greetingContinuation == nil else {
-                        // Overwriting the slot would abandon the first waiter with
-                        // no resume and no deadline. Only negotiation waits here, so
-                        // a second waiter is a programming error, not a race.
+    /// Every wait below funnels its `any Error` continuation through
+    /// `QMPError.wrapping`. The continuations themselves cannot be typed — the
+    /// stdlib only offers `CheckedContinuation<_, any Error>` — so the
+    /// conversion happens at the boundary instead. Every resume in this file is
+    /// already a `QMPError`, so nothing actually reaches
+    /// `QMPError.underlying(_:)` here; it is what keeps the mapping total
+    /// without inventing a case for an error we did not throw.
+    func waitForGreeting(timeout: Duration) async throws(QMPError) {
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    lock.lock()
+                    guard !greetingCancelled else {
+                        // Cancelled before we parked. The latch is what makes that
+                        // ordering harmless: without it the canceller would find no
+                        // waiter, and this continuation would park behind it.
                         lock.unlock()
-                        continuation.resume(throwing: QMPError.invalidResponse)
+                        continuation.resume(throwing: QMPError.cancelled)
                         return
                     }
-                    greetingContinuation = continuation
-                    lock.unlock()
+                    switch greeting {
+                    case .satisfied:
+                        // The greeting landed before we got here. Latching it is
+                        // what keeps this from parking forever.
+                        lock.unlock()
+                        continuation.resume()
+                        return
+                    case .failed(let error):
+                        lock.unlock()
+                        continuation.resume(throwing: error)
+                        return
+                    case .pending:
+                        guard greetingContinuation == nil else {
+                            // Overwriting the slot would abandon the first waiter with
+                            // no resume and no deadline. Only negotiation waits here, so
+                            // a second waiter is a programming error, not a race.
+                            lock.unlock()
+                            continuation.resume(throwing: QMPError.invalidResponse)
+                            return
+                        }
+                        greetingContinuation = continuation
+                        lock.unlock()
+                    }
+                    attachGreetingDeadline(armDeadline(timeout) { [weak self] in self?.timeOutGreeting() })
                 }
-                attachGreetingDeadline(armDeadline(timeout) { [weak self] in self?.timeOutGreeting() })
+            } onCancel: {
+                self.cancelGreeting()
             }
-        } onCancel: {
-            self.cancelGreeting()
+        } catch {
+            throw QMPError.wrapping(error)
         }
     }
 
@@ -595,7 +630,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         greetingDeadline = nil
         lock.unlock()
         deadline?.cancel()
-        waiter?.resume(throwing: CancellationError())
+        waiter?.resume(throwing: QMPError.cancelled)
     }
 
     /// A registered interest in the `DEVICE_DELETED` for one `device_del`.
@@ -629,52 +664,56 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         abandoned?.continuation?.resume(throwing: QMPError.connectionLost)
     }
 
-    func waitForDeviceDeleted(_ ticket: DeletionTicket, timeout: TimeInterval) async throws {
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                lock.lock()
-                guard var pending = deviceDeletions[ticket.token] else {
-                    // Torn down under us — the connection dropped between the command
-                    // and this wait.
-                    let error = closeError ?? QMPError.connectionLost
+    func waitForDeviceDeleted(_ ticket: DeletionTicket, timeout: Duration) async throws(QMPError) {
+        do {
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    lock.lock()
+                    guard var pending = deviceDeletions[ticket.token] else {
+                        // Torn down under us — the connection dropped between the command
+                        // and this wait.
+                        let error = closeError ?? QMPError.connectionLost
+                        lock.unlock()
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    if pending.cancelled {
+                        // Cancelled before we parked. Checked ahead of `seen` so the
+                        // answer is the same whichever way that race lands:
+                        // cancellation does not un-detach the device either way, and
+                        // first-mover-wins is the rule callers can reason about.
+                        deviceDeletions.removeValue(forKey: ticket.token)
+                        lock.unlock()
+                        continuation.resume(throwing: QMPError.cancelled)
+                        return
+                    }
+                    if let closeError {
+                        deviceDeletions.removeValue(forKey: ticket.token)
+                        lock.unlock()
+                        continuation.resume(throwing: closeError)
+                        return
+                    }
+                    if pending.seen {
+                        deviceDeletions.removeValue(forKey: ticket.token)
+                        lock.unlock()
+                        continuation.resume()
+                        return
+                    }
+                    pending.continuation = continuation
+                    deviceDeletions[ticket.token] = pending
                     lock.unlock()
-                    continuation.resume(throwing: error)
-                    return
+                    attachDeadline(
+                        armDeadline(timeout) { [weak self] in
+                            self?.timeOutDeviceDeleted(token: ticket.token)
+                        },
+                        toDeletion: ticket.token
+                    )
                 }
-                if pending.cancelled {
-                    // Cancelled before we parked. Checked ahead of `seen` so the
-                    // answer is the same whichever way that race lands:
-                    // cancellation does not un-detach the device either way, and
-                    // first-mover-wins is the rule callers can reason about.
-                    deviceDeletions.removeValue(forKey: ticket.token)
-                    lock.unlock()
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                if let closeError {
-                    deviceDeletions.removeValue(forKey: ticket.token)
-                    lock.unlock()
-                    continuation.resume(throwing: closeError)
-                    return
-                }
-                if pending.seen {
-                    deviceDeletions.removeValue(forKey: ticket.token)
-                    lock.unlock()
-                    continuation.resume()
-                    return
-                }
-                pending.continuation = continuation
-                deviceDeletions[ticket.token] = pending
-                lock.unlock()
-                attachDeadline(
-                    armDeadline(timeout) { [weak self] in
-                        self?.timeOutDeviceDeleted(token: ticket.token)
-                    },
-                    toDeletion: ticket.token
-                )
+            } onCancel: {
+                self.cancelDeviceDeleted(token: ticket.token)
             }
-        } onCancel: {
-            self.cancelDeviceDeleted(token: ticket.token)
+        } catch {
+            throw QMPError.wrapping(error)
         }
     }
 
@@ -707,14 +746,14 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         }
         lock.unlock()
         deadline?.cancel()
-        waiter?.resume(throwing: CancellationError())
+        waiter?.resume(throwing: QMPError.cancelled)
     }
 
-    func sendRequest(_ request: QMPRequest, timeout: TimeInterval) async throws -> QMPResponse? {
+    func sendRequest(_ request: QMPRequest, timeout: Duration) async throws(QMPError) -> QMPResponse? {
         lock.lock()
         if let closeError {
             lock.unlock()
-            throw closeError
+            throw QMPError.wrapping(closeError)
         }
         guard let channel = channel else {
             lock.unlock()
@@ -734,7 +773,12 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         )
         // Encoded before the record is registered, so a failure here cannot
         // leave an entry behind with nothing to resolve it.
-        let data = try encoder.encode(identified)
+        let data: Data
+        do {
+            data = try encoder.encode(identified)
+        } catch {
+            throw QMPError.requestEncodingFailed(command: request.execute, underlying: error)
+        }
         var buffer = channel.allocator.buffer(capacity: data.count + 1)
         buffer.writeBytes(data)
         buffer.writeString("\n")
@@ -743,7 +787,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         lock.lock()
         if let closeError {
             lock.unlock()
-            throw closeError
+            throw QMPError.wrapping(closeError)
         }
         // Registered before the cancellation handler is installed so that a
         // cancellation landing first has a record to mark. Nothing has been
@@ -751,34 +795,38 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         pendingRequests.append(PendingRequest(id: id))
         lock.unlock()
 
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
-                lock.lock()
-                guard let index = pendingRequests.firstIndex(where: { $0.id == id }) else {
-                    // Torn down under us between registration and here.
-                    let error = closeError ?? QMPError.connectionLost
+        do {
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
+                    lock.lock()
+                    guard let index = pendingRequests.firstIndex(where: { $0.id == id }) else {
+                        // Torn down under us between registration and here.
+                        let error = closeError ?? QMPError.connectionLost
+                        lock.unlock()
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    if pendingRequests[index].cancelled {
+                        // Cancelled before we parked, so the command is never
+                        // written at all.
+                        pendingRequests.remove(at: index)
+                        lock.unlock()
+                        continuation.resume(throwing: QMPError.cancelled)
+                        return
+                    }
+                    pendingRequests[index].continuation = continuation
                     lock.unlock()
-                    continuation.resume(throwing: error)
-                    return
+                    channel.writeAndFlush(outbound, promise: nil)
+                    attachDeadline(
+                        armDeadline(timeout) { [weak self] in self?.timeOutRequest(id: id) },
+                        toRequest: id
+                    )
                 }
-                if pendingRequests[index].cancelled {
-                    // Cancelled before we parked, so the command is never
-                    // written at all.
-                    pendingRequests.remove(at: index)
-                    lock.unlock()
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                pendingRequests[index].continuation = continuation
-                lock.unlock()
-                channel.writeAndFlush(outbound, promise: nil)
-                attachDeadline(
-                    armDeadline(timeout) { [weak self] in self?.timeOutRequest(id: id) },
-                    toRequest: id
-                )
+            } onCancel: {
+                self.cancelRequest(id: id)
             }
-        } onCancel: {
-            self.cancelRequest(id: id)
+        } catch {
+            throw QMPError.wrapping(error)
         }
     }
 
@@ -804,10 +852,10 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     /// A non-positive timeout expires immediately rather than never, and returns
     /// nothing to cancel.
     private func armDeadline(
-        _ seconds: TimeInterval,
+        _ timeout: Duration,
         _ expire: @escaping @Sendable () -> Void
     ) -> Scheduled<Void>? {
-        guard seconds > 0 else {
+        guard timeout > .zero else {
             expire()
             return nil
         }
@@ -817,10 +865,10 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         // deadline-less.
         let loop = deadlineLoop ?? MultiThreadedEventLoopGroup.singleton.any()
         lock.unlock()
-        // Clamped so an absurd budget cannot overflow the conversion; the bound
-        // is a few centuries, which is indistinguishable from "no deadline".
-        let nanoseconds = Int64(min(seconds, 9_000_000_000) * 1_000_000_000)
-        return loop.scheduleTask(in: .nanoseconds(nanoseconds)) {
+        // `TimeAmount(_:)` truncates to nanoseconds and clamps at `Int64.max`,
+        // so an absurd budget cannot overflow the conversion; the bound is a few
+        // centuries, which is indistinguishable from "no deadline".
+        return loop.scheduleTask(in: TimeAmount(timeout)) {
             // A no-op once the waiter resolved normally: every timeOut* helper
             // removes by key under the lock, so it fails only a live waiter.
             expire()
@@ -893,7 +941,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         }
         lock.unlock()
         deadline?.cancel()
-        waiter?.resume(throwing: CancellationError())
+        waiter?.resume(throwing: QMPError.cancelled)
     }
 
     func handlerAdded(context: ChannelHandlerContext) {
@@ -1045,7 +1093,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         // The oldest outstanding expectation for this device, so repeated
         // detaches are matched in the order they were issued.
         // Cancelled expectations are skipped: their waiter is going to throw
-        // `CancellationError` regardless, and letting one absorb the event would
+        // `QMPError.cancelled` regardless, and letting one absorb the event would
         // hide it from a live wait for the same device.
         let token = deviceDeletions
             .filter { $0.value.deviceId == device && !$0.value.cancelled }
