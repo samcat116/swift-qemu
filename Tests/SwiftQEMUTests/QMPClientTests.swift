@@ -25,6 +25,10 @@ final class QMPClientTests: XCTestCase {
         case silent
         /// Greet and negotiate normally, but never emit DEVICE_DELETED.
         case greetButSwallowDeviceDeleted
+        /// Greet and negotiate normally, then never answer another command.
+        /// Models a QEMU that has stopped servicing the monitor, which is the
+        /// only way to hold a command parked long enough to cancel it.
+        case greetThenSwallowCommands
         /// Greet and negotiate normally, then answer subsequent commands with
         /// an id belonging to no outstanding request. Models QEMU finally
         /// replying to a request that already timed out.
@@ -95,6 +99,15 @@ final class QMPClientTests: XCTestCase {
                     if behaviour == .greetAndBehaveLikeQEMU || behaviour == .greetAndDeleteBeforeReplying {
                         replyLikeQEMU(to: line, context: context)
                         continue
+                    }
+
+                    if behaviour == .greetThenSwallowCommands {
+                        // Negotiation still has to succeed; everything after it
+                        // goes unanswered.
+                        guard !negotiated else { continue }
+                        if line.contains("qmp_capabilities") {
+                            negotiated = true
+                        }
                     }
 
                     var id = Self.extractID(from: line)
@@ -300,6 +313,103 @@ final class QMPClientTests: XCTestCase {
                 }
             }
         }
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Cancellation
+
+    /// A cancelled command must come back at once, not when its deadline fires.
+    ///
+    /// The waits used to be cancellation-blind: the only thing that could resume
+    /// them was the deadline, so a cancelled caller stayed parked for the whole
+    /// budget — up to the 10s default — with nothing left to wait for.
+    func testCancellingACommandReturnsWellBeforeItsTimeout() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetThenSwallowCommands)
+        defer { Task { await server.shutdown() } }
+
+        // A budget far longer than this test is willing to wait for: if
+        // cancellation is not honoured, the only other way out is the timeout,
+        // and the elapsed-time assertion fails long before it arrives.
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 60, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let started = ContinuousClock.now
+        let command = Task { try await client.execute(.cont) }
+        // Give the command time to park, so this covers cancelling an installed
+        // waiter; the pre-park ordering is covered below.
+        try await Task.sleep(for: .milliseconds(100))
+        command.cancel()
+
+        do {
+            _ = try await command.value
+            XCTFail("Expected the cancelled command to throw")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertLessThan(
+            started.duration(to: .now), .seconds(5),
+            "A cancelled command must not wait out its request timeout")
+
+        try await client.disconnect()
+    }
+
+    /// The same for the `DEVICE_DELETED` wait, which parks after the command
+    /// itself has been answered.
+    func testCancellingADeviceDetachReturnsWellBeforeItsTimeout() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetButSwallowDeviceDeleted)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 5, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let started = ContinuousClock.now
+        let detach = Task { try await client.deviceDel(deviceId: "vdb", timeout: 60) }
+        try await Task.sleep(for: .milliseconds(100))
+        detach.cancel()
+
+        do {
+            try await detach.value
+            XCTFail("Expected the cancelled detach to throw")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        XCTAssertLessThan(
+            started.duration(to: .now), .seconds(5),
+            "A cancelled detach must not wait out its event timeout")
+
+        try await client.disconnect()
+    }
+
+    /// Cancellation that lands *before* the waiter parks is the mirror image of
+    /// the deadline ordering hazard: the canceller finds nothing to cancel, and
+    /// the operation then parks behind it. Repeated so that ordering is actually
+    /// hit — an immediate `cancel()` usually beats the task to its first
+    /// suspension.
+    func testCancellationBeforeTheWaiterParksIsNotLost() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetThenSwallowCommands)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 60, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let started = ContinuousClock.now
+        for _ in 0..<25 {
+            let command = Task { try await client.execute(.cont) }
+            command.cancel()
+            do {
+                _ = try await command.value
+                XCTFail("Expected the cancelled command to throw")
+            } catch is CancellationError {
+                // Expected.
+            }
+        }
+
+        XCTAssertLessThan(
+            started.duration(to: .now), .seconds(5),
+            "Cancellation must be honoured however it races the waiter")
 
         try await client.disconnect()
     }
