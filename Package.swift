@@ -26,7 +26,12 @@ let package = Package(
         ),
         .testTarget(
             name: "SwiftQEMUTests",
-            dependencies: ["SwiftQEMU"]
+            dependencies: [
+                "SwiftQEMU",
+                // Test-only: `EmbeddedChannel` is how the QMP frame decoder is
+                // driven without a socket.
+                .product(name: "NIOEmbedded", package: "swift-nio"),
+            ]
         ),
     ]
 )
