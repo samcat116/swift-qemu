@@ -17,10 +17,18 @@ public final class QMPClient: Sendable {
     /// bounds.
     public static let defaultConnectTimeout: TimeInterval = 10
 
+    /// Default cap on a single inbound QMP frame, terminating newline included.
+    ///
+    /// 512 KB is far above any real QMP message — `query-block` on a VM with a
+    /// long device list is the largest realistic payload and runs to tens of KB
+    /// — while still bounding what an unterminated frame can cost.
+    public static let defaultMaximumFrameSize = 512 * 1024
+
     private let logger: Logger
     private let eventLoopGroup: EventLoopGroup
     private let requestTimeout: TimeInterval
     private let connectTimeout: TimeInterval
+    private let maximumFrameSize: Int
 
     /// Connection state.
     ///
@@ -39,11 +47,15 @@ public final class QMPClient: Sendable {
     public init(
         logger: Logger = Logger(label: "SwiftQEMU.QMPClient"),
         requestTimeout: TimeInterval = QMPClient.defaultRequestTimeout,
-        connectTimeout: TimeInterval = QMPClient.defaultConnectTimeout
+        connectTimeout: TimeInterval = QMPClient.defaultConnectTimeout,
+        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize
     ) {
         self.logger = logger
         self.requestTimeout = requestTimeout
         self.connectTimeout = connectTimeout
+        // A cap below one byte would reject the frame that is about to arrive
+        // whatever it is, so clamp rather than let a caller disable framing.
+        self.maximumFrameSize = max(1, maximumFrameSize)
         // The process-wide singleton group, not a private one. A per-client
         // group costs a dedicated OS thread per VM, and tearing it down in
         // `deinit` meant a blocking `syncShutdownGracefully()` on whatever
@@ -121,7 +133,7 @@ public final class QMPClient: Sendable {
         // has latched its greeting/close state and must not be reused for the
         // next connection.
         let state = self.state
-        let handler = QMPChannelHandler(logger: logger) {
+        let handler = QMPChannelHandler(logger: logger, maximumFrameSize: maximumFrameSize) {
             // The peer going away must clear the connected flag, so a later
             // command fails as not-connected rather than being written into a
             // dead channel and waiting out its timeout.
@@ -358,6 +370,10 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     private let logger: Logger
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
+    /// Largest inbound frame this connection will buffer, terminating newline
+    /// included. Frames are newline-delimited, so without a cap a peer that
+    /// never sends one grows `buffer` for as long as it keeps writing.
+    private let maximumFrameSize: Int
     /// Invoked once the connection is no longer usable, so the owning client can
     /// stop reporting itself as connected.
     private let onConnectionLost: @Sendable () -> Void
@@ -378,21 +394,47 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
 
     private var greeting: Latch = .pending
     private var greetingContinuation: CheckedContinuation<Void, Error>?
+    private var greetingDeadline: Scheduled<Void>?
+    /// The task waiting on the greeting was cancelled. Latched, because the
+    /// cancellation can land before the waiter parks.
+    private var greetingCancelled = false
     /// Outstanding requests in submission order, keyed for out-of-order and
     /// timed-out removal. QMP echoes our `id` back, so a response is matched to
     /// its request rather than to whatever happens to be at the head.
-    private var pendingRequests: [(id: String, continuation: CheckedContinuation<QMPResponse?, Error>)] = []
+    private var pendingRequests: [PendingRequest] = []
     /// One entry per outstanding `device_del`, keyed by ticket token rather than
     /// by device id. A single slot per device meant two concurrent waits on the
     /// same device overwrote each other, abandoning the first continuation with
     /// nothing to resume it and no deadline to fail it.
     private var deviceDeletions: [UInt64: PendingDeletion] = [:]
 
+    /// One outstanding QMP command.
+    ///
+    /// The record is created before the command is written and before the caller
+    /// parks on it, so a cancellation that arrives first has something to mark
+    /// rather than nothing at all. The caller then finds that mark and resumes
+    /// itself, instead of parking behind a canceller that has already been and
+    /// gone — the same ordering hazard the deadlines have to respect.
+    private struct PendingRequest {
+        let id: String
+        /// `nil` until the caller parks. A record without one has not been
+        /// written to the channel yet, so no response can belong to it.
+        var continuation: CheckedContinuation<QMPResponse?, Error>?
+        /// Cancelled the moment the request resolves, so no deadline outlives
+        /// the thing it bounds.
+        var deadline: Scheduled<Void>?
+        /// The waiting task was cancelled before it parked.
+        var cancelled = false
+    }
+
     private struct PendingDeletion {
         let deviceId: String
         /// The event arrived before the caller got around to waiting.
         var seen = false
         var continuation: CheckedContinuation<Void, Error>?
+        var deadline: Scheduled<Void>?
+        /// The waiting task was cancelled before it parked.
+        var cancelled = false
     }
     /// Set once the channel goes inactive, so waiters that arrive afterwards
     /// fail immediately instead of parking on a dead connection.
@@ -400,22 +442,46 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     private var nextRequestID: UInt64 = 0
     private var nextWaiterToken: UInt64 = 0
     private weak var channel: Channel?
+    /// The loop deadlines are scheduled on, captured when the handler joins a
+    /// pipeline. Held strongly and separately from `channel`, which is weak: a
+    /// waiter whose channel has gone still has to be bounded.
+    private var deadlineLoop: EventLoop?
 
     /// Event-loop-confined: only touched from `channelRead`.
     private var buffer = ByteBuffer()
+    /// Event-loop-confined, like `buffer`. Latched once framing has failed, so
+    /// bytes still in flight when the close was requested are dropped rather
+    /// than parsed on a connection we have already given up on.
+    private var hasFailedFraming = false
 
-    init(logger: Logger, onConnectionLost: @escaping @Sendable () -> Void = {}) {
+    init(
+        logger: Logger,
+        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize,
+        onConnectionLost: @escaping @Sendable () -> Void = {}
+    ) {
         self.logger = logger
+        self.maximumFrameSize = maximumFrameSize
         self.onConnectionLost = onConnectionLost
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        guard !hasFailedFraming else { return }
+
         var input = self.unwrapInboundIn(data)
         buffer.writeBuffer(&input)
 
-        // Process complete JSON messages
-        while let message = extractJSONMessage() {
-            processMessage(message)
+        // Process complete JSON messages, and give up on the connection rather
+        // than buffer a frame that has grown past the cap.
+        drain: while true {
+            switch nextFrame() {
+            case .frame(let message):
+                processMessage(message)
+            case .incomplete:
+                break drain
+            case .overflow(let bytes):
+                failOversizedFrame(bytes: bytes, context: context)
+                return
+            }
         }
     }
 
@@ -435,10 +501,12 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         lock.lock()
         let requests = pendingRequests
         pendingRequests.removeAll()
-        let deviceWaiters = deviceDeletions.values.compactMap(\.continuation)
+        let deletions = Array(deviceDeletions.values)
         deviceDeletions.removeAll()
         let greetingWaiter = greetingContinuation
         greetingContinuation = nil
+        let greetingDeadline = self.greetingDeadline
+        self.greetingDeadline = nil
         if case .pending = greeting {
             greeting = .failed(error)
         }
@@ -448,12 +516,18 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         }
         lock.unlock()
 
+        // Every deadline goes with the waiter it bounded — there is nothing left
+        // for it to fail, and leaving it scheduled would keep this handler alive
+        // until it fired.
         for request in requests {
-            request.continuation.resume(throwing: error)
+            request.deadline?.cancel()
+            request.continuation?.resume(throwing: error)
         }
-        for waiter in deviceWaiters {
-            waiter.resume(throwing: error)
+        for deletion in deletions {
+            deletion.deadline?.cancel()
+            deletion.continuation?.resume(throwing: error)
         }
+        greetingDeadline?.cancel()
         greetingWaiter?.resume(throwing: error)
 
         if isFirstClose {
@@ -462,32 +536,44 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     }
 
     func waitForGreeting(timeout: TimeInterval) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            lock.lock()
-            switch greeting {
-            case .satisfied:
-                // The greeting landed before we got here. Latching it is
-                // what keeps this from parking forever.
-                lock.unlock()
-                continuation.resume()
-                return
-            case .failed(let error):
-                lock.unlock()
-                continuation.resume(throwing: error)
-                return
-            case .pending:
-                guard greetingContinuation == nil else {
-                    // Overwriting the slot would abandon the first waiter with
-                    // no resume and no deadline. Only negotiation waits here, so
-                    // a second waiter is a programming error, not a race.
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                guard !greetingCancelled else {
+                    // Cancelled before we parked. The latch is what makes that
+                    // ordering harmless: without it the canceller would find no
+                    // waiter, and this continuation would park behind it.
                     lock.unlock()
-                    continuation.resume(throwing: QMPError.invalidResponse)
+                    continuation.resume(throwing: CancellationError())
                     return
                 }
-                greetingContinuation = continuation
-                lock.unlock()
+                switch greeting {
+                case .satisfied:
+                    // The greeting landed before we got here. Latching it is
+                    // what keeps this from parking forever.
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                case .failed(let error):
+                    lock.unlock()
+                    continuation.resume(throwing: error)
+                    return
+                case .pending:
+                    guard greetingContinuation == nil else {
+                        // Overwriting the slot would abandon the first waiter with
+                        // no resume and no deadline. Only negotiation waits here, so
+                        // a second waiter is a programming error, not a race.
+                        lock.unlock()
+                        continuation.resume(throwing: QMPError.invalidResponse)
+                        return
+                    }
+                    greetingContinuation = continuation
+                    lock.unlock()
+                }
+                attachGreetingDeadline(armDeadline(timeout) { [weak self] in self?.timeOutGreeting() })
             }
-            armDeadline(timeout) { [weak self] in self?.timeOutGreeting() }
+        } onCancel: {
+            self.cancelGreeting()
         }
     }
 
@@ -495,8 +581,21 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         lock.lock()
         let waiter = greetingContinuation
         greetingContinuation = nil
+        greetingDeadline = nil
         lock.unlock()
         waiter?.resume(throwing: QMPError.timeout)
+    }
+
+    private func cancelGreeting() {
+        lock.lock()
+        greetingCancelled = true
+        let waiter = greetingContinuation
+        greetingContinuation = nil
+        let deadline = greetingDeadline
+        greetingDeadline = nil
+        lock.unlock()
+        deadline?.cancel()
+        waiter?.resume(throwing: CancellationError())
     }
 
     /// A registered interest in the `DEVICE_DELETED` for one `device_del`.
@@ -526,38 +625,56 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         lock.lock()
         let abandoned = deviceDeletions.removeValue(forKey: ticket.token)
         lock.unlock()
+        abandoned?.deadline?.cancel()
         abandoned?.continuation?.resume(throwing: QMPError.connectionLost)
     }
 
     func waitForDeviceDeleted(_ ticket: DeletionTicket, timeout: TimeInterval) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            lock.lock()
-            guard var pending = deviceDeletions[ticket.token] else {
-                // Torn down under us — the connection dropped between the command
-                // and this wait.
-                let error = closeError ?? QMPError.connectionLost
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                lock.lock()
+                guard var pending = deviceDeletions[ticket.token] else {
+                    // Torn down under us — the connection dropped between the command
+                    // and this wait.
+                    let error = closeError ?? QMPError.connectionLost
+                    lock.unlock()
+                    continuation.resume(throwing: error)
+                    return
+                }
+                if pending.cancelled {
+                    // Cancelled before we parked. Checked ahead of `seen` so the
+                    // answer is the same whichever way that race lands:
+                    // cancellation does not un-detach the device either way, and
+                    // first-mover-wins is the rule callers can reason about.
+                    deviceDeletions.removeValue(forKey: ticket.token)
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if let closeError {
+                    deviceDeletions.removeValue(forKey: ticket.token)
+                    lock.unlock()
+                    continuation.resume(throwing: closeError)
+                    return
+                }
+                if pending.seen {
+                    deviceDeletions.removeValue(forKey: ticket.token)
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                pending.continuation = continuation
+                deviceDeletions[ticket.token] = pending
                 lock.unlock()
-                continuation.resume(throwing: error)
-                return
+                attachDeadline(
+                    armDeadline(timeout) { [weak self] in
+                        self?.timeOutDeviceDeleted(token: ticket.token)
+                    },
+                    toDeletion: ticket.token
+                )
             }
-            if let closeError {
-                deviceDeletions.removeValue(forKey: ticket.token)
-                lock.unlock()
-                continuation.resume(throwing: closeError)
-                return
-            }
-            if pending.seen {
-                deviceDeletions.removeValue(forKey: ticket.token)
-                lock.unlock()
-                continuation.resume()
-                return
-            }
-            pending.continuation = continuation
-            deviceDeletions[ticket.token] = pending
-            lock.unlock()
-            armDeadline(timeout) { [weak self] in
-                self?.timeOutDeviceDeleted(token: ticket.token)
-            }
+        } onCancel: {
+            self.cancelDeviceDeleted(token: ticket.token)
         }
     }
 
@@ -568,6 +685,29 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         let waiter = deviceDeletions.removeValue(forKey: token)?.continuation
         lock.unlock()
         waiter?.resume(throwing: QMPError.timeout)
+    }
+
+    private func cancelDeviceDeleted(token: UInt64) {
+        lock.lock()
+        var waiter: CheckedContinuation<Void, Error>?
+        var deadline: Scheduled<Void>?
+        if var pending = deviceDeletions[token] {
+            if let continuation = pending.continuation {
+                deadline = pending.deadline
+                deviceDeletions.removeValue(forKey: token)
+                waiter = continuation
+            } else {
+                // Not parked yet — leave the record behind, marked, for the wait
+                // to find. Removing it here would send that wait down the
+                // "torn down under us" path and report a connection loss that
+                // did not happen.
+                pending.cancelled = true
+                deviceDeletions[token] = pending
+            }
+        }
+        lock.unlock()
+        deadline?.cancel()
+        waiter?.resume(throwing: CancellationError())
     }
 
     func sendRequest(_ request: QMPRequest, timeout: TimeInterval) async throws -> QMPResponse? {
@@ -592,23 +732,53 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
             arguments: request.arguments,
             id: id
         )
+        // Encoded before the record is registered, so a failure here cannot
+        // leave an entry behind with nothing to resolve it.
         let data = try encoder.encode(identified)
         var buffer = channel.allocator.buffer(capacity: data.count + 1)
         buffer.writeBytes(data)
         buffer.writeString("\n")
         let outbound = buffer
 
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
-            lock.lock()
-            if let closeError {
-                lock.unlock()
-                continuation.resume(throwing: closeError)
-                return
-            }
-            pendingRequests.append((id: id, continuation: continuation))
+        lock.lock()
+        if let closeError {
             lock.unlock()
-            channel.writeAndFlush(outbound, promise: nil)
-            armDeadline(timeout) { [weak self] in self?.timeOutRequest(id: id) }
+            throw closeError
+        }
+        // Registered before the cancellation handler is installed so that a
+        // cancellation landing first has a record to mark. Nothing has been
+        // written yet, so no response can arrive for it in the meantime.
+        pendingRequests.append(PendingRequest(id: id))
+        lock.unlock()
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
+                lock.lock()
+                guard let index = pendingRequests.firstIndex(where: { $0.id == id }) else {
+                    // Torn down under us between registration and here.
+                    let error = closeError ?? QMPError.connectionLost
+                    lock.unlock()
+                    continuation.resume(throwing: error)
+                    return
+                }
+                if pendingRequests[index].cancelled {
+                    // Cancelled before we parked, so the command is never
+                    // written at all.
+                    pendingRequests.remove(at: index)
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                pendingRequests[index].continuation = continuation
+                lock.unlock()
+                channel.writeAndFlush(outbound, promise: nil)
+                attachDeadline(
+                    armDeadline(timeout) { [weak self] in self?.timeOutRequest(id: id) },
+                    toRequest: id
+                )
+            }
+        } onCancel: {
+            self.cancelRequest(id: id)
         }
     }
 
@@ -621,23 +791,77 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     /// to remove. Arming only after installation makes that unrepresentable:
     /// the deadline either finds the waiter or finds it already resolved.
     ///
-    /// A non-positive timeout expires immediately rather than never.
-    private func armDeadline(_ seconds: TimeInterval, _ expire: @escaping @Sendable () -> Void) {
+    /// Scheduled on the channel's event loop rather than run as a task of its
+    /// own. A `Task.detached` per waiter slept out the whole budget even once
+    /// its waiter had resolved, so a burst of commands left one task per command
+    /// idling for the full timeout. The returned `Scheduled` goes to the waiter,
+    /// which cancels it the moment it resolves, so a deadline never outlives
+    /// what it bounds. Scheduling also keeps the deadline out of reach of the
+    /// caller's cancellation, which is the property the detached task existed
+    /// for: a deadline that inherited cancellation and skipped `expire` would
+    /// strand its waiter.
+    ///
+    /// A non-positive timeout expires immediately rather than never, and returns
+    /// nothing to cancel.
+    private func armDeadline(
+        _ seconds: TimeInterval,
+        _ expire: @escaping @Sendable () -> Void
+    ) -> Scheduled<Void>? {
         guard seconds > 0 else {
             expire()
-            return
+            return nil
         }
-        // Detached so it cannot inherit cancellation from the caller: a
-        // cancelled deadline that skipped `expire` would strand the waiter.
-        Task.detached {
-            do {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            } catch {
-                return
-            }
+        lock.lock()
+        // Any loop will do — every `expire` takes the lock — so a waiter that
+        // somehow predates `handlerAdded` is bounded rather than silently
+        // deadline-less.
+        let loop = deadlineLoop ?? MultiThreadedEventLoopGroup.singleton.any()
+        lock.unlock()
+        // Clamped so an absurd budget cannot overflow the conversion; the bound
+        // is a few centuries, which is indistinguishable from "no deadline".
+        let nanoseconds = Int64(min(seconds, 9_000_000_000) * 1_000_000_000)
+        return loop.scheduleTask(in: .nanoseconds(nanoseconds)) {
             // A no-op once the waiter resolved normally: every timeOut* helper
             // removes by key under the lock, so it fails only a live waiter.
             expire()
+        }
+    }
+
+    /// Hand a freshly armed deadline to its waiter, or cancel it outright if the
+    /// waiter resolved in the window between parking and arming.
+    private func attachDeadline(_ deadline: Scheduled<Void>?, toRequest id: String) {
+        guard let deadline else { return }
+        lock.lock()
+        if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
+            pendingRequests[index].deadline = deadline
+            lock.unlock()
+        } else {
+            lock.unlock()
+            deadline.cancel()
+        }
+    }
+
+    private func attachDeadline(_ deadline: Scheduled<Void>?, toDeletion token: UInt64) {
+        guard let deadline else { return }
+        lock.lock()
+        if deviceDeletions[token]?.continuation != nil {
+            deviceDeletions[token]?.deadline = deadline
+            lock.unlock()
+        } else {
+            lock.unlock()
+            deadline.cancel()
+        }
+    }
+
+    private func attachGreetingDeadline(_ deadline: Scheduled<Void>?) {
+        guard let deadline else { return }
+        lock.lock()
+        if greetingContinuation != nil {
+            greetingDeadline = deadline
+            lock.unlock()
+        } else {
+            lock.unlock()
+            deadline.cancel()
         }
     }
 
@@ -651,27 +875,84 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         waiter?.resume(throwing: QMPError.timeout)
     }
 
+    private func cancelRequest(id: String) {
+        lock.lock()
+        var waiter: CheckedContinuation<QMPResponse?, Error>?
+        var deadline: Scheduled<Void>?
+        if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
+            if let continuation = pendingRequests[index].continuation {
+                deadline = pendingRequests[index].deadline
+                pendingRequests.remove(at: index)
+                waiter = continuation
+            } else {
+                // Not parked yet — leave the record behind, marked, so the
+                // caller resumes itself rather than parking on a continuation
+                // whose canceller has already run.
+                pendingRequests[index].cancelled = true
+            }
+        }
+        lock.unlock()
+        deadline?.cancel()
+        waiter?.resume(throwing: CancellationError())
+    }
+
     func handlerAdded(context: ChannelHandlerContext) {
         lock.lock()
         self.channel = context.channel
+        self.deadlineLoop = context.eventLoop
         lock.unlock()
     }
 
-    private func extractJSONMessage() -> Data? {
+    private enum FrameExtraction {
+        case frame(Data)
+        /// No terminator yet, and what is buffered still fits the cap.
+        case incomplete
+        /// One frame is over the cap. The payload is what is buffered for it so
+        /// far, which for an unterminated frame is a lower bound.
+        case overflow(bytes: Int)
+    }
+
+    private func nextFrame() -> FrameExtraction {
         // Look for complete JSON objects ending with newline
         guard let newlineIndex = buffer.readableBytesView.firstIndex(of: UInt8(ascii: "\n")) else {
-            return nil
+            // Nothing here is a frame yet. It can still be over the cap: a peer
+            // that writes without ever terminating is exactly the case the cap
+            // exists for, and waiting for its newline is waiting forever.
+            return buffer.readableBytes > maximumFrameSize
+                ? .overflow(bytes: buffer.readableBytes)
+                : .incomplete
         }
 
         let messageLength = buffer.readableBytesView.startIndex.distance(to: newlineIndex) + 1
+        guard messageLength <= maximumFrameSize else {
+            return .overflow(bytes: messageLength)
+        }
         guard let slice = buffer.readSlice(length: messageLength) else {
-            return nil
+            return .incomplete
         }
         // Reclaim the space this message occupied instead of letting the read
         // region grow for the lifetime of the connection.
         buffer.discardReadBytes()
 
-        return Data(slice.readableBytesView.dropLast()) // Remove newline
+        return .frame(Data(slice.readableBytesView.dropLast())) // Remove newline
+    }
+
+    /// Drop a connection whose peer sent a frame larger than we will buffer.
+    ///
+    /// Failing the waiters *before* closing is what makes the cause visible:
+    /// `failAllWaiters` latches the first error, so the in-flight caller gets
+    /// `frameTooLarge` rather than the `connectionLost` that `channelInactive`
+    /// would otherwise latch a moment later.
+    private func failOversizedFrame(bytes: Int, context: ChannelHandlerContext) {
+        logger.error("QMP frame exceeded the maximum size; closing the connection", metadata: [
+            "bytes": .stringConvertible(bytes),
+            "limit": .stringConvertible(maximumFrameSize)
+        ])
+        hasFailedFraming = true
+        // Release it now rather than hold it for as long as the handler lives.
+        buffer.clear()
+        failAllWaiters(with: QMPError.frameTooLarge(limit: maximumFrameSize))
+        context.close(promise: nil)
     }
 
     private func processMessage(_ data: Data) {
@@ -705,13 +986,17 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         }
         let waiter = greetingContinuation
         greetingContinuation = nil
+        let deadline = greetingDeadline
+        greetingDeadline = nil
         lock.unlock()
+        deadline?.cancel()
         waiter?.resume()
     }
 
     private func handleResponse(_ response: QMPResponse) {
         lock.lock()
         var waiter: CheckedContinuation<QMPResponse?, Error>?
+        var deadline: Scheduled<Void>?
         var unmatchedID: String?
         if let id = response.id?.stringValue {
             // Tagged: match strictly, and drop it if nothing matches. A
@@ -721,14 +1006,20 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
             // pending *now*, which is precisely the response-shift
             // corruption id correlation exists to prevent.
             if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
-                waiter = pendingRequests.remove(at: index).continuation
+                let removed = pendingRequests.remove(at: index)
+                waiter = removed.continuation
+                deadline = removed.deadline
             } else {
                 unmatchedID = id
             }
-        } else if !pendingRequests.isEmpty {
+        } else if let index = pendingRequests.firstIndex(where: { $0.continuation != nil }) {
             // Untagged (an older QEMU that does not echo `id`): submission
-            // order is the only correlation available.
-            waiter = pendingRequests.removeFirst().continuation
+            // order is the only correlation available. Records without a
+            // continuation are skipped — they have not been written yet, so
+            // this reply cannot be theirs.
+            let removed = pendingRequests.remove(at: index)
+            waiter = removed.continuation
+            deadline = removed.deadline
         }
         lock.unlock()
 
@@ -737,6 +1028,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
                 "Discarding QMP response with no matching request",
                 metadata: ["id": .string(unmatchedID)])
         }
+        deadline?.cancel()
         waiter?.resume(returning: response)
     }
 
@@ -752,13 +1044,18 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         lock.lock()
         // The oldest outstanding expectation for this device, so repeated
         // detaches are matched in the order they were issued.
+        // Cancelled expectations are skipped: their waiter is going to throw
+        // `CancellationError` regardless, and letting one absorb the event would
+        // hide it from a live wait for the same device.
         let token = deviceDeletions
-            .filter { $0.value.deviceId == device }
+            .filter { $0.value.deviceId == device && !$0.value.cancelled }
             .keys
             .min()
         var waiter: CheckedContinuation<Void, Error>?
+        var deadline: Scheduled<Void>?
         if let token {
             if let continuation = deviceDeletions[token]?.continuation {
+                deadline = deviceDeletions[token]?.deadline
                 deviceDeletions.removeValue(forKey: token)
                 waiter = continuation
             } else {
@@ -769,6 +1066,7 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         }
         lock.unlock()
 
+        deadline?.cancel()
         waiter?.resume()
     }
 }

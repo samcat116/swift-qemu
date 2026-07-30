@@ -17,6 +17,9 @@ public enum QMPError: Error, LocalizedError {
     /// The QEMU process outlived both SIGTERM and SIGKILL, so a force quit could not
     /// deliver what it promises. Carries the pid of the survivor.
     case processTerminationFailed(pid: Int32?)
+    /// A single inbound QMP frame exceeded the configured maximum, so the connection
+    /// was dropped rather than buffered further. Carries the limit in bytes.
+    case frameTooLarge(limit: Int)
     /// The QMP socket path does not fit in `sockaddr_un.sun_path` (104 bytes on
     /// Darwin, 108 on Linux). QEMU would fail to bind, which reaches a caller only
     /// as a socket that never appears.
@@ -52,6 +55,8 @@ public enum QMPError: Error, LocalizedError {
         case .processTerminationFailed(let pid):
             let which = pid.map { "process \($0)" } ?? "process"
             return "QEMU \(which) is still running after SIGTERM and SIGKILL"
+        case .frameTooLarge(let limit):
+            return "A QMP message exceeded the \(limit) byte frame limit; the connection was closed"
         case .socketPathTooLong(let path, let limit):
             return """
             QMP socket path is \(path.utf8.count) bytes, over the \(limit)-byte \

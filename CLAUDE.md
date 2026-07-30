@@ -37,7 +37,7 @@ swift test --filter QMPProtocolTests
 - An `actor`. `isRunning`, `capturedStderr`, `start(with:)` and `stop()` are all isolated, so reads of process state are `await`-ed. `getQMPSocketPath()` is `nonisolated` (the path is fixed at init). The two Foundation callbacks — the stderr readability handler and `terminationHandler` — are installed by `nonisolated static` helpers so they run honestly off-actor, closing over only the internally-locked `StderrCapture`/`ExitWaiter`
 - Builds QEMU command-line arguments from QEMUConfiguration
 - Handles QMP Unix socket creation and readiness with retry logic (up to 10 seconds)
-- **Puts the socket in a private `0700` directory** (`<runtimeDirectory>/qemu-<token>/qmp.sock`), not loose in `/tmp` — see fix 14
+- **Puts the socket in a private `0700` directory** (`<runtimeDirectory>/qemu-<token>/qmp.sock`), not loose in `/tmp` — see fix 16
 - **Critical fix**: Redirects stdout to prevent pipe buffer overflow crashes
   - If `ENABLE_QEMU_PROCESS_LOG_FILES=true` (or `yes`, `1`): stdout goes to `<instance directory>/qemu-<token>.log`, mode `0600`
   - Otherwise: redirects to `/dev/null` (default behavior)
@@ -52,7 +52,9 @@ swift test --filter QMPProtocolTests
 - Handles QMP greeting, capability negotiation, and command execution
 - Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit
 - Connection state (channel, handler, connected flag) lives in one lock-guarded box, so the type is honestly `Sendable` rather than `@unchecked Sendable`. Losing the channel clears the connected flag, so the next command fails fast instead of being written into a dead socket
+- Every wait is bounded by a deadline scheduled on the channel's event loop and cancelled when the waiter resolves, and every wait is cancellation-aware (see fix 14). Both halves have the same ordering hazard — the deadline, or the cancellation, can land before the waiter parks — and both are handled by installing the waiter's record first and resolving against it under the lock
 - `disconnect()` is idempotent and treats an already-closed channel as success
+- Inbound frames are newline-delimited and **bounded**: `maximumFrameSize` (default 512 KB) caps what one frame may buffer, and a peer that exceeds it gets `QMPError.frameTooLarge` and a closed connection (see fix 15)
 
 **QMPProtocol** (Sources/SwiftQEMU/QMPProtocol.swift)
 - Defines QMP message types: QMPGreeting, QMPRequest, QMPResponse, QMPEvent
@@ -69,7 +71,7 @@ swift test --filter QMPProtocolTests
 The codebase includes critical fixes for production reliability:
 
 1. **Pipe Buffer Overflow Prevention**: QEMU stdout is redirected away from pipes to prevent crashes when buffers fill up. The original implementation used `Pipe()` objects but never read from them, causing QEMU to crash with `NIOCore.IOError` when the 64KB buffer filled. Current behavior:
-   - Set `ENABLE_QEMU_PROCESS_LOG_FILES=true` to capture output in a log file inside the instance's private directory (see fix 14)
+   - Set `ENABLE_QEMU_PROCESS_LOG_FILES=true` to capture output in a log file inside the instance's private directory (see fix 16)
    - Default behavior (when env var not set): stdout redirects to `/dev/null`
    - stderr uses a `Pipe()` that **is** continuously drained by a `readabilityHandler` into `StderrCapture` (bounded to the last 16KB). A pipe is only ever safe with an active reader — **never** attach one without draining it.
 
@@ -126,7 +128,19 @@ The codebase includes critical fixes for production reliability:
     - `.creating` is left to the window before `createVM` returns. `inmigrate` keeps it — an incoming migration really is a VM still being constructed — and nothing else QEMU reports maps to it
     - The mapping moved out of `updateStatus()` into `QEMUVMStatus.init?(_ response: QMPStatusResponse)`, a pure function testable without a process or a socket. It returns `nil` for an unrecognised run state so the manager still logs the raw string before falling back to `.unknown`
 
-14. **A Private Directory for the QMP Socket**: the socket defaulted to `/tmp/qemu-<uuid>.sock`, and `start()` deleted whatever sat at that path before launching. `/tmp` is world-writable and shared with every user on the host, and a QMP socket is a full control channel for the VM — connect to it and you can `quit` the guest, hot-plug devices, or read block device state. The UUID made it hard to guess rather than protected. Now:
+14. **Scheduled Deadlines and Cancellable Waits**: every waiter in `QMPChannelHandler` armed its deadline as a `Task.detached` that slept out the *whole* budget, and no wait observed cancellation. So a burst of commands left one task per command idling for the full 10s default long after each resolved, and a cancelled caller had nothing to resume it but the deadline it was trying to escape. Now:
+    - `armDeadline` returns an `EventLoop.scheduleTask` `Scheduled<Void>`, stored on the waiter's record and cancelled the moment the waiter resolves — no task, no sleep, and no deadline outliving what it bounds. It is still armed only *after* the waiter is installed (fix 6's ordering rule), so it either finds the waiter or finds it already resolved; `attachDeadline` closes the remaining window by cancelling a deadline whose waiter resolved while it was being armed. Scheduling on the loop also preserves what `Task.detached` was there for: the deadline is out of reach of caller cancellation, and a deadline that inherited cancellation and skipped `expire` would strand its waiter
+    - All three waits (`waitForGreeting`, `sendRequest`, `waitForDeviceDeleted`) run under `withTaskCancellationHandler` and throw `CancellationError` promptly. The mirror image of the deadline hazard applies — a cancellation can arrive *before* the waiter parks — so each waiter's record is created before the handler is installed and the canceller marks it rather than finding nothing; the parking waiter then resumes itself. This is why `sendRequest` now registers its `PendingRequest` before writing to the channel, and why a cancelled command may never be written at all
+    - A `PendingRequest` without a continuation has not been written yet, so no reply can belong to it. The untagged-response FIFO fallback (old QEMU that does not echo `id`) skips those records rather than taking the head blindly
+
+15. **Bounded Inbound Frames**: `channelRead` accumulated everything it read and only drained on a newline, so a peer that never sent one grew the buffer for as long as it kept writing. Fix 6's `discardReadBytes()` stopped *consumed* frames accumulating; a single unterminated frame was still unbounded. `maximumFrameSize` (default `QMPClient.defaultMaximumFrameSize`, 512 KB, settable per client) now caps one frame including its terminating newline, and exceeding it fails the connection with `QMPError.frameTooLarge(limit:)`.
+    - QEMU does not do this, so this is hardening — it matters because a half-written frame should surface as a named error rather than as growing memory and, eventually, a bare `.timeout`. It used to matter more: the socket lived in a world-writable directory until fix 16 moved it into a private one
+    - The cap is on **frame size**, not merely on withheld newlines: an over-limit frame is rejected whether or not its newline has arrived. The unterminated branch (`readableBytes > limit`) and the complete-frame branch (`messageLength > limit`) are both reachable and both tested — which arrives depends only on how the peer's bytes land across socket reads
+    - Waiters are failed *before* the close, so the in-flight caller gets `frameTooLarge` rather than the `connectionLost` that `channelInactive` would otherwise latch a moment later. `failAllWaiters` keeps the first error
+    - 512 KB is far above any real QMP message (`query-block` on a long device list, the largest realistic payload, runs to tens of KB). `testLargeFrameWithinTheLimitIsStillDelivered` exists because a cap that clipped legitimate payloads would be worse than no cap
+    - `NIOExtras.LineBasedFrameDecoder` would give this for free via its `maximumBufferSize`; it is deliberately not used here, since adding the dependency belongs with the `NIOAsyncChannel` migration (issue #21)
+
+16. **A Private Directory for the QMP Socket**: the socket defaulted to `/tmp/qemu-<uuid>.sock`, and `start()` deleted whatever sat at that path before launching. `/tmp` is world-writable and shared with every user on the host, and a QMP socket is a full control channel for the VM — connect to it and you can `quit` the guest, hot-plug devices, or read block device state. The UUID made it hard to guess rather than protected. Now:
     - The socket is `<runtimeDirectory>/qemu-<token>/qmp.sock`, in a directory created with mode `0700`. **The directory's mode is the access control** — a socket file's own permission bits are not portably honoured, so putting the socket somewhere private is the only thing that works. The mode is set twice (as a `createDirectory` attribute, then via `setAttributes`) because Foundation does not promise the attribute reaches `mkdir(2)` rather than being applied afterwards
     - `withIntermediateDirectories: false` for the leaf, so anything already at that path is an error rather than something to adopt
     - `runtimeDirectory` is injectable on both `QEMUProcess` and `QEMUManager` (defaults to `NSTemporaryDirectory()`, already per-user on macOS)
@@ -138,7 +152,6 @@ The codebase includes critical fixes for production reliability:
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
-- **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
 - **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` drives the manager against a real QEMU for the create → start → destroy path (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake
 - **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
 
@@ -258,6 +271,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
 - socketPathTooLong(path:limit:) (the QMP socket path does not fit in `sockaddr_un.sun_path`; QEMU would fail to bind, which otherwise reads as a socket that never appears)
 - timeout (createVM operation exceeded timeout)
+- frameTooLarge(limit:) (an inbound QMP frame exceeded `maximumFrameSize`, so the connection was closed)
 - invalidResponse, invalidConfiguration
 - qmpError(class, description) for QMP-specific errors
 
