@@ -17,6 +17,9 @@ public enum QMPError: Error, LocalizedError {
     /// The QEMU process outlived both SIGTERM and SIGKILL, so a force quit could not
     /// deliver what it promises. Carries the pid of the survivor.
     case processTerminationFailed(pid: Int32?)
+    /// A single inbound QMP frame exceeded the configured maximum, so the connection
+    /// was dropped rather than buffered further. Carries the limit in bytes.
+    case frameTooLarge(limit: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -48,6 +51,8 @@ public enum QMPError: Error, LocalizedError {
         case .processTerminationFailed(let pid):
             let which = pid.map { "process \($0)" } ?? "process"
             return "QEMU \(which) is still running after SIGTERM and SIGKILL"
+        case .frameTooLarge(let limit):
+            return "A QMP message exceeded the \(limit) byte frame limit; the connection was closed"
         }
     }
 

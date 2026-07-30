@@ -52,6 +52,7 @@ swift test --filter QMPProtocolTests
 - Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit
 - Connection state (channel, handler, connected flag) lives in one lock-guarded box, so the type is honestly `Sendable` rather than `@unchecked Sendable`. Losing the channel clears the connected flag, so the next command fails fast instead of being written into a dead socket
 - `disconnect()` is idempotent and treats an already-closed channel as success
+- Inbound frames are newline-delimited and **bounded**: `maximumFrameSize` (default 512 KB) caps what one frame may buffer, and a peer that exceeds it gets `QMPError.frameTooLarge` and a closed connection (see fix 13)
 
 **QMPProtocol** (Sources/SwiftQEMU/QMPProtocol.swift)
 - Defines QMP message types: QMPGreeting, QMPRequest, QMPResponse, QMPEvent
@@ -119,6 +120,13 @@ The codebase includes critical fixes for production reliability:
     - `nonisolated` is used in four deliberate places, and nowhere else: `getQMPSocketPath()` and `buildArguments(from:)` (both derive only from `let` state, so call sites and argument-list assertions stay synchronous), and the two `static` callback installers, whose closures Foundation invokes on its own queues and must therefore *not* be actor-isolated
     - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties; anything computed or any method call would not compile there
     - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is `await`-ed and `defer` bodies cannot await. That also reaches cleanup on failure paths, which the hand-written `await process.stop()` calls it replaced did not
+
+13. **Bounded Inbound Frames**: `channelRead` accumulated everything it read and only drained on a newline, so a peer that never sent one grew the buffer for as long as it kept writing. Fix 6's `discardReadBytes()` stopped *consumed* frames accumulating; a single unterminated frame was still unbounded. `maximumFrameSize` (default `QMPClient.defaultMaximumFrameSize`, 512 KB, settable per client) now caps one frame including its terminating newline, and exceeding it fails the connection with `QMPError.frameTooLarge(limit:)`.
+    - QEMU does not do this, so this is hardening — it matters because the socket lives in a world-writable directory today, and because a half-written frame should surface as a named error rather than as growing memory and, eventually, a bare `.timeout`
+    - The cap is on **frame size**, not merely on withheld newlines: an over-limit frame is rejected whether or not its newline has arrived. The unterminated branch (`readableBytes > limit`) and the complete-frame branch (`messageLength > limit`) are both reachable and both tested — which arrives depends only on how the peer's bytes land across socket reads
+    - Waiters are failed *before* the close, so the in-flight caller gets `frameTooLarge` rather than the `connectionLost` that `channelInactive` would otherwise latch a moment later. `failAllWaiters` keeps the first error
+    - 512 KB is far above any real QMP message (`query-block` on a long device list, the largest realistic payload, runs to tens of KB). `testLargeFrameWithinTheLimitIsStillDelivered` exists because a cap that clipped legitimate payloads would be worse than no cap
+    - `NIOExtras.LineBasedFrameDecoder` would give this for free via its `maximumBufferSize`; it is deliberately not used here, since adding the dependency belongs with the `NIOAsyncChannel` migration (issue #21)
 
 ### Known Gaps
 
@@ -239,6 +247,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - processExited(exitCode:killedBySignal:stderr:) (QEMU died before the socket was ready; carries its stderr)
 - processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
 - timeout (createVM operation exceeded timeout)
+- frameTooLarge(limit:) (an inbound QMP frame exceeded `maximumFrameSize`, so the connection was closed)
 - invalidResponse, invalidConfiguration
 - qmpError(class, description) for QMP-specific errors
 
