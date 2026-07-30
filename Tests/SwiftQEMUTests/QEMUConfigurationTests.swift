@@ -1,5 +1,6 @@
-import XCTest
+import Foundation
 import Logging
+import Testing
 @testable import SwiftQEMU
 
 /// Tests for accelerator and CPU-model selection.
@@ -10,7 +11,8 @@ import Logging
 /// reached anything else in the argument list. `cpuType = "host"` was the same
 /// bug one argument later: `host` needs a hardware accelerator, and under TCG
 /// QEMU answers `unable to find CPU model 'host'`.
-final class QEMUConfigurationTests: XCTestCase {
+@Suite("QEMU configuration")
+struct QEMUConfigurationTests {
 
     private func arguments(for config: QEMUConfiguration) -> [String] {
         QEMUProcess(
@@ -29,131 +31,124 @@ final class QEMUConfigurationTests: XCTestCase {
     // MARK: - The default configuration
 
     /// The headline of the bug: what a caller gets without configuring anything.
-    func testDefaultConfigurationUsesAPortableAcceleratorAndCPU() {
+    @Test func defaultConfigurationUsesAPortableAcceleratorAndCPU() {
         let args = arguments(for: QEMUConfiguration())
 
-        XCTAssertEqual(value(of: "-accel", in: args), "tcg")
-        XCTAssertEqual(
-            value(of: "-cpu", in: args), "qemu64",
+        #expect(value(of: "-accel", in: args) == "tcg")
+        #expect(
+            value(of: "-cpu", in: args) == "qemu64",
             "`host` is invalid under TCG — QEMU rejects it with 'unable to find CPU model'"
         )
     }
 
     /// `-enable-kvm` is gone entirely. It could only ever name one accelerator,
     /// and named it on a platform that has none.
-    func testLegacyEnableKVMFlagIsNeverEmitted() {
-        for accelerator in QEMUAccelerator.allCases {
-            var config = QEMUConfiguration()
-            config.accelerator = accelerator
-            XCTAssertFalse(
-                arguments(for: config).contains("-enable-kvm"),
-                "-enable-kvm should not survive for \(accelerator)"
-            )
-        }
+    @Test("The legacy -enable-kvm flag is never emitted", arguments: QEMUAccelerator.allCases)
+    func legacyEnableKVMFlagIsNeverEmitted(accelerator: QEMUAccelerator) {
+        var config = QEMUConfiguration()
+        config.accelerator = accelerator
+
+        #expect(
+            !arguments(for: config).contains("-enable-kvm"),
+            "-enable-kvm should not survive for \(accelerator)"
+        )
     }
 
     // MARK: - Accelerator selection
 
-    func testEachAcceleratorEmitsItsOwnName() {
-        for accelerator in [QEMUAccelerator.kvm, .hvf, .tcg] {
-            var config = QEMUConfiguration()
-            config.accelerator = accelerator
-            XCTAssertEqual(value(of: "-accel", in: arguments(for: config)), accelerator.rawValue)
-        }
+    @Test("Each accelerator emits its own name", arguments: [QEMUAccelerator.kvm, .hvf, .tcg])
+    func eachAcceleratorEmitsItsOwnName(accelerator: QEMUAccelerator) {
+        var config = QEMUConfiguration()
+        config.accelerator = accelerator
+
+        #expect(value(of: "-accel", in: arguments(for: config)) == accelerator.rawValue)
     }
 
     /// `.unspecified` exists to stay out of the way of a caller selecting the
     /// accelerator through `-machine accel=...`, so it must emit nothing.
-    func testUnspecifiedAcceleratorEmitsNoAccelArgument() {
+    @Test func unspecifiedAcceleratorEmitsNoAccelArgument() {
         var config = QEMUConfiguration()
         config.accelerator = .unspecified
 
-        XCTAssertFalse(arguments(for: config).contains("-accel"))
+        #expect(!arguments(for: config).contains("-accel"))
     }
 
-    func testHostNativeIsTheHostPlatformsHardwareAccelerator() {
+    @Test func hostNativeIsTheHostPlatformsHardwareAccelerator() {
         #if os(macOS)
-        XCTAssertEqual(QEMUAccelerator.hostNative, .hvf)
+        #expect(QEMUAccelerator.hostNative == .hvf)
         #else
-        XCTAssertEqual(QEMUAccelerator.hostNative, .kvm)
+        #expect(QEMUAccelerator.hostNative == .kvm)
         #endif
-        XCTAssertTrue(QEMUAccelerator.hostNative.isHardwareAccelerated)
+        #expect(QEMUAccelerator.hostNative.isHardwareAccelerated)
     }
 
     // MARK: - CPU model
 
     /// `host` passes through the accelerator's capabilities, so it is only
     /// meaningful under hardware virtualization.
-    func testCPUModelFollowsWhetherTheAcceleratorIsHardwareBacked() {
-        let expected: [QEMUAccelerator: String] = [
-            .kvm: "host",
-            .hvf: "host",
-            .tcg: "qemu64",
-            .unspecified: "qemu64"
-        ]
+    @Test("The default CPU model follows whether the accelerator is hardware-backed", arguments: [
+        (QEMUAccelerator.kvm, "host"),
+        (.hvf, "host"),
+        (.tcg, "qemu64"),
+        (.unspecified, "qemu64")
+    ])
+    func cpuModelFollowsTheAccelerator(accelerator: QEMUAccelerator, cpu: String) {
+        var config = QEMUConfiguration()
+        config.accelerator = accelerator
 
-        for (accelerator, cpu) in expected {
-            var config = QEMUConfiguration()
-            config.accelerator = accelerator
-            XCTAssertEqual(config.resolvedCPUType, cpu, "wrong default CPU for \(accelerator)")
-            XCTAssertEqual(value(of: "-cpu", in: arguments(for: config)), cpu)
-        }
+        #expect(config.resolvedCPUType == cpu, "wrong default CPU for \(accelerator)")
+        #expect(value(of: "-cpu", in: arguments(for: config)) == cpu)
     }
 
-    func testExplicitCPUTypeOverridesTheAcceleratorDefault() {
+    @Test func explicitCPUTypeOverridesTheAcceleratorDefault() {
         var config = QEMUConfiguration()
         config.accelerator = .tcg
         config.cpuType = "Nehalem"
 
-        XCTAssertEqual(config.resolvedCPUType, "Nehalem")
-        XCTAssertEqual(value(of: "-cpu", in: arguments(for: config)), "Nehalem")
+        #expect(config.resolvedCPUType == "Nehalem")
+        #expect(value(of: "-cpu", in: arguments(for: config)) == "Nehalem")
     }
 
     // MARK: - Compatibility shim
 
     /// Marked deprecated so exercising the deprecated shim does not warn.
     @available(*, deprecated)
-    func testDeprecatedEnableKVMStillMapsBothWays() {
+    @Test func deprecatedEnableKVMStillMapsBothWays() {
         var config = QEMUConfiguration()
 
         config.enableKVM = true
-        XCTAssertEqual(config.accelerator, .kvm)
-        XCTAssertTrue(config.enableKVM)
+        #expect(config.accelerator == .kvm)
+        #expect(config.enableKVM)
 
         // `false` used to mean "omit -enable-kvm", which left QEMU on TCG.
         config.enableKVM = false
-        XCTAssertEqual(config.accelerator, .tcg)
-        XCTAssertFalse(config.enableKVM)
+        #expect(config.accelerator == .tcg)
+        #expect(!config.enableKVM)
 
         // The shim cannot express hvf, and says so rather than lying upward.
         config.accelerator = .hvf
-        XCTAssertFalse(config.enableKVM)
+        #expect(!config.enableKVM)
     }
+}
 
-    // MARK: - Against a real QEMU
+// MARK: - Against a real QEMU
 
-    /// The end of the argument list is the only place this is really settled:
-    /// every combination above is a guess until a real QEMU accepts or rejects
-    /// it. Skipped where QEMU is not installed.
-    func testDefaultConfigurationStartsRealQEMU() async throws {
-        let candidates = [
-            "/opt/homebrew/bin/qemu-system-x86_64",
-            "/usr/local/bin/qemu-system-x86_64",
-            "/usr/bin/qemu-system-x86_64"
-        ]
-        guard let qemuPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw XCTSkip("qemu-system-x86_64 not installed")
-        }
+/// The end of the argument list is the only place any of this is really settled:
+/// every combination above is a guess until a real QEMU accepts or rejects it.
+@Suite("QEMU configuration against a real QEMU", .requiresQEMU, .hangBackstop)
+struct RealQEMUConfigurationTests {
 
-        let socketPath = NSTemporaryDirectory() + "qemu-accel-\(UUID().uuidString).sock"
-        let process = QEMUProcess(qemuPath: qemuPath, qmpSocketPath: socketPath, logger: Logger(label: "test"))
-        // An async teardown block rather than `defer`: `stop()` is awaited, so it
-        // cannot go in a `defer` at all, and a teardown block reaches it on the
-        // failure paths too — this test starts a real VM to leak.
-        addTeardownBlock {
-            await process.stop()
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
+    private let temporaryFiles = TemporaryFiles()
+
+    @Test func defaultConfigurationStartsRealQEMU() async throws {
+        let socketPath = temporaryFiles.track(
+            NSTemporaryDirectory() + "qemu-accel-\(UUID().uuidString).sock"
+        )
+        let process = QEMUProcess(
+            qemuPath: try QEMUFixtures.requireSystemBinary(),
+            qmpSocketPath: socketPath,
+            logger: Logger(label: "test")
+        )
 
         var config = QEMUConfiguration()
         config.memoryMB = 128
@@ -161,6 +156,8 @@ final class QEMUConfigurationTests: XCTestCase {
         try await process.start(with: config)
         let isRunning = await process.isRunning
         let stderr = await process.capturedStderr
-        XCTAssertTrue(isRunning, "stderr was: \(stderr)")
+        #expect(isRunning, "stderr was: \(stderr)")
+
+        await process.stop()
     }
 }

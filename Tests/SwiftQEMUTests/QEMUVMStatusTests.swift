@@ -1,5 +1,6 @@
-import XCTest
+import Foundation
 import Logging
+import Testing
 @testable import SwiftQEMU
 
 /// Tests for the QEMU run state → `QEMUVMStatus` mapping.
@@ -10,7 +11,8 @@ import Logging
 /// to be started read as still being created — and `.creating` meant two
 /// different things at once ("`createVM` is in flight" and "ready for you"),
 /// which left a caller unable to tell them apart.
-final class QEMUVMStatusTests: XCTestCase {
+@Suite("VM status mapping")
+struct QEMUVMStatusTests {
 
     private func status(_ runState: String, running: Bool? = nil) -> QEMUVMStatus? {
         QEMUVMStatus(
@@ -22,54 +24,48 @@ final class QEMUVMStatusTests: XCTestCase {
 
     /// A VM started with `-S` is live and waiting for `cont`, which is exactly
     /// what `.paused` means everywhere else in this API.
-    func testPrelaunchIsPausedNotCreating() {
-        XCTAssertEqual(status("prelaunch"), .paused)
+    @Test func prelaunchIsPausedNotCreating() {
+        #expect(status("prelaunch") == .paused)
     }
 
     /// `.creating` is now unambiguous: nothing QEMU can report maps to it except
     /// an incoming migration, so it otherwise only describes the window before
     /// `createVM` returns.
-    func testOnlyAnIncomingMigrationReportsCreating() {
+    @Test func onlyAnIncomingMigrationReportsCreating() {
         let reportingCreating = [
             "running", "paused", "suspended", "prelaunch", "shutdown", "poweroff", "inmigrate"
         ].filter { status($0) == .creating }
 
-        XCTAssertEqual(reportingCreating, ["inmigrate"])
+        #expect(reportingCreating == ["inmigrate"])
     }
 
     // MARK: - The rest of the mapping
 
-    func testRunningStates() {
-        XCTAssertEqual(status("running", running: true), .running)
-
+    /// QEMU's run states are not case-normalised anywhere in the protocol, so the
+    /// mapping does it rather than falling through to "unrecognised" — hence the
+    /// mixed case in the table.
+    @Test("Every run state QEMU reports maps to one status", arguments: [
+        ("running", true, QEMUVMStatus.running),
         // QEMU can report the run state as `running` with execution stopped; the
         // flag is what settles it.
-        XCTAssertEqual(status("running", running: false), .paused)
-    }
-
-    func testPausedStates() {
-        XCTAssertEqual(status("paused"), .paused)
-        XCTAssertEqual(status("suspended"), .paused)
-    }
-
-    func testStoppedStates() {
-        XCTAssertEqual(status("shutdown"), .stopped)
-        XCTAssertEqual(status("poweroff"), .stopped)
-    }
-
-    /// QEMU's run states are not case-normalised anywhere in the protocol, so the
-    /// mapping does it rather than falling through to "unrecognised".
-    func testRunStateMatchingIsCaseInsensitive() {
-        XCTAssertEqual(status("PRELAUNCH"), .paused)
-        XCTAssertEqual(status("Paused"), .paused)
+        ("running", false, .paused),
+        ("paused", false, .paused),
+        ("suspended", false, .paused),
+        ("shutdown", false, .stopped),
+        ("poweroff", false, .stopped),
+        ("PRELAUNCH", false, .paused),
+        ("Paused", false, .paused)
+    ])
+    func runStateMapping(runState: String, running: Bool, expected: QEMUVMStatus) {
+        #expect(status(runState, running: running) == expected)
     }
 
     /// `nil`, not `.unknown`: the caller has the raw string and a logger, and
     /// swallowing an unrecognised state here would lose the warning.
-    func testUnrecognisedRunStateIsRejectedRatherThanGuessed() {
-        XCTAssertNil(status("guest-panicked"))
-        XCTAssertNil(status("watchdog"))
-        XCTAssertNil(status(""))
+    @Test("An unrecognised run state is rejected rather than guessed",
+          arguments: ["guest-panicked", "watchdog", ""])
+    func unrecognisedRunStateIsRejected(runState: String) {
+        #expect(status(runState) == nil)
     }
 
     // MARK: - From events
@@ -81,143 +77,102 @@ final class QEMUVMStatusTests: XCTestCase {
     /// The transitions QEMU announces, which is what lets `status` stay current
     /// without polling `query-status` — including when the guest is the one that
     /// initiated them.
-    func testEventsThatImplyARunState() {
-        XCTAssertEqual(status(event: "STOP"), .paused)
-        XCTAssertEqual(status(event: "SUSPEND"), .paused)
-        XCTAssertEqual(status(event: "RESUME"), .running)
-        XCTAssertEqual(status(event: "WAKEUP"), .running)
-        XCTAssertEqual(status(event: "POWERDOWN"), .shuttingDown)
-        XCTAssertEqual(status(event: "SHUTDOWN"), .stopped)
+    @Test("An event that implies a run state maps to it", arguments: [
+        ("STOP", QEMUVMStatus.paused),
+        ("SUSPEND", .paused),
+        ("RESUME", .running),
+        ("WAKEUP", .running),
+        ("POWERDOWN", .shuttingDown),
+        ("SHUTDOWN", .stopped)
+    ])
+    func eventsThatImplyARunState(event: String, expected: QEMUVMStatus) {
+        #expect(status(event: event) == expected)
     }
 
     /// `nil` rather than a guess. `RESET` leaves the run state exactly as it was —
     /// verified on 11.0.2, which also emits it *twice* per `system_reset`, so
     /// treating it as a transition would be wrong twice over — and what
     /// `GUEST_PANICKED` implies depends on `-action panic`.
-    func testEventsThatImplyNothingAboutTheRunState() {
-        XCTAssertNil(status(event: "RESET"))
-        XCTAssertNil(status(event: "GUEST_PANICKED"))
-        XCTAssertNil(status(event: "DEVICE_DELETED", data: ["device": "vdb"]))
-        XCTAssertNil(status(event: "BLOCK_IO_ERROR"))
-        XCTAssertNil(status(event: "NIC_RX_FILTER_CHANGED"))
+    ///
+    /// The last two are the case rule: QMP event names are upper-case and matched
+    /// exactly, unlike the run states above, which are deliberately case-folded.
+    @Test("An event that implies nothing about the run state maps to nothing",
+          arguments: ["RESET", "GUEST_PANICKED", "BLOCK_IO_ERROR", "NIC_RX_FILTER_CHANGED", "stop", ""])
+    func eventsThatImplyNothingAboutTheRunState(event: String) {
+        #expect(status(event: event) == nil)
     }
 
-    /// QMP event names are upper-case and matched exactly; nothing here should be
-    /// guessing at case the way the run-state mapping deliberately does.
-    func testEventNamesAreMatchedExactly() {
-        XCTAssertNil(status(event: "stop"))
-        XCTAssertNil(status(event: ""))
+    @Test func deviceDeletedImpliesNothingAboutTheRunState() {
+        #expect(status(event: "DEVICE_DELETED", data: ["device": "vdb"]) == nil)
     }
 
     /// The names the mapping switches on are the ones QEMU actually emits.
-    func testEventNameConstantsMatchTheProtocol() {
-        XCTAssertEqual(QMPEventName.stop, "STOP")
-        XCTAssertEqual(QMPEventName.resume, "RESUME")
-        XCTAssertEqual(QMPEventName.powerdown, "POWERDOWN")
-        XCTAssertEqual(QMPEventName.shutdown, "SHUTDOWN")
-        XCTAssertEqual(QMPEventName.deviceDeleted, "DEVICE_DELETED")
+    @Test func eventNameConstantsMatchTheProtocol() {
+        #expect(QMPEventName.stop == "STOP")
+        #expect(QMPEventName.resume == "RESUME")
+        #expect(QMPEventName.powerdown == "POWERDOWN")
+        #expect(QMPEventName.shutdown == "SHUTDOWN")
+        #expect(QMPEventName.deviceDeleted == "DEVICE_DELETED")
     }
+}
 
-    // MARK: - Against a real QEMU
+// MARK: - Against a real QEMU
 
-    /// The end-to-end version of the bug, and the only place the run state comes
-    /// from QEMU rather than from this test: create a VM with the stock
-    /// configuration, and it should report itself as waiting to be started, not
-    /// as still being created. Skipped where QEMU is not installed.
-    func testCreatedVMReportsPausedAndBecomesRunningOnStart() async throws {
-        let manager = QEMUManager(qemuPath: try Self.installedQEMU(), logger: Logger(label: "test"))
+/// The manager driven end to end against a real QEMU, which is the only place the
+/// run state and the event names come from QEMU rather than from a test.
+///
+/// A separate suite because the traits are: these are skipped where QEMU is not
+/// installed, and bounded by a time limit because everything they wait on — a VM
+/// coming up, an event arriving — is something that could stop happening.
+@Suite("VM status against a real QEMU", .requiresQEMU, .slowHangBackstop)
+struct RealQEMUVMStatusTests {
 
-        // This test starts a real VM to leak, and `destroy()` is `await`-ed, so
-        // cleanup goes in a teardown block rather than a `defer` — which cannot
-        // await — and thereby also covers the failure paths below.
-        addTeardownBlock { try? await manager.destroy() }
-
+    /// The end-to-end version of the bug: create a VM with the stock
+    /// configuration, and it should report itself as waiting to be started, not as
+    /// still being created.
+    @Test func createdVMReportsPausedAndBecomesRunningOnStart() async throws {
         var config = QEMUConfiguration()
         config.memoryMB = 128
-        XCTAssertTrue(config.startPaused, "the default this test is about")
+        #expect(config.startPaused, "the default this test is about")
 
-        try await manager.createVM(config: config)
+        try await withVM(config) { manager in
+            let afterCreate = try await manager.getStatus()
+            #expect(
+                afterCreate == .paused,
+                "a created-but-not-started VM is waiting for start(), not still being created"
+            )
 
-        let afterCreate = try await manager.getStatus()
-        XCTAssertEqual(
-            afterCreate, .paused,
-            "a created-but-not-started VM is waiting for start(), not still being created"
-        )
+            try await manager.start()
+            #expect(try await manager.getStatus() == .running)
 
-        try await manager.start()
-        let afterStart = try await manager.getStatus()
-        XCTAssertEqual(afterStart, .running)
-
-        try await manager.destroy()
-        let afterDestroy = await manager.status
-        XCTAssertEqual(afterDestroy, .stopped)
-    }
-
-    /// The event stream, end to end against a real QEMU: the events have to arrive
-    /// with the names and ordering QEMU actually uses, which no fake can establish.
-    /// Skipped where QEMU is not installed.
-    func testEventsFromARealQEMUReachTheManagersSubscribers() async throws {
-        let manager = QEMUManager(qemuPath: try Self.installedQEMU(), logger: Logger(label: "test"))
-        addTeardownBlock { try? await manager.destroy() }
-
-        var config = QEMUConfiguration()
-        config.memoryMB = 128
-        try await manager.createVM(config: config)
-
-        // QEMU 11 offers `oob` and nothing else; a VM that negotiated it can reach a
-        // blocked monitor.
-        let capabilities = await manager.negotiatedCapabilities
-        XCTAssertEqual(capabilities, [.oob], "QEMU 11 offers oob, and it is requested by default")
-
-        let events = try await manager.events()
-
-        try await manager.start()
-        try await manager.pause()
-
-        // RESUME then STOP, from the real QEMU. `collect` bounds the wait so a
-        // regression fails rather than hangs.
-        let received = await Self.collect(2, from: events)
-        XCTAssertEqual(received.map(\.event), ["RESUME", "STOP"])
-
-        let afterPause = await manager.status
-        XCTAssertEqual(afterPause, .paused)
-    }
-
-    private static func installedQEMU() throws -> String {
-        let candidates = [
-            "/opt/homebrew/bin/qemu-system-x86_64",
-            "/usr/local/bin/qemu-system-x86_64",
-            "/usr/bin/qemu-system-x86_64"
-        ]
-        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw XCTSkip("qemu-system-x86_64 not installed")
+            try await manager.destroy()
+            #expect(await manager.status == .stopped)
         }
-        return path
     }
 
-    /// Take up to `count` events, giving up after `timeout` so a delivery regression
-    /// fails the test instead of parking the suite.
-    private static func collect(
-        _ count: Int,
-        from stream: AsyncStream<QMPEvent>,
-        timeout: Duration = .seconds(10)
-    ) async -> [QMPEvent] {
-        await withTaskGroup(of: [QMPEvent]?.self) { group in
-            group.addTask {
-                var collected: [QMPEvent] = []
-                for await event in stream {
-                    collected.append(event)
-                    if collected.count == count { break }
-                }
-                return collected
-            }
-            group.addTask {
-                try? await Task.sleep(for: timeout)
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first ?? []
+    /// The event stream, end to end: the events have to arrive with the names and
+    /// ordering QEMU actually uses, which no fake can establish.
+    @Test func eventsFromARealQEMUReachTheManagersSubscribers() async throws {
+        var config = QEMUConfiguration()
+        config.memoryMB = 128
+
+        try await withVM(config) { manager in
+            // QEMU 11 offers `oob` and nothing else; a VM that negotiated it can
+            // reach a blocked monitor.
+            let capabilities = await manager.negotiatedCapabilities
+            #expect(capabilities == [.oob], "QEMU 11 offers oob, and it is requested by default")
+
+            let events = try await manager.events()
+
+            try await manager.start()
+            try await manager.pause()
+
+            // RESUME then STOP, from the real QEMU. `collect` bounds the wait so a
+            // regression fails rather than hangs.
+            let received = await QMPEvents.collect(2, from: events, timeout: .seconds(10))
+            #expect(received.map(\.event) == ["RESUME", "STOP"])
+
+            #expect(await manager.status == .paused)
         }
     }
 }
