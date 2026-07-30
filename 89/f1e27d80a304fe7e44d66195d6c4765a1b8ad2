@@ -1,0 +1,52 @@
+Tests/SwiftQEMUTests/QEMUVMStatusTests.swift
+  s_526410a4eeb395::t_d066f8b98b2977 75-120,128,155-222
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_526410a4eeb395::t_d066f8b98b2977 3,58-62,72-74,78-81,86-93,95-97,99-100,104-110,125-126,130-134,136-137,142,154-158,205-211,721-1105,1107-1108
+  s_526410a4eeb395::t_37bd16999d8a5d 1106,1109
+Sources/SwiftQEMU/QEMUProcess.swift
+  s_526410a4eeb395::t_c2d7cb7605b595 479,481,483
+  s_526410a4eeb395::t_b747e83c3e330c 256-262
+  s_526410a4eeb395::t_f5ff560006c986 176
+  s_526410a4eeb395::t_02eee03251edb6 38-40
+  s_526410a4eeb395::t_75a0dcb01152c9 247,252-254,265,270-296
+  s_526410a4eeb395::t_9a848189b73f0b 255,266-268
+  s_526410a4eeb395::t_d066f8b98b2977 47-62,70-78,102-112,116,119-122,124-129,132-141,148-167,381,421,480,482,484,486-500,505-600
+Sources/SwiftQEMU/QEMUManager.swift
+  s_526410a4eeb395::t_d066f8b98b2977 19-22,25-29,31-43,46,50-54,112-114,134,240,275-277,320-328,334-403,691-722,726-727
+  s_526410a4eeb395::t_8df818eb4b3553 723-725
+Sources/SwiftQEMU/QMPClient.swift
+  s_526410a4eeb395::t_d066f8b98b2977 26-28,36-42,54-55,63-64,72,86-124,262-291,294,425-459,470-477,481-492,494-509,550-556,669-672,691-695,703-755,947-950,954-955,1203-1204,1207-1209,1264-1269,1272-1275
+Tests/SwiftQEMUTests/QMPProtocolTests.swift
+  s_526410a4eeb395::t_d066f8b98b2977 57-122
+Sources/SwiftQEMU/QMPProtocol.swift
+  s_526410a4eeb395::t_d066f8b98b2977 30-37,39-44,48-75,79-99,227-231,249-250,255-285
+  s_526410a4eeb395::t_1265313b4c5d1c 286-287
+Tests/SwiftQEMUTests/QEMUProcessTests.swift
+  s_526410a4eeb395::t_d066f8b98b2977 5-12,78-93,535-736
+  s_526410a4eeb395::t_edd1158103b1f7 737
+Sources/SwiftQEMU/QMPError.swift
+  s_526410a4eeb395::t_d066f8b98b2977 23-26,36-41,75-79,101-102
+CLAUDE.md
+  s_526410a4eeb395::t_3ec2aee8a9626b 83,113,122,215,223
+  s_526410a4eeb395::t_1137258dc88850 179-180,182,188
+  s_526410a4eeb395::t_35cc12ff8e9b56 130-131
+  s_526410a4eeb395::t_d066f8b98b2977 33-34,43,45,56-58,66-67,81,145,159-178,196-197,230,234,259-270,275-277,285-287,326-356,374,380
+  s_526410a4eeb395::t_649b5c76746aff 38
+  s_526410a4eeb395::t_13306670c7b8d9 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "89f1e27d80a304fe7e44d66195d6c4765a1b8ad2",
+  "prompts": {},
+  "sessions": {
+    "s_526410a4eeb395": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a83b4ccd-78c1-4b24-a1fa-1905605c4afa",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
