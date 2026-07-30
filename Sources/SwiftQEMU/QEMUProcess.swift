@@ -1,6 +1,15 @@
 import Foundation
 import Logging
 
+// `stop()` and `deinit` send SIGKILL through `kill(2)` — Foundation offers no
+// forced-kill API — so the POSIX layer is imported explicitly rather than relying
+// on Foundation to re-export it.
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Manages QEMU process lifecycle
 public final class QEMUProcess: @unchecked Sendable {
     private let logger: Logger
