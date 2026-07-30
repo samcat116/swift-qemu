@@ -40,17 +40,16 @@ public final class QMPClient: Sendable {
     /// nothing.
     public let requestedCapabilities: Set<QMPCapability>
 
-    /// Connection state.
+    /// The current connection, if any, the task consuming it, and what negotiation
+    /// settled on.
     ///
-    /// Boxed rather than held as `var`s: the channel and the connected flag are
-    /// written during connect/teardown from a caller's task and read from the
-    /// event loop when the peer goes away, so they are genuinely shared. Holding
-    /// them behind a lock is what lets this type be honestly `Sendable` instead
-    /// of `@unchecked Sendable`.
+    /// Boxed rather than held as `var`s: they are written during connect and
+    /// teardown from a caller's task and read from wherever a command is issued,
+    /// so they are genuinely shared. Holding them behind a lock is what lets this
+    /// type be honestly `Sendable` instead of `@unchecked Sendable`.
     private struct State: Sendable {
-        var channel: Channel?
-        var handler: QMPChannelHandler?
-        var isConnected = false
+        var connection: QMPConnection?
+        var reader: Task<Void, Never>?
         var greeting: QMPGreeting?
         var negotiatedCapabilities: Set<QMPCapability> = []
     }
@@ -78,9 +77,23 @@ public final class QMPClient: Sendable {
         self.eventLoopGroup = MultiThreadedEventLoopGroup.singleton
     }
 
-    /// Whether the client currently believes it has a usable connection.
+    /// A client dropped without being disconnected would otherwise leave its
+    /// reader task — and the connection that task holds — alive for as long as
+    /// QEMU keeps the socket open. Closing the channel is what ends the loop.
+    /// Nothing can be awaited here, so this is a backstop, not a substitute for
+    /// ``disconnect()``.
+    deinit {
+        let abandoned = state.withLockedValue { $0 }
+        abandoned.connection?.closeWithoutWaiting()
+    }
+
+    /// Whether the client currently has a usable connection.
+    ///
+    /// Derived from the channel rather than from a flag something has to remember
+    /// to clear: a channel that has gone inactive is not a connection, whether it
+    /// was closed here, by QEMU exiting, or by a framing failure.
     public var isConnected: Bool {
-        state.withLockedValue { $0.isConnected }
+        state.withLockedValue { $0.connection?.isActive ?? false }
     }
 
     /// The greeting QEMU sent on the current connection, or `nil` when there is
@@ -108,8 +121,8 @@ public final class QMPClient: Sendable {
     ///
     /// - Buffering: bounded at `bufferSize` events, keeping the newest and
     ///   discarding the oldest. A consumer that stops reading therefore loses
-    ///   history but can never stall the event loop, which is delivering these
-    ///   from NIO and must not block.
+    ///   history but can never stall the loop delivering them, which is also the
+    ///   loop delivering command replies and must not block.
     /// - Lifetime: the stream belongs to *this* connection and finishes when the
     ///   connection ends — `disconnect()`, or the peer going away — so a
     ///   `for await` loop terminates instead of parking forever. Reconnecting
@@ -119,7 +132,7 @@ public final class QMPClient: Sendable {
     ///
     /// - Throws: `QMPError.notConnected` if there is no connection to subscribe to.
     public func events(bufferSize: Int = QMPClient.defaultEventBufferSize) throws(QMPError) -> AsyncStream<QMPEvent> {
-        try connectedHandler().subscribeToEvents(bufferSize: bufferSize)
+        try connectedConnection().events.subscribe(bufferSize: bufferSize)
     }
 
     // MARK: - Connection Management
@@ -135,8 +148,11 @@ public final class QMPClient: Sendable {
 
         while retries < maxRetries {
             do {
-                try await connectOnce { bootstrap in
-                    try await bootstrap.connect(unixDomainSocketPath: path).get()
+                try await connectOnce { bootstrap, initializer in
+                    try await bootstrap.connect(
+                        unixDomainSocketPath: path,
+                        channelInitializer: initializer
+                    )
                 }
                 logger.info("Connected to QEMU successfully")
                 return
@@ -169,8 +185,8 @@ public final class QMPClient: Sendable {
         ])
 
         do {
-            try await connectOnce { bootstrap in
-                try await bootstrap.connect(host: host, port: port).get()
+            try await connectOnce { bootstrap, initializer in
+                try await bootstrap.connect(host: host, port: port, channelInitializer: initializer)
             }
         } catch {
             await teardownFailedAttempt()
@@ -193,92 +209,87 @@ public final class QMPClient: Sendable {
         return .connectionFailed(endpoint: endpoint, underlying: error)
     }
 
-    /// One connect attempt: fresh handler, connect, negotiate.
+    /// One connect attempt: connect, start consuming inbound messages, negotiate.
     private func connectOnce(
-        _ connect: (ClientBootstrap) async throws -> Channel
+        _ connect: (
+            ClientBootstrap,
+            @escaping @Sendable (Channel) -> EventLoopFuture<QMPAsyncChannel>
+        ) async throws -> QMPAsyncChannel
     ) async throws {
-        // A fresh handler per attempt: a handler that saw a failed negotiation
-        // has latched its greeting/close state and must not be reused for the
-        // next connection.
-        let state = self.state
-        let handler = QMPChannelHandler(logger: logger, maximumFrameSize: maximumFrameSize) {
-            // The peer going away must clear the connected flag, so a later
-            // command fails as not-connected rather than being written into a
-            // dead channel and waiting out its timeout.
-            state.withLockedValue { $0.isConnected = false }
-        }
-
         let bootstrap = ClientBootstrap(group: eventLoopGroup)
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .channelInitializer { channel in
-                return channel.pipeline.addHandler(handler)
+
+        let asyncChannel = try await connect(bootstrap, channelInitializer())
+        let connection = QMPConnection(
+            logger: logger,
+            asyncChannel: asyncChannel,
+            connectTimeout: connectTimeout
+        )
+        // The reader task captures the connection and not this client, so a client
+        // that is dropped mid-connection can still be deinitialised.
+        let reader = Task { await connection.run() }
+        state.withLockedValue { $0 = State(connection: connection, reader: reader) }
+
+        try await negotiateCapabilities(connection)
+    }
+
+    /// Build the pipeline for a fresh connection: frame the byte stream, then hand
+    /// the framed messages to Swift concurrency.
+    private func channelInitializer() -> @Sendable (Channel) -> EventLoopFuture<QMPAsyncChannel> {
+        let maximumFrameSize = self.maximumFrameSize
+        return { channel in
+            channel.eventLoop.makeCompletedFuture {
+                try channel.pipeline.syncOperations.addHandler(
+                    ByteToMessageHandler(QMPFrameDecoder(maximumFrameSize: maximumFrameSize))
+                )
+                return try QMPAsyncChannel(wrappingChannelSynchronously: channel)
             }
-
-        state.withLockedValue { $0.handler = handler }
-        let channel = try await connect(bootstrap)
-        state.withLockedValue {
-            $0.channel = channel
-            $0.isConnected = true
         }
-
-        // Wait for greeting and negotiate capabilities
-        try await negotiateCapabilities(handler: handler)
     }
 
     /// Disconnect from QEMU.
     ///
     /// Idempotent, and never reports a peer that has already gone as a failure:
-    /// QEMU exiting in response to `quit` closes the channel from its end, so
-    /// the close here fails with `ChannelError.alreadyClosed`. Letting that
-    /// escape meant `QEMUManager.destroy()` threw before terminating the
-    /// process, leaving an orphaned QEMU behind — the exact outcome the cleanup
-    /// path exists to prevent.
+    /// QEMU exiting in response to `quit` closes the channel from its end, so a
+    /// close here routinely races one that has already happened. Letting that
+    /// escape meant `QEMUManager.destroy()` threw before terminating the process,
+    /// leaving exactly the orphaned QEMU the cleanup path exists to prevent.
+    ///
+    /// Waits for the reader loop to finish, so anything parked on the connection
+    /// has been failed by the time this returns rather than left to time out
+    /// against a channel nobody owns any more.
     public func disconnect() async throws(QMPError) {
-        let previous = state.withLockedValue { state -> State in
-            let previous = state
-            state = State()
-            return previous
-        }
-
-        guard previous.isConnected || previous.channel != nil else { return }
+        let previous = takeState()
+        guard let connection = previous.connection else { return }
 
         logger.info("Disconnecting from QEMU")
-
-        // Fail anything parked on this connection rather than leaving it to time
-        // out against a channel nobody owns any more.
-        previous.handler?.failAllWaiters(with: QMPError.connectionLost)
-
-        do {
-            try await previous.channel?.close()
-        } catch ChannelError.alreadyClosed {
-            logger.debug("QMP channel was already closed by the peer")
-        } catch {
-            throw QMPError.wrapping(error)
-        }
-
+        await connection.close()
+        await previous.reader?.value
         logger.info("Disconnected from QEMU")
     }
 
-    /// Drop a half-open connection, failing anything still parked on it. Called
-    /// when connect or negotiation fails so the next retry starts clean and no
-    /// waiter is left holding a continuation on the abandoned channel.
+    /// Drop a half-open connection. Called when connect or negotiation fails so
+    /// the next retry starts clean and no waiter is left holding a continuation on
+    /// the abandoned channel.
     private func teardownFailedAttempt() async {
-        let previous = state.withLockedValue { state -> State in
+        let previous = takeState()
+        guard let connection = previous.connection else { return }
+        await connection.close()
+        await previous.reader?.value
+    }
+
+    private func takeState() -> State {
+        state.withLockedValue { state in
             let previous = state
             state = State()
             return previous
         }
-        previous.handler?.failAllWaiters(with: QMPError.connectionLost)
-        try? await previous.channel?.close()
     }
 
     // MARK: - QMP Commands
 
     /// Execute a QMP command
-    public func execute(
-        _ command: QMPCommand,
-        arguments: [String: JSONValue]? = nil
-    ) async throws(QMPError) -> JSONValue? {
+    public func execute(_ command: QMPCommand, arguments: [String: JSONValue]? = nil) async throws(QMPError) -> JSONValue? {
         try await send(command, arguments: arguments, outOfBand: false)
     }
 
@@ -309,13 +320,10 @@ public final class QMPClient: Sendable {
         arguments: [String: JSONValue]?,
         outOfBand: Bool
     ) async throws(QMPError) -> JSONValue? {
-        let handler = try connectedHandler()
+        let connection = try connectedConnection()
 
         let request = QMPRequest(execute: command.name, arguments: arguments, outOfBand: outOfBand)
-
-        guard let response = try await handler.sendRequest(request, timeout: requestTimeout) else {
-            throw QMPError.invalidResponse
-        }
+        let response = try await connection.sendRequest(request, timeout: requestTimeout)
 
         if let error = response.error {
             throw QMPError.qmpError(error.class, error.desc)
@@ -375,11 +383,7 @@ public final class QMPClient: Sendable {
     ///   - nodeName: Unique identifier for the block device (e.g., "drive-vdb")
     ///   - filename: Path to the disk image
     ///   - readOnly: Whether the disk is read-only
-    public func blockdevAdd(
-        nodeName: String,
-        filename: String,
-        readOnly: Bool = false
-    ) async throws(QMPError) {
+    public func blockdevAdd(nodeName: String, filename: String, readOnly: Bool = false) async throws(QMPError) {
         let arguments: [String: JSONValue] = [
             "driver": "qcow2",
             "node-name": .string(nodeName),
@@ -424,21 +428,21 @@ public final class QMPClient: Sendable {
     /// Remove a device and wait for DEVICE_DELETED event
     /// - Parameters:
     ///   - deviceId: The device ID to remove
-    ///   - timeout: How long to wait for the DEVICE_DELETED event
+    ///   - timeout: Timeout in seconds for waiting on DEVICE_DELETED event
     public func deviceDel(deviceId: String, timeout: Duration = .seconds(5)) async throws(QMPError) {
-        let handler = try connectedHandler()
+        let connection = try connectedConnection()
 
         // Registered before the command goes out: QEMU can emit DEVICE_DELETED
         // ahead of its reply, and an interest registered afterwards would miss it.
-        let ticket = handler.expectDeviceDeleted(deviceId: deviceId)
+        let ticket = await connection.expectDeviceDeleted(deviceId: deviceId, timeout: timeout)
         do {
             _ = try await execute(.deviceDel, arguments: ["id": .string(deviceId)])
         } catch {
-            handler.cancelExpectation(ticket)
+            await connection.cancelExpectation(ticket)
             throw error
         }
 
-        try await handler.waitForDeviceDeleted(ticket, timeout: timeout)
+        try await connection.waitForDeviceDeleted(ticket)
     }
 
     /// Query attached block devices
@@ -483,12 +487,11 @@ public final class QMPClient: Sendable {
 
     // MARK: - Private Methods
 
-    private func connectedHandler() throws(QMPError) -> QMPChannelHandler {
-        let state = self.state.withLockedValue { $0 }
-        guard state.isConnected, let handler = state.handler else {
+    private func connectedConnection() throws(QMPError) -> QMPConnection {
+        guard let connection = state.withLockedValue({ $0.connection }), connection.isActive else {
             throw QMPError.notConnected
         }
-        return handler
+        return connection
     }
 
     /// Wait for the greeting, then enable the capabilities it offers that we asked
@@ -499,11 +502,11 @@ public final class QMPClient: Sendable {
     /// requested: `qmp_capabilities` fails outright on a capability QEMU did not
     /// advertise, and a failed negotiation leaves a monitor that refuses every
     /// subsequent command.
-    private func negotiateCapabilities(handler: QMPChannelHandler) async throws(QMPError) {
-        try await handler.waitForGreeting(timeout: connectTimeout)
-
-        let greeting = handler.receivedGreeting
-        let offered = Set((greeting?.QMP.capabilities ?? []).compactMap(QMPCapability.init(rawValue:)))
+    private func negotiateCapabilities(_ connection: QMPConnection) async throws(QMPError) {
+        // The greeting comes back from the wait rather than being fetched
+        // afterwards, so there is no question of whether the value is visible yet.
+        let greeting = try await connection.waitForGreeting()
+        let offered = Set(greeting.QMP.capabilities.compactMap(QMPCapability.init(rawValue:)))
         let toEnable = offered.intersection(requestedCapabilities)
 
         // Omitted entirely when there is nothing to enable, so a QEMU predating
@@ -513,12 +516,12 @@ public final class QMPClient: Sendable {
             : ["enable": .array(toEnable.map(\.rawValue).sorted().map(JSONValue.string))]
 
         let request = QMPRequest(execute: QMPCommand.capabilities.name, arguments: arguments)
-        let response = try await handler.sendRequest(request, timeout: connectTimeout)
+        let response = try await connection.sendRequest(request, timeout: connectTimeout)
 
         // A rejected negotiation is fatal for the connection — QEMU answers every
         // later command with "Expecting capabilities negotiation" — so it must not
         // be swallowed the way it was when the reply went unread.
-        if let error = response?.error {
+        if let error = response.error {
             throw QMPError.qmpError(error.class, error.desc)
         }
 
@@ -531,822 +534,5 @@ public final class QMPClient: Sendable {
             "offered": .string(offered.map(\.rawValue).sorted().joined(separator: ",")),
             "enabled": .string(toEnable.map(\.rawValue).sorted().joined(separator: ","))
         ])
-    }
-}
-
-// MARK: - QMP Channel Handler
-
-private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendable {
-    typealias InboundIn = ByteBuffer
-    typealias OutboundOut = ByteBuffer
-
-    private let logger: Logger
-    private let decoder = JSONDecoder()
-    private let encoder = JSONEncoder()
-    /// Largest inbound frame this connection will buffer, terminating newline
-    /// included. Frames are newline-delimited, so without a cap a peer that
-    /// never sends one grows `buffer` for as long as it keeps writing.
-    private let maximumFrameSize: Int
-    /// Invoked once the connection is no longer usable, so the owning client can
-    /// stop reporting itself as connected.
-    private let onConnectionLost: @Sendable () -> Void
-
-    /// Guards every field below. Waiters are installed from arbitrary Swift
-    /// concurrency threads while the event loop resumes them, so all of this
-    /// state is genuinely shared. Continuations are always *removed* under the
-    /// lock and resumed after unlocking, which gives each one exactly one
-    /// resume without ever calling out while holding the lock.
-    private let lock = NIOLock()
-
-    /// A one-shot signal that may be satisfied before anyone waits on it.
-    private enum Latch {
-        case pending
-        case satisfied
-        case failed(Error)
-    }
-
-    private var greeting: Latch = .pending
-    private var greetingContinuation: CheckedContinuation<Void, Error>?
-    private var greetingDeadline: Scheduled<Void>?
-    /// The task waiting on the greeting was cancelled. Latched, because the
-    /// cancellation can land before the waiter parks.
-    private var greetingCancelled = false
-    /// The greeting itself, kept rather than discarded: its `capabilities` list is
-    /// what capability negotiation has to be driven from.
-    private var greetingMessage: QMPGreeting?
-    /// One continuation per live `events()` subscription. Several consumers can
-    /// watch the same connection, so this is a map rather than a single slot; each
-    /// is yielded to independently and none can block the others.
-    private var eventSubscribers: [UInt64: AsyncStream<QMPEvent>.Continuation] = [:]
-    /// Outstanding requests in submission order, keyed for out-of-order and
-    /// timed-out removal. QMP echoes our `id` back, so a response is matched to
-    /// its request rather than to whatever happens to be at the head.
-    private var pendingRequests: [PendingRequest] = []
-    /// One entry per outstanding `device_del`, keyed by ticket token rather than
-    /// by device id. A single slot per device meant two concurrent waits on the
-    /// same device overwrote each other, abandoning the first continuation with
-    /// nothing to resume it and no deadline to fail it.
-    private var deviceDeletions: [UInt64: PendingDeletion] = [:]
-
-    /// One outstanding QMP command.
-    ///
-    /// The record is created before the command is written and before the caller
-    /// parks on it, so a cancellation that arrives first has something to mark
-    /// rather than nothing at all. The caller then finds that mark and resumes
-    /// itself, instead of parking behind a canceller that has already been and
-    /// gone — the same ordering hazard the deadlines have to respect.
-    private struct PendingRequest {
-        let id: String
-        /// `nil` until the caller parks. A record without one has not been
-        /// written to the channel yet, so no response can belong to it.
-        var continuation: CheckedContinuation<QMPResponse?, Error>?
-        /// Cancelled the moment the request resolves, so no deadline outlives
-        /// the thing it bounds.
-        var deadline: Scheduled<Void>?
-        /// The waiting task was cancelled before it parked.
-        var cancelled = false
-    }
-
-    private struct PendingDeletion {
-        let deviceId: String
-        /// The event arrived before the caller got around to waiting.
-        var seen = false
-        var continuation: CheckedContinuation<Void, Error>?
-        var deadline: Scheduled<Void>?
-        /// The waiting task was cancelled before it parked.
-        var cancelled = false
-    }
-    /// Set once the channel goes inactive, so waiters that arrive afterwards
-    /// fail immediately instead of parking on a dead connection.
-    private var closeError: Error?
-    private var nextRequestID: UInt64 = 0
-    private var nextWaiterToken: UInt64 = 0
-    private weak var channel: Channel?
-    /// The loop deadlines are scheduled on, captured when the handler joins a
-    /// pipeline. Held strongly and separately from `channel`, which is weak: a
-    /// waiter whose channel has gone still has to be bounded.
-    private var deadlineLoop: EventLoop?
-
-    /// Event-loop-confined: only touched from `channelRead`.
-    private var buffer = ByteBuffer()
-    /// Event-loop-confined, like `buffer`. Latched once framing has failed, so
-    /// bytes still in flight when the close was requested are dropped rather
-    /// than parsed on a connection we have already given up on.
-    private var hasFailedFraming = false
-
-    init(
-        logger: Logger,
-        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize,
-        onConnectionLost: @escaping @Sendable () -> Void = {}
-    ) {
-        self.logger = logger
-        self.maximumFrameSize = maximumFrameSize
-        self.onConnectionLost = onConnectionLost
-    }
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        guard !hasFailedFraming else { return }
-
-        var input = self.unwrapInboundIn(data)
-        buffer.writeBuffer(&input)
-
-        // Process complete JSON messages, and give up on the connection rather
-        // than buffer a frame that has grown past the cap.
-        drain: while true {
-            switch nextFrame() {
-            case .frame(let message):
-                processMessage(message)
-            case .incomplete:
-                break drain
-            case .overflow(let bytes):
-                failOversizedFrame(bytes: bytes, context: context)
-                return
-            }
-        }
-    }
-
-    func channelInactive(context: ChannelHandlerContext) {
-        logger.debug("QMP channel became inactive")
-        failAllWaiters(with: QMPError.connectionLost)
-    }
-
-    func errorCaught(context: ChannelHandlerContext, error: Error) {
-        logger.error("QMP channel error: \(error)")
-        context.close(promise: nil)
-    }
-
-    /// Fail everything parked on this connection and latch the failure so later
-    /// waiters fail fast too.
-    func failAllWaiters(with error: Error) {
-        lock.lock()
-        let requests = pendingRequests
-        pendingRequests.removeAll()
-        let deletions = Array(deviceDeletions.values)
-        deviceDeletions.removeAll()
-        let greetingWaiter = greetingContinuation
-        greetingContinuation = nil
-        let greetingDeadline = self.greetingDeadline
-        self.greetingDeadline = nil
-        if case .pending = greeting {
-            greeting = .failed(error)
-        }
-        // Event streams end with the connection they belong to, so a `for await`
-        // over one completes rather than parking on a channel nobody owns.
-        let subscribers = Array(eventSubscribers.values)
-        eventSubscribers.removeAll()
-        let isFirstClose = closeError == nil
-        if isFirstClose {
-            closeError = error
-        }
-        lock.unlock()
-
-        // Every deadline goes with the waiter it bounded — there is nothing left
-        // for it to fail, and leaving it scheduled would keep this handler alive
-        // until it fired.
-        for request in requests {
-            request.deadline?.cancel()
-            request.continuation?.resume(throwing: error)
-        }
-        for deletion in deletions {
-            deletion.deadline?.cancel()
-            deletion.continuation?.resume(throwing: error)
-        }
-        greetingDeadline?.cancel()
-        // Finished outside the lock: `finish()` invokes the termination handler,
-        // which takes the same non-recursive lock.
-        for subscriber in subscribers {
-            subscriber.finish()
-        }
-        greetingWaiter?.resume(throwing: error)
-
-        if isFirstClose {
-            onConnectionLost()
-        }
-    }
-
-    /// The greeting received on this connection, if it has arrived.
-    var receivedGreeting: QMPGreeting? {
-        lock.lock()
-        defer { lock.unlock() }
-        return greetingMessage
-    }
-
-    /// A new independent event stream over this connection.
-    ///
-    /// The subscriber is registered synchronously, inside `AsyncStream`'s build
-    /// closure, so events cannot slip through between the call and the first
-    /// iteration of the caller's loop.
-    func subscribeToEvents(bufferSize: Int) -> AsyncStream<QMPEvent> {
-        AsyncStream(QMPEvent.self, bufferingPolicy: .bufferingNewest(bufferSize)) { continuation in
-            lock.lock()
-            if closeError != nil {
-                // Already dead: hand back a stream that is simply over, rather than
-                // one that will never produce anything and never end.
-                lock.unlock()
-                continuation.finish()
-                return
-            }
-            nextWaiterToken += 1
-            let token = nextWaiterToken
-            eventSubscribers[token] = continuation
-            lock.unlock()
-
-            // Drops the registration when the consumer stops iterating (or its task
-            // is cancelled), so an abandoned stream is not yielded to forever.
-            continuation.onTermination = { [weak self] _ in
-                guard let self else { return }
-                self.lock.lock()
-                self.eventSubscribers.removeValue(forKey: token)
-                self.lock.unlock()
-            }
-        }
-    }
-
-    /// Deliver one event to every live subscriber.
-    ///
-    /// Called from the event loop, so it must not block: `bufferingNewest` makes
-    /// `yield` non-blocking, discarding a slow subscriber's oldest event instead of
-    /// applying backpressure to QEMU's socket.
-    private func broadcast(_ event: QMPEvent) {
-        lock.lock()
-        let subscribers = Array(eventSubscribers.values)
-        lock.unlock()
-
-        for subscriber in subscribers {
-            subscriber.yield(event)
-        }
-    }
-
-    /// Every wait below funnels its `any Error` continuation through
-    /// `QMPError.wrapping`. The continuations themselves cannot be typed — the
-    /// stdlib only offers `CheckedContinuation<_, any Error>` — so the
-    /// conversion happens at the boundary instead. Every resume in this file is
-    /// already a `QMPError`, so nothing actually reaches
-    /// `QMPError.underlying(_:)` here; it is what keeps the mapping total
-    /// without inventing a case for an error we did not throw.
-    func waitForGreeting(timeout: Duration) async throws(QMPError) {
-        do {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    lock.lock()
-                    guard !greetingCancelled else {
-                        // Cancelled before we parked. The latch is what makes that
-                        // ordering harmless: without it the canceller would find no
-                        // waiter, and this continuation would park behind it.
-                        lock.unlock()
-                        continuation.resume(throwing: QMPError.cancelled)
-                        return
-                    }
-                    switch greeting {
-                    case .satisfied:
-                        // The greeting landed before we got here. Latching it is
-                        // what keeps this from parking forever.
-                        lock.unlock()
-                        continuation.resume()
-                        return
-                    case .failed(let error):
-                        lock.unlock()
-                        continuation.resume(throwing: error)
-                        return
-                    case .pending:
-                        guard greetingContinuation == nil else {
-                            // Overwriting the slot would abandon the first waiter with
-                            // no resume and no deadline. Only negotiation waits here, so
-                            // a second waiter is a programming error, not a race.
-                            lock.unlock()
-                            continuation.resume(throwing: QMPError.invalidResponse)
-                            return
-                        }
-                        greetingContinuation = continuation
-                        lock.unlock()
-                    }
-                    attachGreetingDeadline(armDeadline(timeout) { [weak self] in self?.timeOutGreeting() })
-                }
-            } onCancel: {
-                self.cancelGreeting()
-            }
-        } catch {
-            throw QMPError.wrapping(error)
-        }
-    }
-
-    private func timeOutGreeting() {
-        lock.lock()
-        let waiter = greetingContinuation
-        greetingContinuation = nil
-        greetingDeadline = nil
-        lock.unlock()
-        waiter?.resume(throwing: QMPError.timeout)
-    }
-
-    private func cancelGreeting() {
-        lock.lock()
-        greetingCancelled = true
-        let waiter = greetingContinuation
-        greetingContinuation = nil
-        let deadline = greetingDeadline
-        greetingDeadline = nil
-        lock.unlock()
-        deadline?.cancel()
-        waiter?.resume(throwing: QMPError.cancelled)
-    }
-
-    /// A registered interest in the `DEVICE_DELETED` for one `device_del`.
-    struct DeletionTicket {
-        let token: UInt64
-    }
-
-    /// Register interest *before* `device_del` is sent.
-    ///
-    /// QEMU may emit `DEVICE_DELETED` before its reply to the command reaches us,
-    /// and a waiter installed only afterwards misses the event and waits out the
-    /// full timeout. Registering first makes the ordering irrelevant. Scoping the
-    /// record to this specific command matters too: a free-floating "this device
-    /// was deleted" latch would still be sitting there if the guest ejected a
-    /// device nobody was waiting on, and would then falsely satisfy a later
-    /// detach of a device re-added under the same name.
-    func expectDeviceDeleted(deviceId: String) -> DeletionTicket {
-        lock.lock()
-        defer { lock.unlock() }
-        nextWaiterToken += 1
-        deviceDeletions[nextWaiterToken] = PendingDeletion(deviceId: deviceId)
-        return DeletionTicket(token: nextWaiterToken)
-    }
-
-    /// Drop a registration whose command never made it out.
-    func cancelExpectation(_ ticket: DeletionTicket) {
-        lock.lock()
-        let abandoned = deviceDeletions.removeValue(forKey: ticket.token)
-        lock.unlock()
-        abandoned?.deadline?.cancel()
-        abandoned?.continuation?.resume(throwing: QMPError.connectionLost)
-    }
-
-    func waitForDeviceDeleted(_ ticket: DeletionTicket, timeout: Duration) async throws(QMPError) {
-        do {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                    lock.lock()
-                    guard var pending = deviceDeletions[ticket.token] else {
-                        // Torn down under us — the connection dropped between the command
-                        // and this wait.
-                        let error = closeError ?? QMPError.connectionLost
-                        lock.unlock()
-                        continuation.resume(throwing: error)
-                        return
-                    }
-                    if pending.cancelled {
-                        // Cancelled before we parked. Checked ahead of `seen` so the
-                        // answer is the same whichever way that race lands:
-                        // cancellation does not un-detach the device either way, and
-                        // first-mover-wins is the rule callers can reason about.
-                        deviceDeletions.removeValue(forKey: ticket.token)
-                        lock.unlock()
-                        continuation.resume(throwing: QMPError.cancelled)
-                        return
-                    }
-                    if let closeError {
-                        deviceDeletions.removeValue(forKey: ticket.token)
-                        lock.unlock()
-                        continuation.resume(throwing: closeError)
-                        return
-                    }
-                    if pending.seen {
-                        deviceDeletions.removeValue(forKey: ticket.token)
-                        lock.unlock()
-                        continuation.resume()
-                        return
-                    }
-                    pending.continuation = continuation
-                    deviceDeletions[ticket.token] = pending
-                    lock.unlock()
-                    attachDeadline(
-                        armDeadline(timeout) { [weak self] in
-                            self?.timeOutDeviceDeleted(token: ticket.token)
-                        },
-                        toDeletion: ticket.token
-                    )
-                }
-            } onCancel: {
-                self.cancelDeviceDeleted(token: ticket.token)
-            }
-        } catch {
-            throw QMPError.wrapping(error)
-        }
-    }
-
-    private func timeOutDeviceDeleted(token: UInt64) {
-        lock.lock()
-        // Removing by token is what keeps a deadline from failing a *different*
-        // wait for the same device.
-        let waiter = deviceDeletions.removeValue(forKey: token)?.continuation
-        lock.unlock()
-        waiter?.resume(throwing: QMPError.timeout)
-    }
-
-    private func cancelDeviceDeleted(token: UInt64) {
-        lock.lock()
-        var waiter: CheckedContinuation<Void, Error>?
-        var deadline: Scheduled<Void>?
-        if var pending = deviceDeletions[token] {
-            if let continuation = pending.continuation {
-                deadline = pending.deadline
-                deviceDeletions.removeValue(forKey: token)
-                waiter = continuation
-            } else {
-                // Not parked yet — leave the record behind, marked, for the wait
-                // to find. Removing it here would send that wait down the
-                // "torn down under us" path and report a connection loss that
-                // did not happen.
-                pending.cancelled = true
-                deviceDeletions[token] = pending
-            }
-        }
-        lock.unlock()
-        deadline?.cancel()
-        waiter?.resume(throwing: QMPError.cancelled)
-    }
-
-    func sendRequest(_ request: QMPRequest, timeout: Duration) async throws(QMPError) -> QMPResponse? {
-        lock.lock()
-        if let closeError {
-            lock.unlock()
-            throw QMPError.wrapping(closeError)
-        }
-        guard let channel = channel else {
-            lock.unlock()
-            throw QMPError.notConnected
-        }
-        nextRequestID += 1
-        let id = "swiftqemu-\(nextRequestID)"
-        lock.unlock()
-
-        // Tag the request so its response can be correlated back to it. Without
-        // an id, matching is positional — and a single timed-out request would
-        // shift every later response onto the wrong caller. It matters twice as
-        // much for an out-of-band request, which is answered out of order by
-        // definition — so `outOfBand` has to be carried across this rebuild, or the
-        // command silently goes out in-band.
-        let identified = QMPRequest(
-            execute: request.execute,
-            arguments: request.arguments,
-            id: id,
-            outOfBand: request.outOfBand
-        )
-        // Encoded before the record is registered, so a failure here cannot
-        // leave an entry behind with nothing to resolve it.
-        let data: Data
-        do {
-            data = try encoder.encode(identified)
-        } catch {
-            throw QMPError.requestEncodingFailed(command: request.execute, underlying: error)
-        }
-        var buffer = channel.allocator.buffer(capacity: data.count + 1)
-        buffer.writeBytes(data)
-        buffer.writeString("\n")
-        let outbound = buffer
-
-        lock.lock()
-        if let closeError {
-            lock.unlock()
-            throw QMPError.wrapping(closeError)
-        }
-        // Registered before the cancellation handler is installed so that a
-        // cancellation landing first has a record to mark. Nothing has been
-        // written yet, so no response can arrive for it in the meantime.
-        pendingRequests.append(PendingRequest(id: id))
-        lock.unlock()
-
-        do {
-            return try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<QMPResponse?, Error>) in
-                    lock.lock()
-                    guard let index = pendingRequests.firstIndex(where: { $0.id == id }) else {
-                        // Torn down under us between registration and here.
-                        let error = closeError ?? QMPError.connectionLost
-                        lock.unlock()
-                        continuation.resume(throwing: error)
-                        return
-                    }
-                    if pendingRequests[index].cancelled {
-                        // Cancelled before we parked, so the command is never
-                        // written at all.
-                        pendingRequests.remove(at: index)
-                        lock.unlock()
-                        continuation.resume(throwing: QMPError.cancelled)
-                        return
-                    }
-                    pendingRequests[index].continuation = continuation
-                    lock.unlock()
-                    channel.writeAndFlush(outbound, promise: nil)
-                    attachDeadline(
-                        armDeadline(timeout) { [weak self] in self?.timeOutRequest(id: id) },
-                        toRequest: id
-                    )
-                }
-            } onCancel: {
-                self.cancelRequest(id: id)
-            }
-        } catch {
-            throw QMPError.wrapping(error)
-        }
-    }
-
-    /// Start the deadline for a waiter that is *already installed*.
-    ///
-    /// Ordering is the whole point. Racing the deadline against the parking
-    /// task in a group let the deadline fire first, in which case it found no
-    /// waiter to fail, and the task then parked on a continuation nobody would
-    /// ever resume — a timeout that hangs, the exact failure this file exists
-    /// to remove. Arming only after installation makes that unrepresentable:
-    /// the deadline either finds the waiter or finds it already resolved.
-    ///
-    /// Scheduled on the channel's event loop rather than run as a task of its
-    /// own. A `Task.detached` per waiter slept out the whole budget even once
-    /// its waiter had resolved, so a burst of commands left one task per command
-    /// idling for the full timeout. The returned `Scheduled` goes to the waiter,
-    /// which cancels it the moment it resolves, so a deadline never outlives
-    /// what it bounds. Scheduling also keeps the deadline out of reach of the
-    /// caller's cancellation, which is the property the detached task existed
-    /// for: a deadline that inherited cancellation and skipped `expire` would
-    /// strand its waiter.
-    ///
-    /// A non-positive timeout expires immediately rather than never, and returns
-    /// nothing to cancel.
-    private func armDeadline(
-        _ timeout: Duration,
-        _ expire: @escaping @Sendable () -> Void
-    ) -> Scheduled<Void>? {
-        guard timeout > .zero else {
-            expire()
-            return nil
-        }
-        lock.lock()
-        // Any loop will do — every `expire` takes the lock — so a waiter that
-        // somehow predates `handlerAdded` is bounded rather than silently
-        // deadline-less.
-        let loop = deadlineLoop ?? MultiThreadedEventLoopGroup.singleton.any()
-        lock.unlock()
-        // `TimeAmount(_:)` truncates to nanoseconds and clamps at `Int64.max`,
-        // so an absurd budget cannot overflow the conversion; the bound is a few
-        // centuries, which is indistinguishable from "no deadline".
-        return loop.scheduleTask(in: TimeAmount(timeout)) {
-            // A no-op once the waiter resolved normally: every timeOut* helper
-            // removes by key under the lock, so it fails only a live waiter.
-            expire()
-        }
-    }
-
-    /// Hand a freshly armed deadline to its waiter, or cancel it outright if the
-    /// waiter resolved in the window between parking and arming.
-    private func attachDeadline(_ deadline: Scheduled<Void>?, toRequest id: String) {
-        guard let deadline else { return }
-        lock.lock()
-        if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
-            pendingRequests[index].deadline = deadline
-            lock.unlock()
-        } else {
-            lock.unlock()
-            deadline.cancel()
-        }
-    }
-
-    private func attachDeadline(_ deadline: Scheduled<Void>?, toDeletion token: UInt64) {
-        guard let deadline else { return }
-        lock.lock()
-        if deviceDeletions[token]?.continuation != nil {
-            deviceDeletions[token]?.deadline = deadline
-            lock.unlock()
-        } else {
-            lock.unlock()
-            deadline.cancel()
-        }
-    }
-
-    private func attachGreetingDeadline(_ deadline: Scheduled<Void>?) {
-        guard let deadline else { return }
-        lock.lock()
-        if greetingContinuation != nil {
-            greetingDeadline = deadline
-            lock.unlock()
-        } else {
-            lock.unlock()
-            deadline.cancel()
-        }
-    }
-
-    private func timeOutRequest(id: String) {
-        lock.lock()
-        var waiter: CheckedContinuation<QMPResponse?, Error>?
-        if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
-            waiter = pendingRequests.remove(at: index).continuation
-        }
-        lock.unlock()
-        waiter?.resume(throwing: QMPError.timeout)
-    }
-
-    private func cancelRequest(id: String) {
-        lock.lock()
-        var waiter: CheckedContinuation<QMPResponse?, Error>?
-        var deadline: Scheduled<Void>?
-        if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
-            if let continuation = pendingRequests[index].continuation {
-                deadline = pendingRequests[index].deadline
-                pendingRequests.remove(at: index)
-                waiter = continuation
-            } else {
-                // Not parked yet — leave the record behind, marked, so the
-                // caller resumes itself rather than parking on a continuation
-                // whose canceller has already run.
-                pendingRequests[index].cancelled = true
-            }
-        }
-        lock.unlock()
-        deadline?.cancel()
-        waiter?.resume(throwing: QMPError.cancelled)
-    }
-
-    func handlerAdded(context: ChannelHandlerContext) {
-        lock.lock()
-        self.channel = context.channel
-        self.deadlineLoop = context.eventLoop
-        lock.unlock()
-    }
-
-    private enum FrameExtraction {
-        case frame(Data)
-        /// No terminator yet, and what is buffered still fits the cap.
-        case incomplete
-        /// One frame is over the cap. The payload is what is buffered for it so
-        /// far, which for an unterminated frame is a lower bound.
-        case overflow(bytes: Int)
-    }
-
-    private func nextFrame() -> FrameExtraction {
-        // Look for complete JSON objects ending with newline
-        guard let newlineIndex = buffer.readableBytesView.firstIndex(of: UInt8(ascii: "\n")) else {
-            // Nothing here is a frame yet. It can still be over the cap: a peer
-            // that writes without ever terminating is exactly the case the cap
-            // exists for, and waiting for its newline is waiting forever.
-            return buffer.readableBytes > maximumFrameSize
-                ? .overflow(bytes: buffer.readableBytes)
-                : .incomplete
-        }
-
-        let messageLength = buffer.readableBytesView.startIndex.distance(to: newlineIndex) + 1
-        guard messageLength <= maximumFrameSize else {
-            return .overflow(bytes: messageLength)
-        }
-        guard let slice = buffer.readSlice(length: messageLength) else {
-            return .incomplete
-        }
-        // Reclaim the space this message occupied instead of letting the read
-        // region grow for the lifetime of the connection.
-        buffer.discardReadBytes()
-
-        return .frame(Data(slice.readableBytesView.dropLast())) // Remove newline
-    }
-
-    /// Drop a connection whose peer sent a frame larger than we will buffer.
-    ///
-    /// Failing the waiters *before* closing is what makes the cause visible:
-    /// `failAllWaiters` latches the first error, so the in-flight caller gets
-    /// `frameTooLarge` rather than the `connectionLost` that `channelInactive`
-    /// would otherwise latch a moment later.
-    private func failOversizedFrame(bytes: Int, context: ChannelHandlerContext) {
-        logger.error("QMP frame exceeded the maximum size; closing the connection", metadata: [
-            "bytes": .stringConvertible(bytes),
-            "limit": .stringConvertible(maximumFrameSize)
-        ])
-        hasFailedFraming = true
-        // Release it now rather than hold it for as long as the handler lives.
-        buffer.clear()
-        failAllWaiters(with: QMPError.frameTooLarge(limit: maximumFrameSize))
-        context.close(promise: nil)
-    }
-
-    private func processMessage(_ data: Data) {
-        let message: QMPMessage
-        do {
-            message = try decoder.decode(QMPMessage.self, from: data)
-        } catch {
-            logger.warning("Unknown QMP message format", metadata: [
-                "error": .string("\(error)")
-            ])
-            return
-        }
-
-        switch message {
-        case .greeting(let greetingMessage):
-            handleGreeting(greetingMessage)
-        case .response(let response):
-            handleResponse(response)
-        case .event(let event):
-            handleEvent(event)
-        }
-    }
-
-    private func handleGreeting(_ greetingMessage: QMPGreeting) {
-        logger.debug("Received QMP greeting", metadata: [
-            "version": .stringConvertible("\(greetingMessage.QMP.version.qemu.major).\(greetingMessage.QMP.version.qemu.minor).\(greetingMessage.QMP.version.qemu.micro)"),
-            "capabilities": .string(greetingMessage.QMP.capabilities.joined(separator: ","))
-        ])
-        lock.lock()
-        // Stored under the same lock as the latch, so a negotiation woken by the
-        // latch is guaranteed to see the greeting it was waiting for.
-        self.greetingMessage = greetingMessage
-        if case .pending = greeting {
-            greeting = .satisfied
-        }
-        let waiter = greetingContinuation
-        greetingContinuation = nil
-        let deadline = greetingDeadline
-        greetingDeadline = nil
-        lock.unlock()
-        deadline?.cancel()
-        waiter?.resume()
-    }
-
-    private func handleResponse(_ response: QMPResponse) {
-        lock.lock()
-        var waiter: CheckedContinuation<QMPResponse?, Error>?
-        var deadline: Scheduled<Void>?
-        var unmatchedID: String?
-        if let id = response.id?.stringValue {
-            // Tagged: match strictly, and drop it if nothing matches. A
-            // tagged response with no waiter is a late reply to a request
-            // that already timed out — QEMU still answers those. Falling
-            // back to FIFO here would hand it to whichever request is
-            // pending *now*, which is precisely the response-shift
-            // corruption id correlation exists to prevent.
-            if let index = pendingRequests.firstIndex(where: { $0.id == id }) {
-                let removed = pendingRequests.remove(at: index)
-                waiter = removed.continuation
-                deadline = removed.deadline
-            } else {
-                unmatchedID = id
-            }
-        } else if let index = pendingRequests.firstIndex(where: { $0.continuation != nil }) {
-            // Untagged (an older QEMU that does not echo `id`): submission
-            // order is the only correlation available. Records without a
-            // continuation are skipped — they have not been written yet, so
-            // this reply cannot be theirs.
-            let removed = pendingRequests.remove(at: index)
-            waiter = removed.continuation
-            deadline = removed.deadline
-        }
-        lock.unlock()
-
-        if let unmatchedID {
-            logger.debug(
-                "Discarding QMP response with no matching request",
-                metadata: ["id": .string(unmatchedID)])
-        }
-        deadline?.cancel()
-        waiter?.resume(returning: response)
-    }
-
-    private func handleEvent(_ event: QMPEvent) {
-        logger.debug("Received QMP event", metadata: ["event": .string(event.event)])
-
-        // The dedicated waiter first, then everyone watching. A detach needs a
-        // targeted, timed wait, so it keeps its ticket path rather than scanning
-        // the shared stream — but the event is still worth publishing.
-        if event.event == QMPEventName.deviceDeleted,
-           let device = event.data?["device"]?.stringValue {
-            resolveDeviceDeletion(device: device)
-        }
-
-        broadcast(event)
-    }
-
-    private func resolveDeviceDeletion(device: String) {
-        lock.lock()
-        // The oldest outstanding expectation for this device, so repeated
-        // detaches are matched in the order they were issued.
-        // Cancelled expectations are skipped: their waiter is going to throw
-        // `QMPError.cancelled` regardless, and letting one absorb the event would
-        // hide it from a live wait for the same device.
-        let token = deviceDeletions
-            .filter { $0.value.deviceId == device && !$0.value.cancelled }
-            .keys
-            .min()
-        var waiter: CheckedContinuation<Void, Error>?
-        var deadline: Scheduled<Void>?
-        if let token {
-            if let continuation = deviceDeletions[token]?.continuation {
-                deadline = deviceDeletions[token]?.deadline
-                deviceDeletions.removeValue(forKey: token)
-                waiter = continuation
-            } else {
-                // The command has not been answered yet; record it so the wait
-                // that follows returns at once instead of timing out.
-                deviceDeletions[token]?.seen = true
-            }
-        }
-        lock.unlock()
-
-        deadline?.cancel()
-        waiter?.resume()
     }
 }
