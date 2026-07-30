@@ -57,11 +57,9 @@ final class QEMUProcessTests: XCTestCase {
         return (process, socketPath)
     }
 
-    private static let defaultConfig: QEMUConfiguration = {
-        var config = QEMUConfiguration()
-        config.enableKVM = false
-        return config
-    }()
+    /// The stock configuration — which now starts on every supported host, so
+    /// there is nothing left to override.
+    private static let defaultConfig = QEMUConfiguration()
 
     // MARK: - Tests
 

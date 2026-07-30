@@ -373,22 +373,27 @@ public final class QEMUProcess: @unchecked Sendable {
         return capture.text
     }
 
-    private func buildArguments(from config: QEMUConfiguration) -> [String] {
+    /// Internal rather than private so the argument list can be asserted on
+    /// directly; the accelerator and CPU model are exactly the kind of thing that
+    /// only fails once a real QEMU rejects it.
+    func buildArguments(from config: QEMUConfiguration) -> [String] {
         var args: [String] = []
-        
+
         // Machine type
         args.append("-machine")
         args.append(config.machineType)
-        
-        // Enable KVM if available and requested
-        if config.enableKVM {
-            args.append("-enable-kvm")
+
+        // Accelerator. `-accel` rather than the legacy `-enable-kvm`, which can
+        // only ever say "kvm" — and said it on macOS, where kvm does not exist.
+        if let accelerator = config.accelerator.qemuName {
+            args.append("-accel")
+            args.append(accelerator)
         }
-        
+
         // CPU configuration
         args.append("-cpu")
-        args.append(config.cpuType)
-        
+        args.append(config.resolvedCPUType)
+
         args.append("-smp")
         args.append("\(config.cpuCount)")
         
@@ -621,13 +626,86 @@ final class StderrCapture: @unchecked Sendable {
 
 // MARK: - Configuration Types
 
+/// Which accelerator QEMU should use, passed as `-accel <name>`.
+///
+/// This is a choice, not a switch: the previous `enableKVM: Bool` could only
+/// name one accelerator, and named it on a platform that has none — the default
+/// configuration died with `invalid accelerator kvm` before QEMU got as far as
+/// opening a disk.
+///
+/// An accelerator is only valid when QEMU was built with it *for the target
+/// being emulated*. On an Apple Silicon host, `qemu-system-aarch64` accepts
+/// `hvf` while `qemu-system-x86_64` does not — verified against QEMU 11.0.2 —
+/// so matching the host OS is not by itself enough to pick one.
+public enum QEMUAccelerator: String, Sendable, CaseIterable {
+    /// Linux hardware acceleration. Requires a matching-architecture target.
+    case kvm
+    /// macOS Hypervisor.framework. Requires a matching-architecture target:
+    /// available to `qemu-system-aarch64` on Apple Silicon and to
+    /// `qemu-system-x86_64` on Intel, but never across the two.
+    case hvf
+    /// Portable software emulation. Works for any target on any host.
+    case tcg
+    /// Emit no `-accel` argument and let QEMU apply its own default. For
+    /// callers that select the accelerator some other way, such as
+    /// `-machine accel=...` through `additionalArgs`.
+    ///
+    /// Deliberately not spelled `none`: it means "unspecified", not "no
+    /// acceleration" — that is `tcg` — and `.none` on a non-optional enum
+    /// collides with `Optional.none` at the use site.
+    case unspecified
+
+    /// Host-native hardware acceleration, for callers whose QEMU target matches
+    /// the host architecture. Not the default — see `QEMUConfiguration.accelerator`.
+    public static var hostNative: QEMUAccelerator {
+        #if os(macOS)
+        return .hvf
+        #else
+        return .kvm
+        #endif
+    }
+
+    /// Whether this accelerator is backed by hardware virtualization, which is
+    /// what decides whether `-cpu host` means anything.
+    public var isHardwareAccelerated: Bool {
+        switch self {
+        case .kvm, .hvf: return true
+        case .tcg, .unspecified: return false
+        }
+    }
+
+    /// The value for `-accel`, or `nil` when the argument should be omitted.
+    var qemuName: String? {
+        self == .unspecified ? nil : rawValue
+    }
+
+    /// A CPU model this accelerator can actually provide. `host` is only
+    /// meaningful under hardware virtualization — under TCG, QEMU rejects it
+    /// outright with `unable to find CPU model 'host'`.
+    var defaultCPUType: String {
+        isHardwareAccelerated ? "host" : "qemu64"
+    }
+}
+
 /// QEMU VM configuration
 public struct QEMUConfiguration: Sendable {
     public var machineType: String = "q35"
-    public var cpuType: String = "host"
+
+    /// CPU model for `-cpu`. `nil` (the default) picks one that suits the
+    /// accelerator — see `resolvedCPUType`.
+    public var cpuType: String?
+
+    /// Accelerator for `-accel`.
+    ///
+    /// Defaults to `tcg` because it is the only value that starts on every
+    /// supported host: `hostNative` is wrong whenever the QEMU target does not
+    /// match the host architecture, which is the out-of-the-box case on Apple
+    /// Silicon with the default `qemu-system-x86_64`. Set `.hostNative` (or
+    /// `.hvf`/`.kvm` outright) once the target and host architectures agree.
+    public var accelerator: QEMUAccelerator = .tcg
+
     public var cpuCount: Int = 1
     public var memoryMB: Int = 1024
-    public var enableKVM: Bool = true
     public var disks: [QEMUDisk] = []
     public var networks: [QEMUNetwork] = []
     public var kernel: String?
@@ -636,7 +714,24 @@ public struct QEMUConfiguration: Sendable {
     public var noGraphic: Bool = true
     public var startPaused: Bool = true
     public var additionalArgs: [String] = []
-    
+
+    /// The CPU model actually passed to `-cpu`: `cpuType` when set, otherwise
+    /// the accelerator's own default.
+    public var resolvedCPUType: String {
+        cpuType ?? accelerator.defaultCPUType
+    }
+
+    /// Compatibility shim for the previous `Bool`.
+    ///
+    /// `true` maps to `kvm` and `false` to `tcg`, which is what QEMU fell back
+    /// to when `-enable-kvm` was absent. Reading it reports only whether the
+    /// accelerator is kvm, so `hvf` reads as `false`.
+    @available(*, deprecated, message: "Use `accelerator` instead: `.kvm` for true, `.tcg` for false. `enableKVM` cannot express `hvf`.")
+    public var enableKVM: Bool {
+        get { accelerator == .kvm }
+        set { accelerator = newValue ? .kvm : .tcg }
+    }
+
     public init() {}
 }
 
