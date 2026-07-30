@@ -1,0 +1,41 @@
+CLAUDE.md
+  s_58ed6ff39bfda3::t_d8e63c72082dbb 45,111-116,214-217,220-223,240
+  s_58ed6ff39bfda3::t_6f7e54955be865 117-121
+  s_58ed6ff39bfda3::t_7cd6a1609e9a0f 147
+Sources/SwiftQEMU/QEMUProcess.swift
+  s_58ed6ff39bfda3::t_d8e63c72082dbb 41-44,51-59,195-215,217,219,223-249,252,255,287,292-303,309-319,356-391,548,559-583,594,617
+  s_58ed6ff39bfda3::t_324ed8b2c1c917 4-12,27-29
+  s_58ed6ff39bfda3::t_f7c5089041ef15 304-308
+Sources/SwiftQEMU/QEMUManager.swift
+  s_58ed6ff39bfda3::t_086d4e6f182a3d 231,235
+  s_58ed6ff39bfda3::t_a5002827e884a1 95,97
+  s_58ed6ff39bfda3::t_d8e63c72082dbb 89-93,96,98,185-187,196-203,226-230,232-234,236-237
+Sources/SwiftQEMU/QMPError.swift
+  s_58ed6ff39bfda3::t_d8e63c72082dbb 17-19,48-50
+Tests/SwiftQEMUTests/QEMUProcessTests.swift
+  s_58ed6ff39bfda3::t_d8e63c72082dbb 280-281,306-322,325-329,332-335,338-354,357-361,364-381,385-386,388-398,403-408,410-411,413-415,420-428,430-508
+  s_58ed6ff39bfda3::t_6ddc7640622cd8 355-356,362-363
+  s_58ed6ff39bfda3::t_c059f7088984e1 399-402
+  s_58ed6ff39bfda3::t_a1abd48e21f32a 409,412,416-419
+  s_58ed6ff39bfda3::t_29af15e62a14cc 323-324,330-331,336-337
+  s_58ed6ff39bfda3::t_ee76fb01e01430 382-384,387
+  s_58ed6ff39bfda3::t_a28877f19f9253 429
+Tests/SwiftQEMUTests/QEMUConfigurationTests.swift
+  s_58ed6ff39bfda3::t_f405f59c69ffd8 150-152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "2ee7253e75411322487395b5a3bda485e27d698b",
+  "prompts": {},
+  "sessions": {
+    "s_58ed6ff39bfda3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e2431922-d239-4aed-9e99-294d9d147757",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
