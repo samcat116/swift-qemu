@@ -1,9 +1,19 @@
 import Foundation
 import Logging
+import Subprocess
 
-// `stop()` and `deinit` send SIGKILL through `kill(2)` — Foundation offers no
-// forced-kill API — so the POSIX layer is imported explicitly rather than relying
-// on Foundation to re-export it.
+// `FilePath`/`FileDescriptor` come from the OS `System` module on Darwin and from
+// swift-system's `SystemPackage` everywhere else. Subprocess selects between them
+// the same way, so its API is spelled in whichever one is available here.
+#if canImport(System)
+import System
+#else
+import SystemPackage
+#endif
+
+// `stop()` and `deinit` send signals through `kill(2)` against the pid
+// `Subprocess` publishes — see `ChildProcess` for why the signalling goes through
+// the pid rather than through `Execution.send(signal:)`.
 #if canImport(Darwin)
 import Darwin
 #elseif canImport(Glibc)
@@ -12,30 +22,35 @@ import Glibc
 
 /// Manages QEMU process lifecycle.
 ///
-/// An `actor` rather than a `@unchecked Sendable` class, because every field here
-/// is mutable and shared across concurrency domains: `start(with:)` writes
-/// `process`, `stderrPipe`, `stderrCapture` and `exitWaiter` from whatever task
-/// launched the VM, while a caller racing that start against a timeout — which is
-/// exactly what `QEMUManager.createVM` does — reads `isRunning` and
-/// `capturedStderr` from another. `StderrCapture` and `ExitWaiter` lock their own
-/// contents, but the fields *referencing* them were unprotected, and the
-/// `@unchecked` annotation was the only reason Swift 6 did not say so.
+/// Built on [swift-subprocess](https://github.com/swiftlang/swift-subprocess)
+/// rather than Foundation's `Process`. Most of what this type used to do was
+/// compensating for `Process`: a `Pipe` that takes QEMU down with it if nobody
+/// drains it, a `terminationHandler` callback bridged by hand into a cancellable
+/// async wait, and three manual `FileHandle` redirections. `Subprocess` streams
+/// stderr as an `AsyncSequence` with no buffer to overflow, returns the
+/// termination status from an `await`, reaps the child itself, and takes the
+/// output destinations as plain file descriptors.
 ///
-/// The two callbacks Foundation invokes on its own queues (the stderr readability
-/// handler and `terminationHandler`) are installed by `nonisolated` helpers, so
-/// they are honestly outside the actor and touch nothing but the locked helper
-/// objects handed to them. `deinit` is likewise outside the actor, and reaches
+/// An `actor` rather than a `@unchecked Sendable` class, because every field here
+/// is mutable and shared across concurrency domains: `start(with:)` writes `child`
+/// and `stderrCapture` from whatever task launched the VM, while a caller racing
+/// that start against a timeout — which is exactly what `QEMUManager.createVM`
+/// does — reads `isRunning` and `capturedStderr` from another.
+///
+/// `Subprocess.run` is scoped: it does not return until the child has exited. It
+/// therefore runs in a detached task that outlives `start(with:)`, and everything
+/// that task and the actor share goes through the internally-locked `ChildProcess`
+/// and `StderrCapture`. Neither is reachable from the actor's isolation domain by
+/// reference alone, which is also what lets `deinit` — outside the actor, reaching
 /// stored properties under the rule that a deinitializing actor has no other
-/// references left to race against — which is also why the on-disk cleanup it
-/// shares with `stop()` lives in `nonisolated static` helpers taking their paths
-/// as arguments.
+/// references left to race against — still take a running child down. That rule
+/// is also why the on-disk cleanup `deinit` shares with `stop()` lives in
+/// `nonisolated static` helpers taking their paths as arguments.
 public actor QEMUProcess {
     private let logger: Logger
-    private var process: Process?
     private let qmpSocketPath: String
-    private var stderrPipe: Pipe?
+    private var child: ChildProcess?
     private var stderrCapture: StderrCapture?
-    private var exitWaiter: ExitWaiter?
 
     /// Private per-instance directory, created with mode `0700`, that holds the QMP
     /// socket and the debug log. See `createInstanceDirectoryIfNeeded()`.
@@ -71,8 +86,8 @@ public actor QEMUProcess {
 
     /// Is the QEMU process running
     public var isRunning: Bool {
-        guard let process = process else { return false }
-        return process.isRunning
+        guard let child = child else { return false }
+        return !child.hasExited
     }
 
     /// PID of the current QEMU process, or `nil` once it has been reaped and
@@ -81,7 +96,7 @@ public actor QEMUProcess {
     /// Worth reporting when termination fails: it is what a caller needs to go
     /// deal with a survivor by hand.
     public var processIdentifier: Int32? {
-        process?.processIdentifier
+        child?.processIdentifier
     }
 
     /// The tail of QEMU's stderr from the most recent run.
@@ -134,12 +149,13 @@ public actor QEMUProcess {
 
     /// Start QEMU process with given configuration.
     ///
-    /// Everything that can go wrong here is a `QMPError`, including the two
-    /// failures that used to escape untranslated: `Process.run()`'s own error
-    /// (now `processLaunchFailed`, which at least names the binary it tried) and
-    /// the `CancellationError` from the socket wait (now `cancelled`).
+    /// Everything that can go wrong here is a `QMPError`, including the failures
+    /// that used to escape untranslated: a spawn that fails (now
+    /// `processLaunchFailed`, which at least names the binary it tried), a
+    /// descriptor that will not open, and the `CancellationError` from the socket
+    /// wait (now `cancelled`).
     public func start(with config: QEMUConfiguration) async throws(QMPError) {
-        guard process == nil || !isRunning else {
+        if let child = child, !child.hasExited {
             throw QMPError.processAlreadyRunning
         }
 
@@ -171,59 +187,54 @@ public actor QEMUProcess {
             "arguments": .array(arguments.map { .string($0) })
         ])
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: qemuPath)
-        process.arguments = arguments
-
-        var logHandle: FileHandle?
-        if shouldLogToFile, let handle = makeLogFile() {
-            // Redirect output to log file for debugging
-            logHandle = handle
-            process.standardOutput = handle
-        } else {
-            // Redirect to /dev/null to prevent pipe buffer overflow
-            // Note: We cannot use Pipe() without actively reading it, as QEMU's output
-            // will fill the buffer and cause the process to crash
-            let devNull = FileHandle(forWritingAtPath: "/dev/null")
-            process.standardOutput = devNull
-            logger.debug("QEMU output redirected to /dev/null")
-        }
-
-        // stderr goes through a pipe that is drained continuously so a fatal argument
-        // error is reportable instead of being lost to /dev/null. See
-        // `installStderrDrain` for why the drain is not optional.
-        let capture = StderrCapture()
-        let pipe = Pipe()
-        process.standardError = pipe
-        self.stderrPipe = pipe
-        self.stderrCapture = capture
-
-        Self.installStderrDrain(on: pipe, capture: capture, tee: logHandle)
-
-        // Redirect stdin to /dev/null to prevent job control issues
-        // When running from a terminal, not setting standardInput causes QEMU to
-        // inherit the TTY stdin, triggering SIGSTOP/SIGTTOU and T (stopped) state.
-        let devNullInput = FileHandle(forReadingAtPath: "/dev/null")
-        process.standardInput = devNullInput
-
-        // Installed before `run()`, which closes the window where a process that
-        // exits immediately terminates before anyone is listening for it.
-        let exitWaiter = ExitWaiter()
-        self.exitWaiter = exitWaiter
-        Self.installExitHandler(on: process, waiter: exitWaiter)
-
-        // Start process
+        // Opening either descriptor is part of getting QEMU off the ground, so an
+        // `Errno` from here is reported the same way a refused spawn is.
+        let output: StandardOutputTarget
+        let standardInput: FileDescriptor
         do {
-            try process.run()
+            output = try openStandardOutput(logToFile: shouldLogToFile)
+
+            // Redirect stdin to /dev/null to prevent job control issues. Inheriting
+            // the TTY triggers SIGSTOP/SIGTTOU and leaves QEMU in T (stopped) state
+            // with an unresponsive QMP socket.
+            standardInput = try FileDescriptor.open("/dev/null", .readOnly)
         } catch {
-            // Nothing will ever write to the pipe, so it would never reach EOF and
-            // never release its reader on its own.
-            detachStderrReader()
             throw QMPError.processLaunchFailed(path: qemuPath, underlying: error)
         }
-        self.process = process
 
-        logger.info("QEMU process started", metadata: ["pid": .stringConvertible(process.processIdentifier)])
+        // stderr is streamed rather than discarded so a fatal argument error is
+        // reportable. `.sequence` has no fixed-size buffer behind it, which is the
+        // hazard the hand-drained `Pipe()` this replaces existed to work around.
+        let capture = StderrCapture()
+        let child = ChildProcess()
+        self.stderrCapture = capture
+        self.child = child
+
+        // Detached because `Subprocess.run` returns only once the child has exited,
+        // and `start(with:)` must return with QEMU alive. Nothing here captures the
+        // actor: the task and the actor meet only in `ChildProcess`/`StderrCapture`.
+        Task.detached { [qemuPath, logger] in
+            await Self.runQEMU(
+                qemuPath: qemuPath,
+                arguments: arguments,
+                standardInput: standardInput,
+                output: output,
+                capture: capture,
+                child: child,
+                logger: logger
+            )
+        }
+
+        // A spawn that never happened surfaces here, carrying whatever `Subprocess`
+        // said about it — a missing binary, a fork that failed. That error used to
+        // propagate raw, with nothing to say it came from launching QEMU.
+        let pid: pid_t
+        do {
+            pid = try await child.waitForSpawn()
+        } catch {
+            throw QMPError.processLaunchFailed(path: qemuPath, underlying: error)
+        }
+        logger.info("QEMU process started", metadata: ["pid": .stringConvertible(pid)])
 
         // Wait for QMP socket to be ready with retry
         var retries = 0
@@ -240,8 +251,8 @@ public actor QEMUProcess {
             // QEMU rejects a bad argument by exiting immediately. Without this check the
             // real reason sits in stderr while the caller waits out the full socket
             // timeout and sees only a connection failure.
-            if !process.isRunning {
-                throw await processExitedError(process)
+            if child.hasExited {
+                throw await processExitedError(child)
             }
 
             // Wait and retry
@@ -251,14 +262,127 @@ public actor QEMUProcess {
 
         // After all retries, check if socket was created
         if !FileManager.default.fileExists(atPath: qmpSocketPath) {
-            if !process.isRunning {
-                throw await processExitedError(process)
+            if child.hasExited {
+                throw await processExitedError(child)
             }
             logger.error("QMP socket not created after \(maxRetries) retries", metadata: [
                 "path": .string(qmpSocketPath),
                 "stderr": .string(capture.text.isEmpty ? "<empty>" : capture.text)
             ])
             throw QMPError.socketCreationFailed
+        }
+    }
+
+    /// Where QEMU's stdout goes, and — when log files are enabled — the parent's
+    /// own descriptor on the same file so stderr can be teed into it.
+    ///
+    /// The child's descriptor is a `dup` rather than a second `open` so the two
+    /// share a file offset, which is what keeps the teed stderr interleaved with
+    /// stdout instead of overwriting it.
+    ///
+    /// Falls back to /dev/null if the log file cannot be opened, rather than
+    /// handing QEMU nothing to write to.
+    private func openStandardOutput(logToFile: Bool) throws -> StandardOutputTarget {
+        if logToFile, let logFile = makeLogFile() {
+            if let childDescriptor = try? logFile.duplicate() {
+                return StandardOutputTarget(childDescriptor: childDescriptor, logFile: logFile)
+            }
+            // Nothing will be written to it, so do not claim it as this run's log.
+            try? logFile.close()
+            logFilePath = nil
+        }
+
+        logger.debug("QEMU output redirected to /dev/null")
+        return StandardOutputTarget(
+            childDescriptor: try FileDescriptor.open("/dev/null", .writeOnly),
+            logFile: nil
+        )
+    }
+
+    /// Open this run's debug log inside the private directory, or `nil` if it could
+    /// not be created.
+    ///
+    /// Named per run, not per instance, so restarting a `QEMUProcess` does not
+    /// overwrite the log of the run being diagnosed. Mode `0600` for the same
+    /// reason the directory around it is `0700`: with `-nographic` this file is the
+    /// guest console.
+    private func makeLogFile() -> FileDescriptor? {
+        let path = instanceDirectory + "/qemu-\(Self.pathToken()).log"
+
+        guard let descriptor = try? FileDescriptor.open(
+            path,
+            .writeOnly,
+            options: [.create, .exclusiveCreate],
+            permissions: [.ownerRead, .ownerWrite]
+        ) else {
+            logger.warning("Could not create QEMU log file, falling back to /dev/null", metadata: [
+                "path": .string(path)
+            ])
+            return nil
+        }
+
+        logFilePath = path
+        logger.info("QEMU output redirected to: \(path)")
+        return descriptor
+    }
+
+    /// Run QEMU to completion, publishing everything the actor needs as it goes.
+    ///
+    /// `nonisolated static` so it cannot reach the actor by accident: the detached
+    /// task that calls this outlives `start(with:)`, and its only channels back are
+    /// the two locked helpers passed in.
+    private nonisolated static func runQEMU(
+        qemuPath: String,
+        arguments: [String],
+        standardInput: FileDescriptor,
+        output: StandardOutputTarget,
+        capture: StderrCapture,
+        child: ChildProcess,
+        logger: Logger
+    ) async {
+        defer { try? output.logFile?.close() }
+
+        do {
+            let result = try await Subprocess.run(
+                .path(FilePath(qemuPath)),
+                arguments: Arguments(arguments),
+                input: .fileDescriptor(standardInput, closeAfterSpawningProcess: true),
+                output: .fileDescriptor(output.childDescriptor, closeAfterSpawningProcess: true),
+                error: .sequence
+            ) { execution in
+                child.didSpawn(pid: execution.processIdentifier.value)
+
+                do {
+                    for try await buffer in execution.standardError {
+                        let data = buffer.withUnsafeBytes { Data($0) }
+                        capture.append(data)
+                        if let logFile = output.logFile {
+                            _ = try? logFile.writeAll(data)
+                        }
+                    }
+                } catch {
+                    // `run` cancels in-flight reads when the child exits while the
+                    // stream is still open. That ends the stream; it does not
+                    // discard anything already appended.
+                    logger.trace("QEMU stderr stream ended with \(error)")
+                }
+
+                // The child has closed stderr, which `run` guarantees happens
+                // before it reaps the pid. See `ChildProcess.signal(_:)`.
+                child.stderrDidClose()
+                capture.markEOF()
+            }
+
+            child.didExit(status: result.terminationStatus)
+        } catch {
+            // Either the spawn failed outright — a missing or non-executable QEMU
+            // binary — or the run itself did. Both leave `start(with:)` waiting.
+            logger.error("QEMU process failed to run", metadata: [
+                "path": .string(qemuPath),
+                "error": .string("\(error)")
+            ])
+            capture.markEOF()
+            child.didFail(error)
         }
     }
 
@@ -282,34 +406,38 @@ public actor QEMUProcess {
     /// - Parameter timeout: how long to wait for the child to honour SIGTERM before
     ///   escalating to SIGKILL. The same budget applies to the wait after SIGKILL.
     public func stop(timeout: Duration = QEMUProcess.defaultTerminationTimeout) async {
-        guard let process = process else {
+        guard let child = child else {
             logger.debug("QEMU process not running, nothing to stop")
-            // A start that failed before `run()` still leaves the pipe behind.
-            detachStderrReader()
             removeRuntimeFiles()
             return
         }
 
-        if process.isRunning {
+        if !child.hasExited {
+            // `start(with:)` publishes the child before the spawn completes, so a
+            // stop that interleaves with a start can arrive before there is a pid
+            // to signal. Settling that first is what stops the SIGTERM being
+            // dropped on the floor and the escalation running against nothing.
+            _ = try? await child.waitForSpawn()
+
             logger.info("Stopping QEMU process", metadata: [
-                "pid": .stringConvertible(process.processIdentifier)
+                "pid": .stringConvertible(child.processIdentifier ?? -1)
             ])
 
-            process.terminate()
+            child.signal(SIGTERM)
 
-            if await waitForExit(timeout: timeout) == false {
+            if await child.waitForExit(timeout: timeout) == false {
                 logger.warning("QEMU ignored SIGTERM, escalating to SIGKILL", metadata: [
-                    "pid": .stringConvertible(process.processIdentifier),
+                    "pid": .stringConvertible(child.processIdentifier ?? -1),
                     "timeout": .string("\(timeout)")
                 ])
 
-                // No Foundation API forces a kill, and `destroy()` is documented as
-                // a force quit — a wedged or stopped QEMU has to actually die.
-                kill(process.processIdentifier, SIGKILL)
+                // `destroy()` is documented as a force quit — a wedged or stopped
+                // QEMU has to actually die.
+                child.signal(SIGKILL)
 
-                if await waitForExit(timeout: timeout) == false {
+                if await child.waitForExit(timeout: timeout) == false {
                     logger.error("QEMU process survived SIGKILL", metadata: [
-                        "pid": .stringConvertible(process.processIdentifier)
+                        "pid": .stringConvertible(child.processIdentifier ?? -1)
                     ])
                     return
                 }
@@ -318,10 +446,8 @@ public actor QEMUProcess {
             logger.debug("QEMU process already exited, cleaning up")
         }
 
-        self.process = nil
-        self.exitWaiter = nil
+        self.child = nil
 
-        detachStderrReader()
         removeRuntimeFiles()
 
         logger.info("QEMU process stopped")
@@ -348,13 +474,13 @@ public actor QEMUProcess {
     /// Returns immediately if the process has already exited, and throws
     /// `QMPError.cancelled` if the waiting task is cancelled.
     public func waitUntilExit() async throws(QMPError) {
-        guard let process = process, let exitWaiter = exitWaiter else {
+        guard let child = child else {
             throw QMPError.processNotRunning
         }
 
-        guard process.isRunning else { return }
+        guard !child.hasExited else { return }
 
-        await exitWaiter.waitForExit()
+        await child.waitForExit()
 
         guard !Task.isCancelled else { throw QMPError.cancelled }
     }
@@ -364,8 +490,8 @@ public actor QEMUProcess {
     /// Last-ditch cleanup for a `QEMUProcess` that is dropped without `stop()`.
     ///
     /// Without this, releasing a `QEMUProcess` (or the `QEMUManager` holding one)
-    /// left QEMU running for the lifetime of the host process — Foundation's
-    /// `Process` does not take its child down when it goes away.
+    /// left QEMU running for the lifetime of the host process — neither Foundation's
+    /// `Process` nor `Subprocess` takes the child down when the owner goes away.
     ///
     /// `deinit` cannot await, so there is no graceful shutdown to be had here and
     /// no exit to confirm: SIGKILL is the only honest option. Callers that want the
@@ -375,15 +501,16 @@ public actor QEMUProcess {
     /// An actor's `deinit` is not isolated, and reaches the stored properties below
     /// only under the language's exception for a deinitializing actor — by then no
     /// other reference exists to race against. Keep this to *stored* properties:
-    /// `isRunning` or any other computed member or method would not compile here.
+    /// `isRunning` or any other computed member of `self` would not compile here.
+    /// `child` is a separate object, so calling into it is fine — and it has to be,
+    /// because the detached task running QEMU holds the only other reference to it
+    /// and will happily outlive this actor.
     deinit {
-        stderrPipe?.fileHandleForReading.readabilityHandler = nil
-
-        if let process = process, process.isRunning {
+        if let child = child, let pid = child.signallablePID {
             logger.warning("QEMUProcess released while QEMU was still running; killing it", metadata: [
-                "pid": .stringConvertible(process.processIdentifier)
+                "pid": .stringConvertible(pid)
             ])
-            kill(process.processIdentifier, SIGKILL)
+            kill(pid, SIGKILL)
         }
 
         // Spelled out rather than folded into one `&&`: the short-circuit makes the
@@ -403,72 +530,7 @@ public actor QEMUProcess {
         )
     }
 
-    // MARK: - Off-actor callbacks
-
-    /// Install the pipe drain. Foundation invokes the handler on its own queue, so
-    /// it is deliberately formed outside the actor and closes over nothing but the
-    /// internally-locked `StderrCapture` and the tee handle.
-    ///
-    /// The drain is what makes the pipe safe: an unread pipe fills its 64KB buffer
-    /// and takes QEMU down with it, and `StderrCapture` retains only the tail.
-    private nonisolated static func installStderrDrain(
-        on pipe: Pipe,
-        capture: StderrCapture,
-        tee teeHandle: FileHandle?
-    ) {
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                capture.markEOF()
-                return
-            }
-            capture.append(data)
-            if let teeHandle = teeHandle {
-                try? teeHandle.write(contentsOf: data)
-            }
-        }
-    }
-
-    /// Install the termination handler. Also called on a Foundation queue, and also
-    /// closing over only a self-locking helper.
-    private nonisolated static func installExitHandler(on process: Process, waiter: ExitWaiter) {
-        process.terminationHandler = { _ in waiter.processDidExit() }
-    }
-
     // MARK: - Private Methods
-
-    /// Wait up to `timeout` for the child to exit. Reports whether it did.
-    ///
-    /// Deliberately not cancellable, unlike `waitUntilExit()`. Teardown must not be
-    /// abandonable half-done: a cancelled wait would hand `stop()` a `false` it had
-    /// not earned, so it would escalate to SIGKILL — or give up and clear `process`
-    /// and the socket file — without ever having confirmed anything. The wait
-    /// therefore runs in a detached task, which the caller's cancellation cannot
-    /// reach.
-    private func waitForExit(timeout: Duration) async -> Bool {
-        guard let process = process else { return true }
-        guard let exitWaiter = exitWaiter else { return !process.isRunning }
-        guard process.isRunning else { return true }
-
-        let budget = max(.zero, timeout)
-        await Task.detached {
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { try? await Task.sleep(for: budget) }
-                group.addTask { await exitWaiter.waitForExit() }
-
-                // Whichever lands first ends the wait; the other returns on
-                // cancellation, so leaving this scope cannot block.
-                await group.next()
-                group.cancelAll()
-            }
-        }.value
-
-        // `hasExited` is the authoritative answer — it is set by the termination
-        // handler — and is checked first so a lagging `isRunning` cannot provoke a
-        // pointless SIGKILL at a pid that has already been reaped.
-        return exitWaiter.hasExited || !process.isRunning
-    }
 
     /// Create the private directory that holds the QMP socket and the debug log.
     ///
@@ -509,31 +571,6 @@ public actor QEMUProcess {
         logger.debug("Created private QEMU runtime directory", metadata: [
             "path": .string(instanceDirectory)
         ])
-    }
-
-    /// Open this run's debug log inside the private directory, or `nil` if it could
-    /// not be created — in which case the caller falls back to `/dev/null` rather
-    /// than handing QEMU a nil stdout.
-    ///
-    /// Named per run, not per instance, so restarting a `QEMUProcess` does not
-    /// overwrite the log of the run being diagnosed.
-    private func makeLogFile() -> FileHandle? {
-        let path = instanceDirectory + "/qemu-\(Self.pathToken()).log"
-
-        guard FileManager.default.createFile(
-            atPath: path,
-            contents: nil,
-            attributes: [.posixPermissions: 0o600]
-        ), let handle = FileHandle(forWritingAtPath: path) else {
-            logger.warning("Could not create QEMU log file, falling back to /dev/null", metadata: [
-                "path": .string(path)
-            ])
-            return nil
-        }
-
-        logFilePath = path
-        logger.info("QEMU output redirected to: \(path)")
-        return handle
     }
 
     /// Remove what this run left on disk: the socket, and the private directory
@@ -598,32 +635,37 @@ public actor QEMUProcess {
         }
     }
 
-    /// Release the pipe and its reader. The `StderrCapture` is deliberately kept so
-    /// callers can still read stderr after a failed start.
-    private func detachStderrReader() {
-        stderrPipe?.fileHandleForReading.readabilityHandler = nil
-        stderrCapture?.markEOF()
-        stderrPipe = nil
-    }
-
     /// Build the error for a QEMU process that died before the QMP socket appeared,
     /// logging the exit status alongside whatever it wrote to stderr.
-    private func processExitedError(_ process: Process) async -> QMPError {
+    private func processExitedError(_ child: ChildProcess) async -> QMPError {
         let stderr = await drainedStderr()
-        let status = process.terminationStatus
-        let killedBySignal = process.terminationReason == .uncaughtSignal
+        let exitCode: Int32
+        let killedBySignal: Bool
+
+        switch child.terminationStatus {
+        case .exited(let code):
+            exitCode = code
+            killedBySignal = false
+        case .signaled(let signalNumber):
+            exitCode = signalNumber
+            killedBySignal = true
+        case nil:
+            // The run failed rather than the child exiting — a missing binary, say.
+            exitCode = -1
+            killedBySignal = false
+        }
 
         logger.error("QEMU process exited before the QMP socket was ready", metadata: [
-            "exitCode": .stringConvertible(status),
+            "exitCode": .stringConvertible(exitCode),
             "terminationReason": .string(killedBySignal ? "uncaughtSignal" : "exit"),
             "stderr": .string(stderr.isEmpty ? "<empty>" : stderr)
         ])
 
-        return .processExited(exitCode: status, killedBySignal: killedBySignal, stderr: stderr)
+        return .processExited(exitCode: exitCode, killedBySignal: killedBySignal, stderr: stderr)
     }
 
-    /// Wait briefly for the reader to pick up whatever QEMU wrote on its way out —
-    /// the process can be reaped before the last chunk reaches the readability handler.
+    /// Wait briefly for the drain to pick up whatever QEMU wrote on its way out —
+    /// the last chunk can still be in flight when the exit is reported.
     ///
     /// Timed on `ContinuousClock`, not on `Date()`: this is a sub-second deadline,
     /// and wall-clock time can be stepped by NTP or a clock change while it runs.
@@ -762,10 +804,207 @@ public actor QEMUProcess {
     }
 }
 
+// MARK: - Standard Output Target
+
+/// Where a launched QEMU's stdout goes.
+///
+/// `childDescriptor` is handed to `Subprocess`, which closes it once the child
+/// has been spawned. `logFile` is the parent's own handle on the same file, kept
+/// open so stderr can be teed into it, and closed when the run finishes. It is
+/// `nil` when output is going to /dev/null, where there is nothing to tee into.
+struct StandardOutputTarget: Sendable {
+    let childDescriptor: FileDescriptor
+    let logFile: FileDescriptor?
+}
+
+// MARK: - Child Process
+
+/// One launched QEMU child, and the whole of the handshake between the detached
+/// task running `Subprocess.run` and the `QEMUProcess` actor that owns it.
+///
+/// `Subprocess` scopes its `Execution` — and with it `send(signal:)` and
+/// `teardown(using:)` — to the body closure of `run`, on the assumption that a
+/// caller wants the child's lifetime bounded by a scope. `QEMUProcess` promises
+/// the opposite: `start(with:)` returns with QEMU alive and `stop()` arrives later
+/// from an unrelated call. Signalling therefore goes through the pid published
+/// here rather than through `Execution`, which is safe for one specific reason:
+/// `run` does not reap the child until it has exited, so nothing can recycle the
+/// pid while it is still in this box. `signal(_:)` additionally refuses once the
+/// child has closed stderr, which `run` guarantees to observe *before* it reaps —
+/// so the one window where the pid could go stale is also the one window in which
+/// this will not use it.
+///
+/// Locked rather than isolated because both sides need it synchronously: the
+/// run task publishes from inside `run`'s body, and `deinit` reads it from
+/// outside any `await`.
+final class ChildProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pid: pid_t?
+    private var stderrOpen = true
+    private var exited = false
+    private var status: TerminationStatus?
+    private var failure: (any Error)?
+    private var spawnWaiters: [CheckedContinuation<pid_t, any Error>] = []
+
+    /// Fires once the run has finished, one way or another.
+    private let exitWaiter = ExitWaiter()
+
+    /// Whether the child is gone. Authoritative: it is set from the run task after
+    /// `Subprocess.run` has reaped the child, so it cannot report an exit that has
+    /// not happened, nor lag behind one that has.
+    var hasExited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exited
+    }
+
+    /// The pid, for as long as there is one to report.
+    var processIdentifier: pid_t? {
+        lock.lock()
+        defer { lock.unlock() }
+        return pid
+    }
+
+    /// How the child ended, or `nil` if it has not ended or never started.
+    var terminationStatus: TerminationStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return status
+    }
+
+    /// The pid, but only while sending it a signal is still known to be safe.
+    /// See the type's documentation for what makes that window the right one.
+    var signallablePID: pid_t? {
+        lock.lock()
+        defer { lock.unlock() }
+        return (stderrOpen && !exited) ? pid : nil
+    }
+
+    // MARK: Published by the run task
+
+    func didSpawn(pid: pid_t) {
+        lock.lock()
+        self.pid = pid
+        let waiters = spawnWaiters
+        spawnWaiters.removeAll()
+        lock.unlock()
+
+        for waiter in waiters { waiter.resume(returning: pid) }
+    }
+
+    func stderrDidClose() {
+        lock.lock()
+        stderrOpen = false
+        lock.unlock()
+    }
+
+    func didExit(status: TerminationStatus) {
+        finish { $0.status = status }
+    }
+
+    func didFail(_ error: any Error) {
+        finish { $0.failure = error }
+    }
+
+    /// Latch the end of the run and release everyone waiting on it. A spawn waiter
+    /// that is still parked here never saw a pid, so a failed spawn is its error to
+    /// throw — that is how `start(with:)` reports a QEMU binary that will not run.
+    private func finish(_ record: (ChildProcess) -> Void) {
+        lock.lock()
+        record(self)
+        exited = true
+        stderrOpen = false
+        let waiters = spawnWaiters
+        let pid = self.pid
+        let failure = self.failure
+        spawnWaiters.removeAll()
+        lock.unlock()
+
+        for waiter in waiters {
+            if let pid = pid {
+                waiter.resume(returning: pid)
+            } else {
+                waiter.resume(throwing: failure ?? QMPError.processNotRunning)
+            }
+        }
+
+        exitWaiter.processDidExit()
+    }
+
+    // MARK: Awaited by the actor
+
+    /// Wait for the child to be spawned, or for the attempt to fail.
+    ///
+    /// Deliberately not cancellable: this covers only the spawn itself, and a
+    /// caller that abandoned it would leave `start(with:)` without the pid of a
+    /// child that is by then already running.
+    func waitForSpawn() async throws -> pid_t {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if let pid = pid {
+                lock.unlock()
+                continuation.resume(returning: pid)
+                return
+            }
+            if let failure = failure {
+                lock.unlock()
+                continuation.resume(throwing: failure)
+                return
+            }
+            spawnWaiters.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    /// Park until the child exits, returning early if the calling task is cancelled.
+    func waitForExit() async {
+        await exitWaiter.waitForExit()
+    }
+
+    /// Wait up to `timeout` for the child to exit. Reports whether it did.
+    ///
+    /// Deliberately not cancellable, unlike `QEMUProcess.waitUntilExit()`. Teardown
+    /// must not be abandonable half-done: a cancelled wait would hand `stop()` a
+    /// `false` it had not earned, so it would escalate to SIGKILL — or give up and
+    /// clear the child and the socket file — without ever having confirmed
+    /// anything. The wait therefore runs in a detached task, which the caller's
+    /// cancellation cannot reach.
+    func waitForExit(timeout: Duration) async -> Bool {
+        if hasExited { return true }
+
+        let budget = max(.zero, timeout)
+        let exitWaiter = self.exitWaiter
+        await Task.detached {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { try? await Task.sleep(for: budget) }
+                group.addTask { await exitWaiter.waitForExit() }
+
+                // Whichever lands first ends the wait; the other returns on
+                // cancellation, so leaving this scope cannot block.
+                await group.next()
+                group.cancelAll()
+            }
+        }.value
+
+        return hasExited
+    }
+
+    // MARK: Signalling
+
+    /// Send `signalNumber` to the child. Reports whether it was delivered — `false`
+    /// means there was no pid it was still safe to signal, which for `stop()` is
+    /// the same situation as a child that has already gone.
+    @discardableResult
+    func signal(_ signalNumber: Int32) -> Bool {
+        guard let pid = signallablePID else { return false }
+        return kill(pid, signalNumber) == 0
+    }
+}
+
 // MARK: - Exit Waiter
 
-/// Parking spot for the child process's exit, shared by every caller of
-/// `waitUntilExit()`.
+/// Parking spot for the end of the run, shared by every caller of
+/// `waitUntilExit()` and by `stop()`'s bounded waits.
 ///
 /// Three orderings have to work, and each one used to be a hang:
 /// the exit landing before anyone waits (latched by `exited`), several
@@ -780,14 +1019,6 @@ final class ExitWaiter: @unchecked Sendable {
     private var cancelledTokens: Set<UInt64> = []
     private var lastToken: UInt64 = 0
     private var exited = false
-
-    /// Whether the termination handler has fired. Authoritative, and unlike
-    /// `Process.isRunning` it cannot lag behind the exit it reports.
-    var hasExited: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return exited
-    }
 
     /// Park until the process exits, returning early if the calling task is
     /// cancelled.
@@ -859,10 +1090,10 @@ final class ExitWaiter: @unchecked Sendable {
 
 /// Bounded, thread-safe tail buffer for a child process's stderr.
 ///
-/// Written from the pipe's readability handler and read from the caller, so all
-/// access is under a lock. Only the most recent `maxBytes` are retained — QEMU's
-/// fatal errors are the last thing it prints, and an unbounded buffer would just
-/// move the memory problem instead of solving it.
+/// Written from the task draining `Subprocess`'s stderr sequence and read from
+/// the caller, so all access is under a lock. Only the most recent `maxBytes` are
+/// retained — QEMU's fatal errors are the last thing it prints, and an unbounded
+/// buffer would just move the memory problem instead of solving it.
 final class StderrCapture: @unchecked Sendable {
     private let maxBytes: Int
     private let lock = NSLock()

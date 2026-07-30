@@ -6,10 +6,10 @@ import Foundation
 /// of the public API is `throws(QMPError)`, so a caller's `switch` over these
 /// cases is one the compiler can check for exhaustiveness. That is why the
 /// cases below include ones that only wrap somebody else's error —
-/// `processLaunchFailed`, `connectionFailed`, `underlying`. A raw `NSError` from
-/// `Process.run()` used to reach callers with nothing to say it came from
-/// spawning QEMU; now the case it arrives in says so, and the original is still
-/// attached.
+/// `processLaunchFailed`, `connectionFailed`, `underlying`. A failed spawn used
+/// to reach callers as whatever the process layer threw, with nothing to say it
+/// came from launching QEMU; now the case it arrives in says so, and the
+/// original is still attached.
 public enum QMPError: Error, LocalizedError, Sendable {
     case notConnected
     case connectionLost
@@ -56,9 +56,11 @@ public enum QMPError: Error, LocalizedError, Sendable {
     /// error that names the rejected JSON member rather than the missing
     /// capability, so this is caught before it goes out.
     case capabilityNotNegotiated(QMPCapability)
-    /// QEMU could not be spawned at all: the binary is missing, is not
-    /// executable, or the fork failed. Carries `Process.run()`'s own error,
-    /// which used to propagate raw with nothing to say where it came from.
+    /// QEMU could not be launched at all: the binary is missing, is not
+    /// executable, the fork failed, or one of the child's own descriptors would
+    /// not open. Carries the underlying error — a `Subprocess` failure or an
+    /// `Errno` — which used to propagate raw with nothing to say where it came
+    /// from.
     case processLaunchFailed(path: String, underlying: any Error)
     /// The private `0700` directory that holds the QMP socket could not be
     /// created, so there is nowhere safe to put it.
