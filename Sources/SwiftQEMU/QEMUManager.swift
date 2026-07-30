@@ -35,12 +35,23 @@ public actor QEMUManager {
         qmpClient.negotiatedCapabilities
     }
 
+    /// - Parameters:
+    ///   - qemuPath: The QEMU binary to run.
+    ///   - runtimeDirectory: Base directory for the private, `0700` per-VM
+    ///     directory holding the QMP socket. Defaults to `NSTemporaryDirectory()`;
+    ///     pass something like `XDG_RUNTIME_DIR` to place it elsewhere. Note that
+    ///     a unix socket path is limited to about 100 bytes in total.
     public init(
         qemuPath: String = "/usr/bin/qemu-system-x86_64",
+        runtimeDirectory: String? = nil,
         logger: Logger = Logger(label: "SwiftQEMU.QEMUManager")
     ) {
         self.logger = logger
-        self.process = QEMUProcess(qemuPath: qemuPath, logger: logger)
+        self.process = QEMUProcess(
+            qemuPath: qemuPath,
+            runtimeDirectory: runtimeDirectory,
+            logger: logger
+        )
         self.qmpClient = QMPClient(logger: logger)
     }
     

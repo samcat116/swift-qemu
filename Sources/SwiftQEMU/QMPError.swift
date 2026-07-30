@@ -20,6 +20,10 @@ public enum QMPError: Error, LocalizedError {
     /// A single inbound QMP frame exceeded the configured maximum, so the connection
     /// was dropped rather than buffered further. Carries the limit in bytes.
     case frameTooLarge(limit: Int)
+    /// The QMP socket path does not fit in `sockaddr_un.sun_path` (104 bytes on
+    /// Darwin, 108 on Linux). QEMU would fail to bind, which reaches a caller only
+    /// as a socket that never appears.
+    case socketPathTooLong(path: String, limit: Int)
     /// There was nowhere to hot-plug the device: the machine type refuses hot-plug
     /// on its default bus and no free `pcie-root-port` was left to target. Thrown
     /// before anything is sent to QEMU, and names the configuration knob that fixes
@@ -68,6 +72,11 @@ public enum QMPError: Error, LocalizedError {
             return "QEMU \(which) is still running after SIGTERM and SIGKILL"
         case .frameTooLarge(let limit):
             return "A QMP message exceeded the \(limit) byte frame limit; the connection was closed"
+        case .socketPathTooLong(let path, let limit):
+            return """
+            QMP socket path is \(path.utf8.count) bytes, over the \(limit)-byte \
+            limit for a unix socket: \(path)
+            """
         case .noHotplugPortAvailable(let machineType, let portCount, let inUse):
             guard portCount > 0 else {
                 return """

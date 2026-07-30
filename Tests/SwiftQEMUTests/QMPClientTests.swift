@@ -1077,12 +1077,13 @@ final class QMPClientTests: XCTestCase {
             throw XCTSkip("qemu-system-x86_64 not installed")
         }
 
-        let socketPath = NSTemporaryDirectory() + "qmp-oob-\(UUID().uuidString).sock"
-        let process = QEMUProcess(qemuPath: qemuPath, qmpSocketPath: socketPath, logger: Logger(label: "test"))
-        addTeardownBlock {
-            await process.stop()
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
+        // The socket path is left to `QEMUProcess`, which puts it in a private
+        // directory and keeps it inside `sun_path`'s ~104 bytes. A hand-built
+        // `NSTemporaryDirectory() + UUID` path is about 100 of those on macOS —
+        // close enough to the limit to be worth not doing.
+        let process = QEMUProcess(qemuPath: qemuPath, logger: Logger(label: "test"))
+        let socketPath = process.getQMPSocketPath()
+        addTeardownBlock { await process.stop() }
 
         var config = QEMUConfiguration()
         config.memoryMB = 128
