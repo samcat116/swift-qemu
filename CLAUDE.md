@@ -100,11 +100,16 @@ The codebase includes critical fixes for production reliability:
 
 9. **Cancellable Exit Wait**: `waitUntilExit()` is cancellation-aware. Parked on a bare `withCheckedContinuation` around `terminationHandler` it ignored cancellation, so when `shutdown()`'s timeout leg won, the task group's implicit drain waited forever on it — a shutdown that hung *past its own timeout*, never reaching the forced termination meant to follow. `ExitWaiter` handles the three orderings that each used to hang: exit before anyone waits, several waiters at once, and cancellation arriving before a waiter parks. `shutdown(timeout:)` is now configurable.
 
+10. **Accelerator Selection**: `enableKVM: Bool` defaulted to `true` and emitted `-enable-kvm`, so the stock configuration could not start on the only platform `Package.swift` declares — QEMU exits with `invalid accelerator kvm`. A Bool cannot express the choice; `QEMUAccelerator` (`.kvm`/`.hvf`/`.tcg`/`.unspecified`) does, emitted as `-accel <name>`.
+    - **The default is `.tcg`, not the host-native accelerator.** An accelerator has to be built into QEMU *for the target being emulated*, not merely available on the host: on Apple Silicon, `qemu-system-x86_64 -accel hvf` fails with `invalid accelerator hvf` while `qemu-system-aarch64` accepts it (verified on QEMU 11.0.2). Since `qemuPath` defaults to `qemu-system-x86_64`, an `hvf` default would have reproduced the same out-of-the-box failure it was meant to fix. `QEMUAccelerator.hostNative` is there for callers whose target matches the host
+    - `cpuType` is now `String?`. `host` only means something under hardware virtualization — under TCG, QEMU answers `unable to find CPU model 'host'` — so `resolvedCPUType` supplies `host` for kvm/hvf and `qemu64` otherwise. An explicit `cpuType` always wins
+    - `.unspecified` emits no `-accel` at all, for callers configuring it through `-machine accel=...` in `additionalArgs`
+    - `enableKVM` remains as a deprecated shim: `true` → `.kvm`, `false` → `.tcg` (what QEMU fell back to when the flag was absent). It cannot represent `hvf`, and reads `false` for it
+
 ### Known Gaps
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
-- **`enableKVM` defaults to `true`** while `Package.swift` declares macOS only, so the default configuration fails with `invalid accelerator kvm`. The accelerator wants to be an enum (`.kvm`/`.hvf`/`.tcg`) rather than a Bool, with `hvf` on macOS. `cpuType = "host"` has the same problem without an accelerator
 - **`stop()` neither waits nor escalates**: `terminate()` (SIGTERM) is followed immediately by `process = nil`, so `isRunning` reports false while QEMU may still be alive, the socket file is removed under a live process, the child is never reaped, and there is no SIGKILL escalation. There is also no `deinit`, so dropping a manager leaks a running VM
 - **`QEMUProcess` is `@unchecked Sendable` and genuinely raced**: `createVM` mutates its state from a task-group child while the actor's failure path reads `capturedStderr`/`isRunning`. Making it an `actor` would remove the class of bug
 - **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
@@ -115,8 +120,9 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 ### Configuration Types
 
 **QEMUConfiguration**: Main VM configuration
-- Machine type, CPU type/count, memory
-- KVM acceleration support
+- Machine type, CPU count, memory
+- **Accelerator** (`QEMUAccelerator`: `.kvm`/`.hvf`/`.tcg`/`.unspecified`), emitted as `-accel <name>`. Defaults to `.tcg` — see Accelerator Selection below. `enableKVM` survives only as a deprecated shim (`true` → `.kvm`, `false` → `.tcg`)
+- `cpuType` is optional; when `nil` it resolves from the accelerator (`host` under kvm/hvf, `qemu64` otherwise) via `resolvedCPUType`
 - Disks (QEMUDisk): path, format (qcow2/raw), interface (virtio/ide)
 - Networks (QEMUNetwork): backend (user/tap/bridge), model (virtio-net-pci)
 - Kernel, initrd, and kernel arguments for direct kernel boot
@@ -153,9 +159,12 @@ Tests in SwiftQEMUTests primarily cover protocol encoding/decoding. Integration 
 # Verify QEMU is installed
 which qemu-system-x86_64
 
-# Check for KVM support (optional but recommended)
-kvm-ok  # On Linux
+# List the accelerators this binary was actually built with — the check that
+# matters, since availability is per-target, not per-host
+qemu-system-x86_64 -accel help
 ```
+
+`QEMUConfigurationTests.testDefaultConfigurationStartsRealQEMU` starts a real QEMU with the stock configuration when one is installed, and skips otherwise. It is the only test that can confirm the accelerator and CPU model are actually accepted.
 
 ### QMP Socket Debugging
 
@@ -175,7 +184,9 @@ var config = QEMUConfiguration()
 config.memoryMB = 2048
 config.cpuCount = 2
 config.disks.append(QEMUDisk(path: "/path/to/disk.qcow2"))
-config.enableKVM = false  // Required on macOS; see Known Gaps
+// Accelerator defaults to .tcg, which starts anywhere. For hardware
+// acceleration, match the QEMU target to the host architecture first:
+// config.accelerator = .hostNative  // .hvf on macOS, .kvm on Linux
 
 // Create VM (starts QEMU process in paused state by default)
 // Optional timeout parameter (default 30 seconds)
