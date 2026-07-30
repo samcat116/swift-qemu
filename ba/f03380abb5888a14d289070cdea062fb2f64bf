@@ -1,0 +1,60 @@
+Tests/SwiftQEMUTests/QEMUVMStatusTests.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 75-120,128,155-222
+Sources/SwiftQEMU/QMPProtocol.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 30-37,39-44,48-75,79-99,227-231,249-250,255-285
+  s_a12ff1fa509e14::t_ca9aa9652940ef 286-287
+Sources/SwiftQEMU/QMPEventBroadcaster.swift
+  s_a12ff1fa509e14::t_a0f6720372cc68 1-41,43-76
+  s_a12ff1fa509e14::t_31fd7ad02820e4 42
+Sources/SwiftQEMU/QMPConnection.swift
+  s_a12ff1fa509e14::t_50a016c13acdea 250-254
+  s_a12ff1fa509e14::t_9e58a829e4bfd5 293-296,300-301
+  s_a12ff1fa509e14::t_f213d818717a2a 160-161,163
+  s_a12ff1fa509e14::t_41c80d636c04ac 201-207,210-213
+  s_a12ff1fa509e14::t_f38ac384987b56 41-50
+  s_a12ff1fa509e14::t_08c3e5b9dff46f 278-279
+Tests/SwiftQEMUTests/QMPProtocolTests.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 57-122
+Sources/SwiftQEMU/QMPError.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 36-41,101-102
+Sources/SwiftQEMU/QEMUManager.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 19-22,25-29,31-37,112-114,134,240,275-277,320-328,334-403,691-722,726-727
+  s_a12ff1fa509e14::t_cf435c55b0689c 723-725
+Sources/SwiftQEMU/QMPClient.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 26-28,36-42,53-54,62-63,71,99-123,126-134,136,278-307,310,438-472,482-489,495-503,505-508,510-511,513-516,518-521
+  s_a12ff1fa509e14::t_84a49b057c5744 43-44
+  s_a12ff1fa509e14::t_8d28af19dcc214 124-125,135
+  s_a12ff1fa509e14::t_aafb2340358749 491-494,504,509
+  s_a12ff1fa509e14::t_3d5fd90895c8d9 137
+CLAUDE.md
+  s_a12ff1fa509e14::t_19d5426f131824 203
+  s_a12ff1fa509e14::t_125cd1042b0b36 184
+  s_a12ff1fa509e14::t_1afd281baccf7e 165
+  s_a12ff1fa509e14::t_85539df80fdeb6 275-286
+  s_a12ff1fa509e14::t_7401ae6ab1ee19 289
+  s_a12ff1fa509e14::t_d110f367c5b7ad 33-34,84-85,183,185-194,211-212,356-386,410
+  s_a12ff1fa509e14::t_056c551a92efd1 195
+  s_a12ff1fa509e14::t_9b5ffb84800e16 53-57,59-60,64,67,71-76,80
+  s_a12ff1fa509e14::t_e46c3a574df176 232,238
+  s_a12ff1fa509e14::t_8f7d760301615f 196
+  s_a12ff1fa509e14::t_a4fe9c79e21c43 233
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_a12ff1fa509e14::t_d110f367c5b7ad 3,58-62,72-74,78-81,86-93,95-97,99-100,104-110,125-126,130-134,136-137,142,154-158,205-211,721-1105,1107-1108
+  s_a12ff1fa509e14::t_bec91d6debc999 1106,1109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "baf03380abb5888a14d289070cdea062fb2f64bf",
+  "prompts": {},
+  "sessions": {
+    "s_a12ff1fa509e14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a454949d-5148-4836-9342-d879cc28e2d3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
