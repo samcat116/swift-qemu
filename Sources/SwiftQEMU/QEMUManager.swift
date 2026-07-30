@@ -16,6 +16,10 @@ public actor QEMUManager {
     /// The pre-created PCIe root ports, and which device holds each one.
     private var hotplugPorts = HotplugPortPool(portIDs: [])
 
+    /// Whether a `createVM` is already in flight. Guards the one window an actor
+    /// does not close on its own — see `createVM`.
+    private var isCreating = false
+
     /// Consumes the QMP event stream for as long as a connection lasts, so
     /// `status` reflects what QEMU has already told us instead of going stale
     /// until someone calls `getStatus()`.
@@ -72,6 +76,20 @@ public actor QEMUManager {
         config: QEMUConfiguration,
         timeout: Duration = .seconds(30)
     ) async throws(QMPError) {
+        // Tested and set with no `await` in between, which is what makes it a
+        // guard at all. The liveness check below cannot do that job: reading
+        // `QEMUProcess.isRunning` suspends, and an actor is reentrant across a
+        // suspension, so two concurrent `createVM` calls both got past it. The
+        // loser then failed inside the task group — and ran the cleanup path
+        // below, which stops the QEMU process the *winner* had just started, after
+        // having already overwritten the winner's configuration and port pool on
+        // the way in.
+        guard !isCreating else {
+            throw QMPError.processAlreadyRunning
+        }
+        isCreating = true
+        defer { isCreating = false }
+
         guard !(await process.isRunning) else {
             throw QMPError.processAlreadyRunning
         }
@@ -443,9 +461,17 @@ public actor QEMUManager {
             throw QMPError.notConnected
         }
 
-        // Resolved before the backend is added: a rejected attach should not have to
-        // be rolled back when the topology already said it could not work.
-        let targetBus = try hotplugBus(explicit: bus)
+        // Resolved *and claimed* before the backend is added, both without an
+        // intervening `await`.
+        //
+        // Choosing and claiming used to sit on opposite sides of two QMP
+        // round-trips, so that a rejected attach would not burn a port. But this is
+        // a reentrant actor: across those suspensions a second `attachDisk` picked
+        // the same free port, and the loser earned QEMU's bare `slot 0 function 0
+        // already occupied` — which `hotplugFailure` does not rewrite — instead of
+        // this pool's own named error. Claiming up front and giving the port back on
+        // every failure path below keeps the original property without the race.
+        let targetBus = try claimHotplugBus(explicit: bus, for: deviceName)
         let nodeName = "drive-\(deviceName)"
 
         logger.info("Attaching disk", metadata: [
@@ -456,7 +482,12 @@ public actor QEMUManager {
         ])
 
         // Step 1: Add block device backend
-        try await qmpClient.blockdevAdd(nodeName: nodeName, filename: path, readOnly: readOnly)
+        do {
+            try await qmpClient.blockdevAdd(nodeName: nodeName, filename: path, readOnly: readOnly)
+        } catch {
+            releaseHotplugBus(targetBus, for: deviceName)
+            throw error
+        }
 
         // Step 2: Add virtio-blk frontend
         do {
@@ -464,13 +495,8 @@ public actor QEMUManager {
         } catch {
             // Rollback: remove the block device if frontend fails
             try? await qmpClient.blockdevDel(nodeName: nodeName)
+            releaseHotplugBus(targetBus, for: deviceName)
             throw hotplugFailure(error, bus: targetBus)
-        }
-
-        // Claimed only now: a port burned by a failed attach would be unusable for
-        // the life of the VM.
-        if let targetBus = targetBus {
-            hotplugPorts.claim(targetBus, for: deviceName)
         }
 
         logger.info("Disk attached successfully", metadata: ["deviceName": .string(deviceName)])
@@ -530,14 +556,22 @@ public actor QEMUManager {
 
     // MARK: - Hot-Plug Topology
 
-    /// Which bus `device_add` should target, or `nil` for QEMU's default.
+    /// Which bus `device_add` should target, or `nil` for QEMU's default — with the
+    /// port taken out of the pool when one is used.
     ///
-    /// The port is chosen but not claimed — see `attachDisk`.
-    private func hotplugBus(explicit: String?) throws(QMPError) -> String? {
-        // A caller who has built its own topology knows better than this does.
+    /// Synchronous, and deliberately contains no `await`: selecting a port and
+    /// claiming it have to be one indivisible step on a reentrant actor, or two
+    /// concurrent attaches select the same one. See `attachDisk` for the rollback
+    /// that keeps a failed attach from burning what it claimed here.
+    private func claimHotplugBus(explicit: String?, for device: String) throws(QMPError) -> String? {
+        // A caller who has built its own topology knows better than this does, and a
+        // bus this pool does not own is not tracked either way.
         if let explicit = explicit { return explicit }
 
-        if let port = hotplugPorts.nextFreePort { return port }
+        if let port = hotplugPorts.nextFreePort {
+            hotplugPorts.claim(port, for: device)
+            return port
+        }
 
         // No ports, either because none were asked for or because they are all
         // taken. That is only a problem where the default bus refuses hot-plug.
@@ -548,6 +582,17 @@ public actor QEMUManager {
             portCount: hotplugPorts.capacity,
             inUse: hotplugPorts.inUseCount
         )
+    }
+
+    /// Give back a port claimed for an attach that then failed.
+    ///
+    /// Matched on the device *and* the port rather than on the device name alone: an
+    /// attach under a name that already holds a port never claimed the one it
+    /// selected, so releasing by name would hand back the earlier attach's port
+    /// while its device is still plugged into it.
+    private func releaseHotplugBus(_ bus: String?, for device: String) {
+        guard let bus else { return }
+        hotplugPorts.release(device, from: bus)
     }
 
     /// Replace QEMU's own "does not support hotplugging" with an error that names
@@ -616,14 +661,23 @@ struct HotplugPortPool: Sendable {
     }
 
     /// Record that `device` now occupies `port`. A port this pool does not own —
-    /// which is what a caller-supplied `bus` is — is not tracked.
+    /// which is what a caller-supplied `bus` is — is not tracked, and a device that
+    /// already holds a port keeps the one it has: overwriting would orphan the
+    /// first, leaving a physically occupied slot this pool believes is free.
     mutating func claim(_ port: String, for device: String) {
-        guard portIDs.contains(port) else { return }
+        guard portIDs.contains(port), assignments[device] == nil else { return }
         assignments[device] = port
     }
 
     /// Give up whatever port `device` held. A device that never held one is a no-op.
     mutating func release(_ device: String) {
+        assignments.removeValue(forKey: device)
+    }
+
+    /// Give up `port`, but only if `device` is really the one holding it — the
+    /// rollback for an attach that claimed a port and then failed.
+    mutating func release(_ device: String, from port: String) {
+        guard assignments[device] == port else { return }
         assignments.removeValue(forKey: device)
     }
 

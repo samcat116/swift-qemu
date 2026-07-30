@@ -75,6 +75,19 @@ public actor QEMUProcess {
     /// and how long it then waits after SIGKILL.
     public static let defaultTerminationTimeout: Duration = .seconds(5)
 
+    /// How long `start(with:)` waits for QEMU to create the QMP socket before
+    /// giving up with ``QMPError/socketCreationFailed``.
+    static let socketReadyTimeout: Duration = .seconds(10)
+
+    /// The socket wait polls on a doubling interval between these two bounds.
+    ///
+    /// A fixed 500ms tick — what this replaces — charged a healthy start an
+    /// average of a quarter-second of pure quantization, because QEMU creates the
+    /// socket within a few tens of milliseconds. Backing off keeps a start that is
+    /// *not* going to work from spinning for the whole budget.
+    static let initialSocketPollInterval: Duration = .milliseconds(10)
+    static let maximumSocketPollInterval: Duration = .milliseconds(250)
+
     /// The kernel's limit on the length of a unix socket path, taken from
     /// `sockaddr_un.sun_path`: 104 bytes on Darwin, 108 on Linux, including the
     /// terminating NUL.
@@ -236,41 +249,52 @@ public actor QEMUProcess {
         }
         logger.info("QEMU process started", metadata: ["pid": .stringConvertible(pid)])
 
-        // Wait for QMP socket to be ready with retry
-        var retries = 0
-        let maxRetries = 20 // 10 seconds total (20 * 0.5s)
-        while retries < maxRetries {
-            // Check if socket file exists
-            if FileManager.default.fileExists(atPath: qmpSocketPath) {
-                // Socket exists, wait a bit more for it to be ready to accept connections
-                try await sleepOrCancel(for: .milliseconds(200))
-                logger.info("QMP socket ready", metadata: ["path": .string(qmpSocketPath)])
-                break
-            }
+        try await waitForQMPSocket(child: child, capture: capture)
+    }
 
-            // QEMU rejects a bad argument by exiting immediately. Without this check the
-            // real reason sits in stderr while the caller waits out the full socket
-            // timeout and sees only a connection failure.
+    /// Wait for QEMU to create the QMP socket, or for it to die trying.
+    ///
+    /// Polls on a doubling interval rather than a fixed 500ms tick. The socket
+    /// appears within a few tens of milliseconds, so a fixed tick spent most of
+    /// half a second per start waiting for a file that was already there — a cost
+    /// paid by every VM this library has ever launched, including every one in the
+    /// test suite.
+    ///
+    /// There is deliberately no settling delay once the file appears. The 200ms
+    /// one that used to be here was covering for a socket that exists but is not
+    /// yet accepting connections — which ``QMPClient/connectUnix(path:)`` already
+    /// retries with its own backoff. Paying it here only added latency to the
+    /// starts that were going to work anyway.
+    private func waitForQMPSocket(
+        child: ChildProcess,
+        capture: StderrCapture
+    ) async throws(QMPError) {
+        let deadline = ContinuousClock.now + Self.socketReadyTimeout
+        var pollInterval = Self.initialSocketPollInterval
+
+        while !FileManager.default.fileExists(atPath: qmpSocketPath) {
+            // QEMU rejects a bad argument by exiting immediately. Without this check
+            // the real reason sits in stderr while the caller waits out the whole
+            // budget and sees only a connection failure. Checked before the deadline
+            // so a process that dies as the budget expires is still diagnosed by
+            // what it printed rather than by the timeout.
             if child.hasExited {
                 throw await processExitedError(child)
             }
 
-            // Wait and retry
-            try await sleepOrCancel(for: .milliseconds(500))
-            retries += 1
+            guard ContinuousClock.now < deadline else {
+                logger.error("QMP socket not created within \(Self.socketReadyTimeout)", metadata: [
+                    "path": .string(qmpSocketPath),
+                    "stderr": .string(capture.text.isEmpty ? "<empty>" : capture.text)
+                ])
+                throw QMPError.socketCreationFailed
+            }
+
+            try await sleepOrCancel(for: pollInterval)
+            pollInterval = min(pollInterval * 2, Self.maximumSocketPollInterval)
         }
 
-        // After all retries, check if socket was created
-        if !FileManager.default.fileExists(atPath: qmpSocketPath) {
-            if child.hasExited {
-                throw await processExitedError(child)
-            }
-            logger.error("QMP socket not created after \(maxRetries) retries", metadata: [
-                "path": .string(qmpSocketPath),
-                "stderr": .string(capture.text.isEmpty ? "<empty>" : capture.text)
-            ])
-            throw QMPError.socketCreationFailed
-        }
+        logger.info("QMP socket ready", metadata: ["path": .string(qmpSocketPath)])
     }
 
     /// Where QEMU's stdout goes, and — when log files are enabled — the parent's
