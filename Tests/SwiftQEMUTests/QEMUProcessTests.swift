@@ -47,6 +47,12 @@ final class QEMUProcessTests: XCTestCase {
         super.tearDown()
     }
 
+    /// Build a process and register its cleanup.
+    ///
+    /// Cleanup goes through `addTeardownBlock` rather than a per-test `defer`
+    /// because `QEMUProcess` is an actor: `stop()` is `await`-ed now, and `defer`
+    /// bodies cannot await. Teardown blocks can, and they still run on the failure
+    /// paths a `defer` was there to cover.
     private func makeProcess(qemuPath: String) -> (QEMUProcess, String) {
         let socketPath = NSTemporaryDirectory() + "qemu-test-\(UUID().uuidString).sock"
         let process = QEMUProcess(
@@ -54,6 +60,10 @@ final class QEMUProcessTests: XCTestCase {
             qmpSocketPath: socketPath,
             logger: Logger(label: "test")
         )
+        addTeardownBlock {
+            await process.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
         return (process, socketPath)
     }
 
@@ -174,11 +184,12 @@ final class QEMUProcessTests: XCTestCase {
         let (process, _) = makeProcess(qemuPath: fake)
 
         try? await process.start(with: Self.defaultConfig)
-        process.stop()
+        await process.stop()
 
+        let stderr = await process.capturedStderr
         XCTAssertTrue(
-            process.capturedStderr.contains("could not open disk image"),
-            "Expected stderr to survive stop(), got: \(process.capturedStderr)"
+            stderr.contains("could not open disk image"),
+            "Expected stderr to survive stop(), got: \(stderr)"
         )
     }
 
@@ -186,33 +197,31 @@ final class QEMUProcessTests: XCTestCase {
     /// not interfere with the socket wait.
     func testStartSucceedsWhenTheSocketAppears() async throws {
         let fake = try makeSocketCreatingQEMU(body: "sleep 30")
-        let (process, socketPath) = makeProcess(qemuPath: fake)
-        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+        let (process, _) = makeProcess(qemuPath: fake)
 
         try await process.start(with: Self.defaultConfig)
-        XCTAssertTrue(process.isRunning)
-        XCTAssertEqual(process.capturedStderr, "", "A healthy start writes nothing to stderr")
-
-        process.stop()
+        let isRunning = await process.isRunning
+        let stderr = await process.capturedStderr
+        XCTAssertTrue(isRunning)
+        XCTAssertEqual(stderr, "", "A healthy start writes nothing to stderr")
     }
 
     // MARK: - Waiting for exit
 
     /// `waitUntilExit()` returns when the process actually exits.
     func testWaitUntilExitReturnsWhenTheProcessExits() async throws {
-        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 0.5"))
-        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+        let (process, _) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 0.5"))
 
         try await process.start(with: Self.defaultConfig)
         try await process.waitUntilExit()
 
-        XCTAssertFalse(process.isRunning)
+        let isRunning = await process.isRunning
+        XCTAssertFalse(isRunning)
     }
 
     /// A process that has already gone is a completed wait, not a wait forever.
     func testWaitUntilExitReturnsImmediatelyForAnExitedProcess() async throws {
-        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "exit 0"))
-        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+        let (process, _) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "exit 0"))
 
         try await process.start(with: Self.defaultConfig)
         try await Task.sleep(nanoseconds: 300_000_000) // certainly gone
@@ -231,11 +240,7 @@ final class QEMUProcessTests: XCTestCase {
     /// never reaching the forced termination meant to follow. Left unbounded this
     /// test hangs rather than fails, so it asserts against a wall-clock budget.
     func testWaitUntilExitIsCancellableSoATimedWaitCanFinish() async throws {
-        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 120"))
-        defer {
-            process.stop()
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
+        let (process, _) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 120"))
 
         try await process.start(with: Self.defaultConfig)
 
@@ -248,18 +253,15 @@ final class QEMUProcessTests: XCTestCase {
         }
         let elapsed = Date().timeIntervalSince(started)
 
+        let isRunning = await process.isRunning
         XCTAssertLessThan(elapsed, 10, "Leaving the group took \(elapsed)s; the cancelled wait never returned")
-        XCTAssertTrue(process.isRunning, "The process outlives a cancelled wait")
+        XCTAssertTrue(isRunning, "The process outlives a cancelled wait")
     }
 
     /// Cancelling one wait must not satisfy a later one — otherwise a subsequent
     /// `waitUntilExit()` reports a live process as finished.
     func testCancellingOneWaitDoesNotSatisfyTheNext() async throws {
-        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 120"))
-        defer {
-            process.stop()
-            try? FileManager.default.removeItem(atPath: socketPath)
-        }
+        let (process, _) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 120"))
 
         try await process.start(with: Self.defaultConfig)
 
@@ -271,8 +273,9 @@ final class QEMUProcessTests: XCTestCase {
         // The second wait must still be waiting on a process that is still alive.
         let second = Task { try await process.waitUntilExit() }
         try await Task.sleep(nanoseconds: 500_000_000)
+        let isRunning = await process.isRunning
         XCTAssertFalse(second.isCancelled)
-        XCTAssertTrue(process.isRunning)
+        XCTAssertTrue(isRunning)
 
         second.cancel()
         _ = try? await second.value
@@ -286,7 +289,6 @@ final class QEMUProcessTests: XCTestCase {
         sleep 30
         """)
         let (process, _) = makeProcess(qemuPath: fake)
-        defer { process.stop() }
 
         do {
             try await process.start(with: Self.defaultConfig)
@@ -295,10 +297,86 @@ final class QEMUProcessTests: XCTestCase {
             guard case .socketCreationFailed = error else {
                 return XCTFail("Expected .socketCreationFailed, got \(error)")
             }
+            let stderr = await process.capturedStderr
             XCTAssertTrue(
-                process.capturedStderr.contains("something odd"),
+                stderr.contains("something odd"),
                 "Live-process stderr should still be available to the caller"
             )
         }
+    }
+
+    // MARK: - Concurrent access
+
+    /// Reading status while a start is still in flight.
+    ///
+    /// This is the shape `QEMUManager.createVM` takes: a task-group child runs
+    /// `start(with:)` — which writes `process`, `stderrPipe`, `stderrCapture` and
+    /// `exitWaiter` — while another leg reads `isRunning`/`capturedStderr` off the
+    /// failure path. As a `@unchecked Sendable` class that overlap was an
+    /// unsynchronized read of mutable fields; as an actor the reads interleave at
+    /// the start's suspension points instead.
+    ///
+    /// Against the class this test reports two races under
+    /// `swift test --sanitize=thread` — the writes of `stderrCapture` and `process`
+    /// in `start(with:)` against these reads — and none against the actor. Without
+    /// a sanitizer it still asserts the observable half: the concurrent reads see
+    /// the stderr QEMU has already written rather than an empty value.
+    func testStatusCanBeReadConcurrentlyWithAStartInFlight() async throws {
+        let fake = try makeFakeQEMU(body: """
+        echo "qemu-system-x86_64: warning: slow to come up" >&2
+        sleep 30
+        """)
+        let (process, _) = makeProcess(qemuPath: fake)
+
+        // This fake never creates its socket, so `start` sits in the retry loop for
+        // its full 10s budget — plenty of overlap to read across.
+        // The config is hoisted into a local because referencing the static
+        // directly inside the `Task` trips a region-isolation checker crash.
+        let config = Self.defaultConfig
+        let start = Task { try await process.start(with: config) }
+
+        var sawStderrDuringStart = false
+        for _ in 0..<100 where !sawStderrDuringStart {
+            _ = await process.isRunning
+            if await process.capturedStderr.contains("slow to come up") {
+                sawStderrDuringStart = true
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertTrue(
+            sawStderrDuringStart,
+            "Concurrent readers should see stderr while start(with:) is still running"
+        )
+        XCTAssertFalse(start.isCancelled)
+
+        start.cancel()
+        _ = try? await start.value
+    }
+
+    /// Many readers at once, which is only meaningful now that they serialize on
+    /// the actor. Also pins `getQMPSocketPath()` as callable without `await`, since
+    /// the path is fixed at init and `QEMUManager` reads it that way.
+    func testConcurrentReadersAgreeOnState() async throws {
+        let (process, socketPath) = makeProcess(qemuPath: try makeSocketCreatingQEMU(body: "sleep 30"))
+
+        XCTAssertEqual(process.getQMPSocketPath(), socketPath)
+
+        try await process.start(with: Self.defaultConfig)
+
+        let running = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0..<32 {
+                group.addTask {
+                    _ = await process.capturedStderr
+                    return await process.isRunning
+                }
+            }
+            var results: [Bool] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+
+        XCTAssertEqual(running.count, 32)
+        XCTAssertTrue(running.allSatisfy { $0 }, "Every reader should see the same live process")
     }
 }

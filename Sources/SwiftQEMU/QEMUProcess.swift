@@ -1,8 +1,22 @@
 import Foundation
 import Logging
 
-/// Manages QEMU process lifecycle
-public final class QEMUProcess: @unchecked Sendable {
+/// Manages QEMU process lifecycle.
+///
+/// An `actor` rather than a `@unchecked Sendable` class, because every field here
+/// is mutable and shared across concurrency domains: `start(with:)` writes
+/// `process`, `stderrPipe`, `stderrCapture` and `exitWaiter` from whatever task
+/// launched the VM, while a caller racing that start against a timeout — which is
+/// exactly what `QEMUManager.createVM` does — reads `isRunning` and
+/// `capturedStderr` from another. `StderrCapture` and `ExitWaiter` lock their own
+/// contents, but the fields *referencing* them were unprotected, and the
+/// `@unchecked` annotation was the only reason Swift 6 did not say so.
+///
+/// The two callbacks Foundation invokes on its own queues (the stderr readability
+/// handler and `terminationHandler`) are installed by `nonisolated` helpers, so
+/// they are honestly outside the actor and touch nothing but the locked helper
+/// objects handed to them.
+public actor QEMUProcess {
     private let logger: Logger
     private var process: Process?
     private let qmpSocketPath: String
@@ -82,28 +96,15 @@ public final class QEMUProcess: @unchecked Sendable {
         }
 
         // stderr goes through a pipe that is drained continuously so a fatal argument
-        // error is reportable instead of being lost to /dev/null. The drain is what
-        // makes the pipe safe: an unread pipe fills its 64KB buffer and takes QEMU
-        // down with it, and StderrCapture retains only the tail.
+        // error is reportable instead of being lost to /dev/null. See
+        // `installStderrDrain` for why the drain is not optional.
         let capture = StderrCapture()
         let pipe = Pipe()
         process.standardError = pipe
         self.stderrPipe = pipe
         self.stderrCapture = capture
 
-        let teeHandle = logHandle
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                capture.markEOF()
-                return
-            }
-            capture.append(data)
-            if let teeHandle = teeHandle {
-                try? teeHandle.write(contentsOf: data)
-            }
-        }
+        Self.installStderrDrain(on: pipe, capture: capture, tee: logHandle)
 
         // Redirect stdin to /dev/null to prevent job control issues
         // When running from a terminal, not setting standardInput causes QEMU to
@@ -115,7 +116,7 @@ public final class QEMUProcess: @unchecked Sendable {
         // exits immediately terminates before anyone is listening for it.
         let exitWaiter = ExitWaiter()
         self.exitWaiter = exitWaiter
-        process.terminationHandler = { _ in exitWaiter.processDidExit() }
+        Self.installExitHandler(on: process, waiter: exitWaiter)
 
         // Start process
         do {
@@ -189,8 +190,11 @@ public final class QEMUProcess: @unchecked Sendable {
         logger.info("QEMU process stopped")
     }
 
-    /// Get the QMP socket path for this process
-    public func getQMPSocketPath() -> String {
+    /// Get the QMP socket path for this process.
+    ///
+    /// `nonisolated`: the path is fixed at init, so reading it needs neither the
+    /// actor nor an `await` at the call site.
+    public nonisolated func getQMPSocketPath() -> String {
         return qmpSocketPath
     }
     
@@ -228,6 +232,39 @@ public final class QEMUProcess: @unchecked Sendable {
         try Task.checkCancellation()
     }
 
+
+    // MARK: - Off-actor callbacks
+
+    /// Install the pipe drain. Foundation invokes the handler on its own queue, so
+    /// it is deliberately formed outside the actor and closes over nothing but the
+    /// internally-locked `StderrCapture` and the tee handle.
+    ///
+    /// The drain is what makes the pipe safe: an unread pipe fills its 64KB buffer
+    /// and takes QEMU down with it, and `StderrCapture` retains only the tail.
+    private nonisolated static func installStderrDrain(
+        on pipe: Pipe,
+        capture: StderrCapture,
+        tee teeHandle: FileHandle?
+    ) {
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                capture.markEOF()
+                return
+            }
+            capture.append(data)
+            if let teeHandle = teeHandle {
+                try? teeHandle.write(contentsOf: data)
+            }
+        }
+    }
+
+    /// Install the termination handler. Also called on a Foundation queue, and also
+    /// closing over only a self-locking helper.
+    private nonisolated static func installExitHandler(on process: Process, waiter: ExitWaiter) {
+        process.terminationHandler = { _ in waiter.processDidExit() }
+    }
 
     // MARK: - Private Methods
 

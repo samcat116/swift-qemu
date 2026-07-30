@@ -27,7 +27,7 @@ public actor QEMUManager {
     ///   - config: The QEMU VM configuration
     ///   - timeout: Timeout in seconds for the entire operation (default: 30)
     public func createVM(config: QEMUConfiguration, timeout: TimeInterval = 30) async throws {
-        guard !process.isRunning else {
+        guard !(await process.isRunning) else {
             throw QMPError.processAlreadyRunning
         }
 
@@ -72,7 +72,12 @@ public actor QEMUManager {
             // Cleanup on any failure. Read stderr before stopping the process — on a
             // timeout QEMU is still alive, and its output is usually the only thing
             // that explains why the socket never showed up.
-            let stderr = process.capturedStderr
+            //
+            // These reads and the `start(with:)` above no longer touch the same
+            // state from two concurrency domains: `QEMUProcess` is an actor, so the
+            // group's cancelled child is serialized against this path rather than
+            // relying on `@unchecked Sendable` to hide the overlap.
+            let stderr = await process.capturedStderr
             logger.error("Failed to create QEMU VM: \(error)", metadata: [
                 "qemuStderr": .string(stderr.isEmpty ? "<empty>" : stderr)
             ])
@@ -82,9 +87,9 @@ public actor QEMUManager {
             status = .stopped
 
             // Clean up process if it was started
-            if process.isRunning {
+            if await process.isRunning {
                 logger.warning("Cleaning up orphaned QEMU process")
-                process.stop()
+                await process.stop()
             }
 
             throw error
@@ -164,7 +169,7 @@ public actor QEMUManager {
             group.cancelAll()
         }
 
-        if process.isRunning {
+        if await process.isRunning {
             logger.warning("VM did not shut down gracefully, forcing termination")
             try await destroy()
         } else {
@@ -202,7 +207,7 @@ public actor QEMUManager {
             isConnected = false
         }
 
-        process.stop()
+        await process.stop()
         status = .stopped
 
         logger.info("VM destroyed")
