@@ -1,0 +1,50 @@
+Sources/SwiftQEMU/QMPClient.swift
+  s_4f25afda6334a7::t_fbd9e3aa14e7a4 292,386,490,505
+  s_4f25afda6334a7::t_e2bc19897873c5 43-44,46-49,51-52,80-94,96,124-125,135,151-155,188-189,212,214-217,222-246,253-260,262-263,266-267,271-273,275-282,323,326,431,433,437,441,445,491,494,506-509,519,524
+Sources/SwiftQEMU/QMPConnection.swift
+  s_4f25afda6334a7::t_e2bc19897873c5 1-64,66-89,91-137,139-230,232-278,280-284,286-304,311-332,336,338,340-365,367-380,382-389
+  s_4f25afda6334a7::t_9120ac1025ae9f 305-310
+  s_4f25afda6334a7::t_7f0b6ceaa969a7 333-334,337,339
+  s_4f25afda6334a7::t_9da2edb1e03c30 65,90,138,231,279,285,335,366,381
+Sources/SwiftQEMU/QMPFrameDecoder.swift
+  s_4f25afda6334a7::t_e2bc19897873c5 1-52
+CLAUDE.md
+  s_4f25afda6334a7::t_7ac4be941e6ab0 219-221,223
+  s_4f25afda6334a7::t_257317f6dec002 216-217
+  s_4f25afda6334a7::t_6c39c715f01e4f 424
+  s_4f25afda6334a7::t_e2bc19897873c5 52,54-55,58-81,165,167,186,208-215,252-255,260,310-322
+  s_4f25afda6334a7::t_aca7d9f879bee6 323
+Sources/SwiftQEMU/QMPWaiter.swift
+  s_4f25afda6334a7::t_48c67bd8d88a20 31,33,84,86,168
+  s_4f25afda6334a7::t_e2bc19897873c5 1-30,32,34-55,58-63,65,67,69-71,76-83,85,87-108,131,136,145,148-167,169-199
+  s_4f25afda6334a7::t_fac7dcaaefa281 110-117
+  s_4f25afda6334a7::t_b334c47a4f2643 56-57,64,66,68,72-75
+  s_4f25afda6334a7::t_1a437d51508e8a 109
+  s_4f25afda6334a7::t_4146f3c6add7d4 118-130,132-135,137-144,146-147
+Package.swift
+  s_4f25afda6334a7::t_e2bc19897873c5 38-43
+Tests/SwiftQEMUTests/QMPWaiterTests.swift
+  s_4f25afda6334a7::t_6c3c18505a5058 20,43,79,84,94,100,113,125,149,169,208
+  s_4f25afda6334a7::t_10f9b57f2e9b58 117
+  s_4f25afda6334a7::t_e2bc19897873c5 1-19,21-42,44-78,80-83,85-93,95-99,101-112,114-116,118-124,126-148,150-168,170-207,209-219
+Sources/SwiftQEMU/QMPEventBroadcaster.swift
+  s_4f25afda6334a7::t_e2bc19897873c5 1-76
+Tests/SwiftQEMUTests/QMPFrameDecoderTests.swift
+  s_4f25afda6334a7::t_e2bc19897873c5 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "c420412f4de9e5e74569ab343c7e89b3ea8b10d2",
+  "prompts": {},
+  "sessions": {
+    "s_4f25afda6334a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1c32694-306c-4419-a3b7-9bc79021ade4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
