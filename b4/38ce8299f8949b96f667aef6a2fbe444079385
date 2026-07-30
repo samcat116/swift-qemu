@@ -1,0 +1,87 @@
+Tests/SwiftQEMUTests/QMPProtocolTests.swift
+  s_9b33c0b7a378a0::t_c07369e8e42f25 57-122
+Tests/SwiftQEMUTests/QEMUVMStatusTests.swift
+  s_9b33c0b7a378a0::t_325de45809979d 75-120
+  s_9b33c0b7a378a0::t_7cdeed9b9856db 128
+  s_9b33c0b7a378a0::t_08a67a4f590628 155-222
+Sources/SwiftQEMU/QMPClient.swift
+  s_9b33c0b7a378a0::t_04b3f294ecb825 414-417,419-448
+  s_9b33c0b7a378a0::t_5688c3d77f7b69 459-466,470-477,479-493,495-498
+  s_9b33c0b7a378a0::t_b7ca78c9c7e949 622,630-682
+  s_9b33c0b7a378a0::t_3ca7197338a69e 923-924,927-929
+  s_9b33c0b7a378a0::t_fb5e9776b0561c 531-537
+  s_9b33c0b7a378a0::t_8e972d4dac8864 808-811,815-816
+  s_9b33c0b7a378a0::t_6e98230c9dff0e 20-23,29-35,47-48,55-56,61
+  s_9b33c0b7a378a0::t_feae2f21c5eada 75-113
+  s_9b33c0b7a378a0::t_45ce7edf593c57 251-259,261-280,283
+  s_9b33c0b7a378a0::t_638ab02495bb0c 602-605,618-621
+  s_9b33c0b7a378a0::t_30373d449470a5 973-978,981-984
+  s_9b33c0b7a378a0::t_63c0ad81b65024 478
+  s_9b33c0b7a378a0::t_85e970333c1437 260,418
+Sources/SwiftQEMU/QMPProtocol.swift
+  s_9b33c0b7a378a0::t_69fc2bb4296a7e 249-250,255-285
+  s_9b33c0b7a378a0::t_d73e948b110cd6 30-37,39-44,48-75,79-97
+  s_9b33c0b7a378a0::t_026bdb5c403f7f 227-231
+  s_9b33c0b7a378a0::t_e3dccb528ea431 98-99
+  s_9b33c0b7a378a0::t_55b83b613f59dd 286-287
+Sources/SwiftQEMU/QEMUManager.swift
+  s_9b33c0b7a378a0::t_57b2798963eadc 91-93
+  s_9b33c0b7a378a0::t_a8fcab60d77584 378,512-548
+  s_9b33c0b7a378a0::t_540a77bc4ecc21 252-254
+  s_9b33c0b7a378a0::t_9715960d4a3dc6 296-304,310-361,365-377
+  s_9b33c0b7a378a0::t_57c9be6a0a38fd 362-364
+  s_9b33c0b7a378a0::t_66bfe6d804ab8a 113
+  s_9b33c0b7a378a0::t_2b3367fafbd75b 217
+  s_9b33c0b7a378a0::t_abaeb25821d0fe 10-15,17-21,23-29
+  s_2b849d7edb7452::t_737ac0a1d2e240 379
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_9b33c0b7a378a0::t_d6dc53dd5f8bb2 456,487,523,565,583,620,644
+  s_9b33c0b7a378a0::t_02a9eb7d11d66e 566-567
+  s_9b33c0b7a378a0::t_8c39a7058c7649 3
+  s_9b33c0b7a378a0::t_113897958c3f1c 450-455,457-479,509-522,524-541,546,549-564,568-581,585-619,621-643,645-789
+  s_9b33c0b7a378a0::t_c58aff46af7253 480-486,488-508
+  s_9b33c0b7a378a0::t_3b397936e95c90 44-48,51-53,57-60,65-72,74-76,78-79,83-89,104-105,109-113,115-116,121,133-137
+  s_9b33c0b7a378a0::t_f326ab55acc903 168-174
+  s_9b33c0b7a378a0::t_e24549089b2b63 582,584
+  s_9b33c0b7a378a0::t_21a386ad126483 790-837
+  s_9b33c0b7a378a0::t_93621461aa0305 542-543
+  s_9b33c0b7a378a0::t_bfe66451348221 544-545,547-548
+CLAUDE.md
+  s_9b33c0b7a378a0::t_d42ac8d39a3273 137
+  s_9b33c0b7a378a0::t_0ccf30b7be29df 205-210,216
+  s_9b33c0b7a378a0::t_b765a1aca75126 61-62
+  s_9b33c0b7a378a0::t_10fff547e368d6 32-33
+  s_9b33c0b7a378a0::t_dd1f4fbb362faa 152-153
+  s_9b33c0b7a378a0::t_24aefe9539cb54 211-215
+  s_9b33c0b7a378a0::t_2c210cb0fece7b 133-136,138-145
+  s_9b33c0b7a378a0::t_7f08d91ae21798 260-290
+  s_9b33c0b7a378a0::t_7afe469808f8b8 310
+  s_9b33c0b7a378a0::t_29663c83a4b98f 53-55
+Sources/SwiftQEMU/QMPError.swift
+  s_9b33c0b7a378a0::t_07a776cca73891 57-58
+  s_9b33c0b7a378a0::t_5bf6739f869f60 20-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "b438ce8299f8949b96f667aef6a2fbe444079385",
+  "prompts": {},
+  "sessions": {
+    "s_2b849d7edb7452": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "66d9a865-dec0-4038-9157-7287d6f2bb54",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    },
+    "s_9b33c0b7a378a0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "859c7a9c-97e7-45f9-b8ec-96a1e21819b2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
