@@ -44,7 +44,24 @@ final class QMPClientTests: XCTestCase {
         /// `device_del` — the ordering that loses the event if the waiter is only
         /// installed once the command has been answered.
         case greetAndDeleteBeforeReplying
+        /// Negotiate normally, then answer the next command with a well-formed
+        /// JSON *prefix* that is never terminated by a newline. Models a wedged
+        /// or half-written frame: without a cap the client buffers all of it and
+        /// keeps going.
+        case greetThenFloodWithoutNewline
+        /// Negotiate normally, then send one complete but over-limit frame.
+        case greetThenSendOversizedFrame
+        /// Negotiate normally, then reply with a payload that is large but still
+        /// inside the cap — the case the cap must not break.
+        case greetThenReplyWithLargePayload
     }
+
+    /// Padding sizes for the frame-limit tests. The flood is far past any cap a
+    /// test sets; the oversized frame is small enough to arrive in a single read,
+    /// so the complete-frame branch of the check is the one exercised.
+    private static let floodPadding = 64 * 1024
+    private static let oversizedFramePadding = 400
+    private static let largeLegalPadding = 60_000
 
     private static let deviceDeletedEvent = #"{"timestamp": {"seconds": 1745000000, "microseconds": 1}, "event": "DEVICE_DELETED", "data": {"device": "vdb", "path": "/machine/peripheral/vdb"}}"#
     private static let resumeEvent = #"{"timestamp": {"seconds": 1745000000, "microseconds": 2}, "event": "RESUME"}"#
@@ -98,6 +115,13 @@ final class QMPClientTests: XCTestCase {
                 while let line = readLine(&buffer) {
                     if behaviour == .greetAndBehaveLikeQEMU || behaviour == .greetAndDeleteBeforeReplying {
                         replyLikeQEMU(to: line, context: context)
+                        continue
+                    }
+
+                    if behaviour == .greetThenFloodWithoutNewline
+                        || behaviour == .greetThenSendOversizedFrame
+                        || behaviour == .greetThenReplyWithLargePayload {
+                        replyWithSizedFrame(to: line, context: context)
                         continue
                     }
 
@@ -157,6 +181,33 @@ final class QMPClientTests: XCTestCase {
                 }
             }
 
+            /// Negotiate normally, then answer whatever comes next with a frame
+            /// sized to probe the client's inbound cap.
+            private func replyWithSizedFrame(to line: String, context: ChannelHandlerContext) {
+                let idField = Self.extractID(from: line).map { ", \"id\": \"\($0)\"" } ?? ""
+
+                // Negotiation must succeed, so only the command that follows it
+                // gets the outsized reply.
+                guard !line.contains("qmp_capabilities") else {
+                    write("{\"return\": {}\(idField)}", context: context)
+                    return
+                }
+
+                switch behaviour {
+                case .greetThenFloodWithoutNewline:
+                    let pad = String(repeating: "A", count: QMPClientTests.floodPadding)
+                    write("{\"return\": {\"pad\": \"\(pad)", context: context, terminated: false)
+                case .greetThenSendOversizedFrame:
+                    let pad = String(repeating: "A", count: QMPClientTests.oversizedFramePadding)
+                    write("{\"return\": {\"pad\": \"\(pad)\"}\(idField)}", context: context)
+                case .greetThenReplyWithLargePayload:
+                    let pad = String(repeating: "A", count: QMPClientTests.largeLegalPadding)
+                    write("{\"return\": {\"pad\": \"\(pad)\"}\(idField)}", context: context)
+                default:
+                    write("{\"return\": {}\(idField)}", context: context)
+                }
+            }
+
             private func readLine(_ buffer: inout ByteBuffer) -> String? {
                 guard let newlineIndex = buffer.readableBytesView.firstIndex(of: UInt8(ascii: "\n")) else {
                     return nil
@@ -174,10 +225,16 @@ final class QMPClientTests: XCTestCase {
                 return object["id"] as? String
             }
 
-            private func write(_ string: String, context: ChannelHandlerContext) {
+            private func write(
+                _ string: String,
+                context: ChannelHandlerContext,
+                terminated: Bool = true
+            ) {
                 var out = context.channel.allocator.buffer(capacity: string.utf8.count + 1)
                 out.writeString(string)
-                out.writeString("\n")
+                if terminated {
+                    out.writeString("\n")
+                }
                 context.writeAndFlush(self.wrapOutboundOut(out), promise: nil)
             }
         }
@@ -485,6 +542,110 @@ final class QMPClientTests: XCTestCase {
         // And the connection is still correlated correctly afterwards.
         let status = try await client.queryStatus()
         XCTAssertEqual(status.status, "running")
+
+        try await client.disconnect()
+    }
+
+    // MARK: - Inbound frame limit
+
+    /// A peer that writes without ever sending a newline must fail the
+    /// connection, not grow the inbound buffer for as long as it keeps writing.
+    ///
+    /// The request budget here is deliberately long: a client that only notices
+    /// via the request deadline has buffered every byte in the meantime, which is
+    /// the unbounded growth this guards against.
+    func testUnterminatedFrameFailsTheConnectionInsteadOfBufferingForever() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetThenFloodWithoutNewline)
+        defer { Task { await server.shutdown() } }
+
+        let limit = 8 * 1024
+        let client = QMPClient(
+            logger: Logger(label: "test"),
+            requestTimeout: 30,
+            connectTimeout: 5,
+            maximumFrameSize: limit
+        )
+        try await client.connectUnix(path: server.socketPath)
+
+        do {
+            _ = try await client.execute(.cont)
+            XCTFail("Expected an unterminated frame to fail the connection")
+        } catch let error as QMPError {
+            guard case .frameTooLarge(let reported) = error else {
+                return XCTFail("Expected .frameTooLarge, got \(error)")
+            }
+            XCTAssertEqual(reported, limit)
+        }
+
+        XCTAssertFalse(client.isConnected, "An overflowing peer is not a usable connection")
+        try await client.disconnect()
+    }
+
+    /// The same verdict for a frame that is complete but over the limit — the cap
+    /// is on frame size, not merely on how long a peer withholds its newline.
+    func testCompleteButOversizedFrameFailsTheConnection() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetThenSendOversizedFrame)
+        defer { Task { await server.shutdown() } }
+
+        let limit = 300
+        let client = QMPClient(
+            logger: Logger(label: "test"),
+            requestTimeout: 30,
+            connectTimeout: 5,
+            maximumFrameSize: limit
+        )
+        try await client.connectUnix(path: server.socketPath)
+
+        do {
+            _ = try await client.execute(.cont)
+            XCTFail("Expected an oversized frame to fail the connection")
+        } catch let error as QMPError {
+            guard case .frameTooLarge(let reported) = error else {
+                return XCTFail("Expected .frameTooLarge, got \(error)")
+            }
+            XCTAssertEqual(reported, limit)
+        }
+
+        try await client.disconnect()
+    }
+
+    /// A large reply that still fits the cap must be delivered intact. QMP
+    /// payloads like `query-block` on a long device list run to tens of KB, so a
+    /// cap that clipped them would be worse than no cap at all. Arriving across
+    /// several socket reads is also the case the incomplete-frame path has to get
+    /// right.
+    func testLargeFrameWithinTheLimitIsStillDelivered() async throws {
+        let server = try await FakeQMPServer(behaviour: .greetThenReplyWithLargePayload)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(
+            logger: Logger(label: "test"),
+            requestTimeout: 10,
+            connectTimeout: 5,
+            maximumFrameSize: 64 * 1024
+        )
+        try await client.connectUnix(path: server.socketPath)
+
+        let result = try await client.execute(.cont)
+        XCTAssertEqual(result?["pad"]?.stringValue?.count, Self.largeLegalPadding)
+        XCTAssertTrue(client.isConnected)
+
+        try await client.disconnect()
+    }
+
+    /// The default cap is far above any real QMP message, so the well-behaved
+    /// path is unaffected by it.
+    func testDefaultFrameLimitLeavesNormalTrafficAlone() async throws {
+        XCTAssertGreaterThanOrEqual(QMPClient.defaultMaximumFrameSize, 256 * 1024)
+
+        let server = try await FakeQMPServer(behaviour: .greetThenReplyWithLargePayload)
+        defer { Task { await server.shutdown() } }
+
+        let client = QMPClient(logger: Logger(label: "test"), requestTimeout: 10, connectTimeout: 5)
+        try await client.connectUnix(path: server.socketPath)
+
+        let result = try await client.execute(.cont)
+        XCTAssertEqual(result?["pad"]?.stringValue?.count, Self.largeLegalPadding)
 
         try await client.disconnect()
     }
