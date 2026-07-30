@@ -1,0 +1,44 @@
+Sources/SwiftQEMU/QMPConnection.swift
+  s_a12ff1fa509e14::t_893659616e3090 216-218
+  s_a12ff1fa509e14::t_04c6b632b2daa5 1-215,219-355
+Sources/SwiftQEMU/QMPClient.swift
+  s_a12ff1fa509e14::t_8c95e209a3fd31 33,35-38,40-41,65-79,81,97-101,132-133,143,145-148,153-177,184-191,193-194,197-198,202-204,206-213,224,227,334,338,342,346,356-357,360,363,365,369
+Tests/SwiftQEMUTests/QMPWaiterTests.swift
+  s_a12ff1fa509e14::t_3116e43431b9d5 58-59
+  s_a12ff1fa509e14::t_847797c6474561 71-72
+  s_a12ff1fa509e14::t_54868d7d75daae 1-57,60-70,73-130,133-215,218-219
+  s_a12ff1fa509e14::t_296cb1abe22d3c 131-132
+  s_a12ff1fa509e14::t_b39115b1121d3b 216-217
+Sources/SwiftQEMU/QMPFrameDecoder.swift
+  s_a12ff1fa509e14::t_6d75c61cfad252 1-52
+CLAUDE.md
+  s_a12ff1fa509e14::t_c6e223ac6f6277 49,51-70
+  s_a12ff1fa509e14::t_7f39f3e5484532 151,153
+  s_a12ff1fa509e14::t_004177868401f8 196-198,203
+  s_a12ff1fa509e14::t_c90328bd4631dc 163-171
+  s_a12ff1fa509e14::t_3f24f7d0331948 239-252
+Package.swift
+  s_a12ff1fa509e14::t_439b2286ff4300 29-34
+Sources/SwiftQEMU/QMPWaiter.swift
+  s_a12ff1fa509e14::t_8c6ba375714b2a 75
+  s_a12ff1fa509e14::t_c7572dfea2253e 1-43,51-74,76-84,87-89,91-110,115-139,144-161,165-180,184-186
+  s_a12ff1fa509e14::t_03314501a14e1b 44-50,85-86,90,111-114,140-143,162-164,181-183
+Tests/SwiftQEMUTests/QMPFrameDecoderTests.swift
+  s_a12ff1fa509e14::t_2a9c28826cf2be 1-165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "5c2b67febd42907fd15556a2ed673bccdf69c117",
+  "prompts": {},
+  "sessions": {
+    "s_a12ff1fa509e14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a454949d-5148-4836-9342-d879cc28e2d3",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
