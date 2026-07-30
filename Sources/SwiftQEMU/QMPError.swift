@@ -50,6 +50,12 @@ public enum QMPError: Error, LocalizedError, Sendable {
     /// QEMU refused `device_add` because the target bus does not support hot-plug.
     /// The `qmpError` this replaces said which bus, but not what to do about it.
     case hotplugNotSupported(bus: String, machineType: String)
+    /// An operation needs a QMP capability that this connection does not have —
+    /// either QEMU never offered it in its greeting, or it was excluded from
+    /// `QMPClient.requestedCapabilities`. Sending the request anyway earns a QMP
+    /// error that names the rejected JSON member rather than the missing
+    /// capability, so this is caught before it goes out.
+    case capabilityNotNegotiated(QMPCapability)
     /// QEMU could not be spawned at all: the binary is missing, is not
     /// executable, or the fork failed. Carries `Process.run()`'s own error,
     /// which used to propagate raw with nothing to say where it came from.
@@ -146,6 +152,8 @@ public enum QMPError: Error, LocalizedError, Sendable {
                 that bus does not support hot-plug. Pre-create PCIe root ports with \
                 QEMUConfiguration.hotplugPorts, or target a bus that accepts hot-plug.
                 """
+        case .capabilityNotNegotiated(let capability):
+            return "The QMP capability '\(capability.rawValue)' was not negotiated on this connection"
         case .processLaunchFailed(let path, let underlying):
             return "Could not launch QEMU at \(path): \(QMPError.describe(underlying))"
         case .runtimeDirectoryCreationFailed(let path, let underlying):

@@ -23,12 +23,22 @@ public final class QMPClient: Sendable {
     /// long device list is the largest realistic payload and runs to tens of KB
     /// — while still bounding what an unterminated frame can cost.
     public static let defaultMaximumFrameSize = 512 * 1024
+    /// Default depth of a subscriber's event buffer. See ``events(bufferSize:)``
+    /// for what happens when a consumer falls this far behind.
+    public static let defaultEventBufferSize = 64
 
     private let logger: Logger
     private let eventLoopGroup: EventLoopGroup
     private let requestTimeout: Duration
     private let connectTimeout: Duration
     private let maximumFrameSize: Int
+
+    /// The capabilities to enable when QEMU offers them.
+    ///
+    /// Asking for a capability QEMU did not offer fails the negotiation, so this is
+    /// intersected with the greeting rather than sent as-is. Pass `[]` to negotiate
+    /// nothing.
+    public let requestedCapabilities: Set<QMPCapability>
 
     /// Connection state.
     ///
@@ -41,6 +51,8 @@ public final class QMPClient: Sendable {
         var channel: Channel?
         var handler: QMPChannelHandler?
         var isConnected = false
+        var greeting: QMPGreeting?
+        var negotiatedCapabilities: Set<QMPCapability> = []
     }
     private let state = NIOLockedValueBox(State())
 
@@ -48,7 +60,8 @@ public final class QMPClient: Sendable {
         logger: Logger = Logger(label: "SwiftQEMU.QMPClient"),
         requestTimeout: Duration = QMPClient.defaultRequestTimeout,
         connectTimeout: Duration = QMPClient.defaultConnectTimeout,
-        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize
+        maximumFrameSize: Int = QMPClient.defaultMaximumFrameSize,
+        requestedCapabilities: Set<QMPCapability> = [.oob]
     ) {
         self.logger = logger
         self.requestTimeout = requestTimeout
@@ -56,6 +69,7 @@ public final class QMPClient: Sendable {
         // A cap below one byte would reject the frame that is about to arrive
         // whatever it is, so clamp rather than let a caller disable framing.
         self.maximumFrameSize = max(1, maximumFrameSize)
+        self.requestedCapabilities = requestedCapabilities
         // The process-wide singleton group, not a private one. A per-client
         // group costs a dedicated OS thread per VM, and tearing it down in
         // `deinit` meant a blocking `syncShutdownGracefully()` on whatever
@@ -67,6 +81,45 @@ public final class QMPClient: Sendable {
     /// Whether the client currently believes it has a usable connection.
     public var isConnected: Bool {
         state.withLockedValue { $0.isConnected }
+    }
+
+    /// The greeting QEMU sent on the current connection, or `nil` when there is
+    /// none. Carries the QEMU version and the capabilities it offered.
+    public var greeting: QMPGreeting? {
+        state.withLockedValue { $0.greeting }
+    }
+
+    /// The capabilities enabled on the current connection: the intersection of
+    /// ``requestedCapabilities`` with what the greeting offered, once QEMU has
+    /// accepted them.
+    public var negotiatedCapabilities: Set<QMPCapability> {
+        state.withLockedValue { $0.negotiatedCapabilities }
+    }
+
+    // MARK: - Events
+
+    /// Subscribe to the asynchronous events QEMU emits on this connection.
+    ///
+    /// Every subscriber gets its own stream and sees every event, so an
+    /// application can watch the VM without displacing ``QEMUManager``'s own
+    /// bookkeeping. `DEVICE_DELETED` is published here too, but `device_del` does
+    /// not rely on it: a detach needs a targeted, timed wait rather than a scan of
+    /// a shared stream, so it keeps its dedicated ticket path.
+    ///
+    /// - Buffering: bounded at `bufferSize` events, keeping the newest and
+    ///   discarding the oldest. A consumer that stops reading therefore loses
+    ///   history but can never stall the event loop, which is delivering these
+    ///   from NIO and must not block.
+    /// - Lifetime: the stream belongs to *this* connection and finishes when the
+    ///   connection ends — `disconnect()`, or the peer going away — so a
+    ///   `for await` loop terminates instead of parking forever. Reconnecting
+    ///   means subscribing again.
+    /// - Events emitted before this call are not replayed; subscribe first and
+    ///   read the current state afterwards if you need both.
+    ///
+    /// - Throws: `QMPError.notConnected` if there is no connection to subscribe to.
+    public func events(bufferSize: Int = QMPClient.defaultEventBufferSize) throws(QMPError) -> AsyncStream<QMPEvent> {
+        try connectedHandler().subscribeToEvents(bufferSize: bufferSize)
     }
 
     // MARK: - Connection Management
@@ -226,9 +279,39 @@ public final class QMPClient: Sendable {
         _ command: QMPCommand,
         arguments: [String: JSONValue]? = nil
     ) async throws(QMPError) -> JSONValue? {
+        try await send(command, arguments: arguments, outOfBand: false)
+    }
+
+    /// Execute a QMP command out-of-band, so it runs as soon as QEMU parses it
+    /// rather than queueing behind whatever the monitor is working through.
+    ///
+    /// QEMU allows this only for commands its schema marks `allow-oob` — on 11.0.2
+    /// `migrate-pause`, `migrate-recover`, `query-yank` and `yank`; anything else
+    /// comes back as `The command <name> does not support OOB`. `quit` is *not*
+    /// among them, so a wedged VM is unblocked with ``yank(instances:outOfBand:)``, not by
+    /// forcing a quit through.
+    ///
+    /// - Throws: `QMPError.capabilityNotNegotiated` if `oob` is not enabled on this
+    ///   connection, which is what QEMU's own `QMP input member 'exec-oob' is
+    ///   unexpected` would otherwise amount to.
+    public func executeOutOfBand(
+        _ command: QMPCommand,
+        arguments: [String: JSONValue]? = nil
+    ) async throws(QMPError) -> JSONValue? {
+        guard negotiatedCapabilities.contains(.oob) else {
+            throw QMPError.capabilityNotNegotiated(.oob)
+        }
+        return try await send(command, arguments: arguments, outOfBand: true)
+    }
+
+    private func send(
+        _ command: QMPCommand,
+        arguments: [String: JSONValue]?,
+        outOfBand: Bool
+    ) async throws(QMPError) -> JSONValue? {
         let handler = try connectedHandler()
 
-        let request = QMPRequest(execute: command.name, arguments: arguments)
+        let request = QMPRequest(execute: command.name, arguments: arguments, outOfBand: outOfBand)
 
         guard let response = try await handler.sendRequest(request, timeout: requestTimeout) else {
             throw QMPError.invalidResponse
@@ -363,6 +446,41 @@ public final class QMPClient: Sendable {
         try await execute(.queryBlock)?.arrayValue ?? []
     }
 
+    // MARK: - Yank
+
+    /// The instances that can currently be yanked, as QEMU describes them — each a
+    /// `{"type": ..., "id": ...}` object suitable for handing straight back to
+    /// ``yank(instances:outOfBand:)``.
+    ///
+    /// - Parameter outOfBand: Run the query out-of-band. Requires the `oob`
+    ///   capability, and is the point of it: the answer arrives even when the
+    ///   monitor is blocked.
+    public func queryYank(outOfBand: Bool = false) async throws(QMPError) -> [JSONValue] {
+        let result = outOfBand
+            ? try await executeOutOfBand(.queryYank)
+            : try await execute(.queryYank)
+        return result?.arrayValue ?? []
+    }
+
+    /// Yank the given instances: QEMU tears down the underlying connections
+    /// (chardev, block device, migration) without waiting for them to respond.
+    ///
+    /// The recovery path for a VM stuck on an unresponsive backend — a block device
+    /// on a hung NFS mount, for instance — where an in-band command would queue
+    /// behind the very operation that is stuck. Pass `outOfBand: true` for that
+    /// case; it is what the `oob` capability is negotiated for.
+    ///
+    /// Yanking a chardev instance can close this monitor's own socket, so treat a
+    /// lost connection afterwards as expected rather than as a failure.
+    public func yank(instances: [JSONValue], outOfBand: Bool = false) async throws(QMPError) {
+        let arguments: [String: JSONValue] = ["instances": .array(instances)]
+        if outOfBand {
+            _ = try await executeOutOfBand(.yank, arguments: arguments)
+        } else {
+            _ = try await execute(.yank, arguments: arguments)
+        }
+    }
+
     // MARK: - Private Methods
 
     private func connectedHandler() throws(QMPError) -> QMPChannelHandler {
@@ -373,15 +491,46 @@ public final class QMPClient: Sendable {
         return handler
     }
 
+    /// Wait for the greeting, then enable the capabilities it offers that we asked
+    /// for.
+    ///
+    /// The greeting used to be waited on and discarded, which left `oob`
+    /// permanently off however new the QEMU was. Only the offered subset is
+    /// requested: `qmp_capabilities` fails outright on a capability QEMU did not
+    /// advertise, and a failed negotiation leaves a monitor that refuses every
+    /// subsequent command.
     private func negotiateCapabilities(handler: QMPChannelHandler) async throws(QMPError) {
-        // Wait for greeting
         try await handler.waitForGreeting(timeout: connectTimeout)
 
-        // Send capabilities command
-        let request = QMPRequest(execute: QMPCommand.capabilities.name)
-        _ = try await handler.sendRequest(request, timeout: connectTimeout)
+        let greeting = handler.receivedGreeting
+        let offered = Set((greeting?.QMP.capabilities ?? []).compactMap(QMPCapability.init(rawValue:)))
+        let toEnable = offered.intersection(requestedCapabilities)
 
-        logger.debug("QMP capabilities negotiated")
+        // Omitted entirely when there is nothing to enable, so a QEMU predating
+        // the `enable` argument still negotiates.
+        let arguments: [String: JSONValue]? = toEnable.isEmpty
+            ? nil
+            : ["enable": .array(toEnable.map(\.rawValue).sorted().map(JSONValue.string))]
+
+        let request = QMPRequest(execute: QMPCommand.capabilities.name, arguments: arguments)
+        let response = try await handler.sendRequest(request, timeout: connectTimeout)
+
+        // A rejected negotiation is fatal for the connection — QEMU answers every
+        // later command with "Expecting capabilities negotiation" — so it must not
+        // be swallowed the way it was when the reply went unread.
+        if let error = response?.error {
+            throw QMPError.qmpError(error.class, error.desc)
+        }
+
+        state.withLockedValue {
+            $0.greeting = greeting
+            $0.negotiatedCapabilities = toEnable
+        }
+
+        logger.debug("QMP capabilities negotiated", metadata: [
+            "offered": .string(offered.map(\.rawValue).sorted().joined(separator: ",")),
+            "enabled": .string(toEnable.map(\.rawValue).sorted().joined(separator: ","))
+        ])
     }
 }
 
@@ -422,6 +571,13 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     /// The task waiting on the greeting was cancelled. Latched, because the
     /// cancellation can land before the waiter parks.
     private var greetingCancelled = false
+    /// The greeting itself, kept rather than discarded: its `capabilities` list is
+    /// what capability negotiation has to be driven from.
+    private var greetingMessage: QMPGreeting?
+    /// One continuation per live `events()` subscription. Several consumers can
+    /// watch the same connection, so this is a map rather than a single slot; each
+    /// is yielded to independently and none can block the others.
+    private var eventSubscribers: [UInt64: AsyncStream<QMPEvent>.Continuation] = [:]
     /// Outstanding requests in submission order, keyed for out-of-order and
     /// timed-out removal. QMP echoes our `id` back, so a response is matched to
     /// its request rather than to whatever happens to be at the head.
@@ -534,6 +690,10 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
         if case .pending = greeting {
             greeting = .failed(error)
         }
+        // Event streams end with the connection they belong to, so a `for await`
+        // over one completes rather than parking on a channel nobody owns.
+        let subscribers = Array(eventSubscribers.values)
+        eventSubscribers.removeAll()
         let isFirstClose = closeError == nil
         if isFirstClose {
             closeError = error
@@ -552,10 +712,68 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
             deletion.continuation?.resume(throwing: error)
         }
         greetingDeadline?.cancel()
+        // Finished outside the lock: `finish()` invokes the termination handler,
+        // which takes the same non-recursive lock.
+        for subscriber in subscribers {
+            subscriber.finish()
+        }
         greetingWaiter?.resume(throwing: error)
 
         if isFirstClose {
             onConnectionLost()
+        }
+    }
+
+    /// The greeting received on this connection, if it has arrived.
+    var receivedGreeting: QMPGreeting? {
+        lock.lock()
+        defer { lock.unlock() }
+        return greetingMessage
+    }
+
+    /// A new independent event stream over this connection.
+    ///
+    /// The subscriber is registered synchronously, inside `AsyncStream`'s build
+    /// closure, so events cannot slip through between the call and the first
+    /// iteration of the caller's loop.
+    func subscribeToEvents(bufferSize: Int) -> AsyncStream<QMPEvent> {
+        AsyncStream(QMPEvent.self, bufferingPolicy: .bufferingNewest(bufferSize)) { continuation in
+            lock.lock()
+            if closeError != nil {
+                // Already dead: hand back a stream that is simply over, rather than
+                // one that will never produce anything and never end.
+                lock.unlock()
+                continuation.finish()
+                return
+            }
+            nextWaiterToken += 1
+            let token = nextWaiterToken
+            eventSubscribers[token] = continuation
+            lock.unlock()
+
+            // Drops the registration when the consumer stops iterating (or its task
+            // is cancelled), so an abandoned stream is not yielded to forever.
+            continuation.onTermination = { [weak self] _ in
+                guard let self else { return }
+                self.lock.lock()
+                self.eventSubscribers.removeValue(forKey: token)
+                self.lock.unlock()
+            }
+        }
+    }
+
+    /// Deliver one event to every live subscriber.
+    ///
+    /// Called from the event loop, so it must not block: `bufferingNewest` makes
+    /// `yield` non-blocking, discarding a slow subscriber's oldest event instead of
+    /// applying backpressure to QEMU's socket.
+    private func broadcast(_ event: QMPEvent) {
+        lock.lock()
+        let subscribers = Array(eventSubscribers.values)
+        lock.unlock()
+
+        for subscriber in subscribers {
+            subscriber.yield(event)
         }
     }
 
@@ -765,11 +983,15 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
 
         // Tag the request so its response can be correlated back to it. Without
         // an id, matching is positional — and a single timed-out request would
-        // shift every later response onto the wrong caller.
+        // shift every later response onto the wrong caller. It matters twice as
+        // much for an out-of-band request, which is answered out of order by
+        // definition — so `outOfBand` has to be carried across this rebuild, or the
+        // command silently goes out in-band.
         let identified = QMPRequest(
             execute: request.execute,
             arguments: request.arguments,
-            id: id
+            id: id,
+            outOfBand: request.outOfBand
         )
         // Encoded before the record is registered, so a failure here cannot
         // leave an entry behind with nothing to resolve it.
@@ -1026,9 +1248,13 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
 
     private func handleGreeting(_ greetingMessage: QMPGreeting) {
         logger.debug("Received QMP greeting", metadata: [
-            "version": .stringConvertible("\(greetingMessage.QMP.version.qemu.major).\(greetingMessage.QMP.version.qemu.minor).\(greetingMessage.QMP.version.qemu.micro)")
+            "version": .stringConvertible("\(greetingMessage.QMP.version.qemu.major).\(greetingMessage.QMP.version.qemu.minor).\(greetingMessage.QMP.version.qemu.micro)"),
+            "capabilities": .string(greetingMessage.QMP.capabilities.joined(separator: ","))
         ])
         lock.lock()
+        // Stored under the same lock as the latch, so a negotiation woken by the
+        // latch is guaranteed to see the greeting it was waiting for.
+        self.greetingMessage = greetingMessage
         if case .pending = greeting {
             greeting = .satisfied
         }
@@ -1083,12 +1309,18 @@ private final class QMPChannelHandler: ChannelInboundHandler, @unchecked Sendabl
     private func handleEvent(_ event: QMPEvent) {
         logger.debug("Received QMP event", metadata: ["event": .string(event.event)])
 
-        // Handle DEVICE_DELETED event
-        guard event.event == "DEVICE_DELETED",
-              let device = event.data?["device"]?.stringValue else {
-            return
+        // The dedicated waiter first, then everyone watching. A detach needs a
+        // targeted, timed wait, so it keeps its ticket path rather than scanning
+        // the shared stream — but the event is still worth publishing.
+        if event.event == QMPEventName.deviceDeleted,
+           let device = event.data?["device"]?.stringValue {
+            resolveDeviceDeletion(device: device)
         }
 
+        broadcast(event)
+    }
+
+    private func resolveDeviceDeletion(device: String) {
         lock.lock()
         // The oldest outstanding expectation for this device, so repeated
         // detaches are matched in the order they were issued.

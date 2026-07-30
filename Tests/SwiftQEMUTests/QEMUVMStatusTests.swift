@@ -72,6 +72,52 @@ final class QEMUVMStatusTests: XCTestCase {
         XCTAssertNil(status(""))
     }
 
+    // MARK: - From events
+
+    private func status(event: String, data: JSONValue? = nil) -> QEMUVMStatus? {
+        QEMUVMStatus(event: QMPEvent(event: event, data: data))
+    }
+
+    /// The transitions QEMU announces, which is what lets `status` stay current
+    /// without polling `query-status` — including when the guest is the one that
+    /// initiated them.
+    func testEventsThatImplyARunState() {
+        XCTAssertEqual(status(event: "STOP"), .paused)
+        XCTAssertEqual(status(event: "SUSPEND"), .paused)
+        XCTAssertEqual(status(event: "RESUME"), .running)
+        XCTAssertEqual(status(event: "WAKEUP"), .running)
+        XCTAssertEqual(status(event: "POWERDOWN"), .shuttingDown)
+        XCTAssertEqual(status(event: "SHUTDOWN"), .stopped)
+    }
+
+    /// `nil` rather than a guess. `RESET` leaves the run state exactly as it was —
+    /// verified on 11.0.2, which also emits it *twice* per `system_reset`, so
+    /// treating it as a transition would be wrong twice over — and what
+    /// `GUEST_PANICKED` implies depends on `-action panic`.
+    func testEventsThatImplyNothingAboutTheRunState() {
+        XCTAssertNil(status(event: "RESET"))
+        XCTAssertNil(status(event: "GUEST_PANICKED"))
+        XCTAssertNil(status(event: "DEVICE_DELETED", data: ["device": "vdb"]))
+        XCTAssertNil(status(event: "BLOCK_IO_ERROR"))
+        XCTAssertNil(status(event: "NIC_RX_FILTER_CHANGED"))
+    }
+
+    /// QMP event names are upper-case and matched exactly; nothing here should be
+    /// guessing at case the way the run-state mapping deliberately does.
+    func testEventNamesAreMatchedExactly() {
+        XCTAssertNil(status(event: "stop"))
+        XCTAssertNil(status(event: ""))
+    }
+
+    /// The names the mapping switches on are the ones QEMU actually emits.
+    func testEventNameConstantsMatchTheProtocol() {
+        XCTAssertEqual(QMPEventName.stop, "STOP")
+        XCTAssertEqual(QMPEventName.resume, "RESUME")
+        XCTAssertEqual(QMPEventName.powerdown, "POWERDOWN")
+        XCTAssertEqual(QMPEventName.shutdown, "SHUTDOWN")
+        XCTAssertEqual(QMPEventName.deviceDeleted, "DEVICE_DELETED")
+    }
+
     // MARK: - Against a real QEMU
 
     /// The end-to-end version of the bug, and the only place the run state comes
@@ -79,16 +125,7 @@ final class QEMUVMStatusTests: XCTestCase {
     /// configuration, and it should report itself as waiting to be started, not
     /// as still being created. Skipped where QEMU is not installed.
     func testCreatedVMReportsPausedAndBecomesRunningOnStart() async throws {
-        let candidates = [
-            "/opt/homebrew/bin/qemu-system-x86_64",
-            "/usr/local/bin/qemu-system-x86_64",
-            "/usr/bin/qemu-system-x86_64"
-        ]
-        guard let qemuPath = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-            throw XCTSkip("qemu-system-x86_64 not installed")
-        }
-
-        let manager = QEMUManager(qemuPath: qemuPath, logger: Logger(label: "test"))
+        let manager = QEMUManager(qemuPath: try Self.installedQEMU(), logger: Logger(label: "test"))
 
         // This test starts a real VM to leak, and `destroy()` is `await`-ed, so
         // cleanup goes in a teardown block rather than a `defer` — which cannot
@@ -114,5 +151,73 @@ final class QEMUVMStatusTests: XCTestCase {
         try await manager.destroy()
         let afterDestroy = await manager.status
         XCTAssertEqual(afterDestroy, .stopped)
+    }
+
+    /// The event stream, end to end against a real QEMU: the events have to arrive
+    /// with the names and ordering QEMU actually uses, which no fake can establish.
+    /// Skipped where QEMU is not installed.
+    func testEventsFromARealQEMUReachTheManagersSubscribers() async throws {
+        let manager = QEMUManager(qemuPath: try Self.installedQEMU(), logger: Logger(label: "test"))
+        addTeardownBlock { try? await manager.destroy() }
+
+        var config = QEMUConfiguration()
+        config.memoryMB = 128
+        try await manager.createVM(config: config)
+
+        // QEMU 11 offers `oob` and nothing else; a VM that negotiated it can reach a
+        // blocked monitor.
+        let capabilities = await manager.negotiatedCapabilities
+        XCTAssertEqual(capabilities, [.oob], "QEMU 11 offers oob, and it is requested by default")
+
+        let events = try await manager.events()
+
+        try await manager.start()
+        try await manager.pause()
+
+        // RESUME then STOP, from the real QEMU. `collect` bounds the wait so a
+        // regression fails rather than hangs.
+        let received = await Self.collect(2, from: events)
+        XCTAssertEqual(received.map(\.event), ["RESUME", "STOP"])
+
+        let afterPause = await manager.status
+        XCTAssertEqual(afterPause, .paused)
+    }
+
+    private static func installedQEMU() throws -> String {
+        let candidates = [
+            "/opt/homebrew/bin/qemu-system-x86_64",
+            "/usr/local/bin/qemu-system-x86_64",
+            "/usr/bin/qemu-system-x86_64"
+        ]
+        guard let path = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            throw XCTSkip("qemu-system-x86_64 not installed")
+        }
+        return path
+    }
+
+    /// Take up to `count` events, giving up after `timeout` so a delivery regression
+    /// fails the test instead of parking the suite.
+    private static func collect(
+        _ count: Int,
+        from stream: AsyncStream<QMPEvent>,
+        timeout: Duration = .seconds(10)
+    ) async -> [QMPEvent] {
+        await withTaskGroup(of: [QMPEvent]?.self) { group in
+            group.addTask {
+                var collected: [QMPEvent] = []
+                for await event in stream {
+                    collected.append(event)
+                    if collected.count == count { break }
+                }
+                return collected
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? []
+        }
     }
 }

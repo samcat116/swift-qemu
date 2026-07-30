@@ -16,10 +16,25 @@ public actor QEMUManager {
     /// The pre-created PCIe root ports, and which device holds each one.
     private var hotplugPorts = HotplugPortPool(portIDs: [])
 
+    /// Consumes the QMP event stream for as long as a connection lasts, so
+    /// `status` reflects what QEMU has already told us instead of going stale
+    /// until someone calls `getStatus()`.
+    private var eventMonitor: Task<Void, Never>?
 
     /// Current VM status
+    ///
+    /// Kept current from QMP events while connected — a guest that powers itself
+    /// off, pauses or resumes is reflected here without polling — so reading this
+    /// property is not the same as the stale snapshot it used to be. `getStatus()`
+    /// still exists for a definitive round-trip to QEMU.
     public private(set) var status: QEMUVMStatus = .stopped
-    
+
+    /// The QMP capabilities negotiated on the current connection, empty when there
+    /// is none. `.oob` here means out-of-band commands are available.
+    public var negotiatedCapabilities: Set<QMPCapability> {
+        qmpClient.negotiatedCapabilities
+    }
+
     /// - Parameters:
     ///   - qemuPath: The QEMU binary to run.
     ///   - runtimeDirectory: Base directory for the private, `0700` per-VM
@@ -105,6 +120,9 @@ public actor QEMUManager {
 
         guard let failure else {
             isConnected = true
+            // Subscribed before the first status query, so no transition can slip
+            // through the gap between the two.
+            startEventMonitor()
             await updateStatus()
             logger.info("QEMU VM created successfully")
             return
@@ -125,6 +143,7 @@ public actor QEMUManager {
 
         // Reset state
         isConnected = false
+        stopEventMonitor()
         status = .stopped
         forgetHotplugState()
 
@@ -229,6 +248,7 @@ public actor QEMUManager {
             status = .stopped
             isConnected = false
             forgetHotplugState()
+            stopEventMonitor()
         }
 
         logger.info("VM shutdown complete")
@@ -263,6 +283,9 @@ public actor QEMUManager {
                 logger.debug("QMP disconnect reported \(error) while tearing down")
             }
             isConnected = false
+            // From here the outcome below is authoritative, so nothing still in the
+            // event buffer gets to rewrite it.
+            stopEventMonitor()
         }
 
         // Waits for the child and escalates to SIGKILL, so by the time this returns
@@ -305,9 +328,88 @@ public actor QEMUManager {
                 status = .unknown
             }
         } catch {
+            // A VM whose QEMU has exited is stopped, not indeterminate. Without
+            // this, a guest that powered itself off — which the SHUTDOWN event
+            // reports accurately — was overwritten with `.unknown` by the next
+            // query, since the query fails against a socket that has gone.
+            if await process.isRunning == false {
+                logger.debug("Status query failed and QEMU has exited; reporting stopped")
+                status = .stopped
+                return
+            }
             logger.error("Failed to query VM status: \(error)")
             status = .unknown
         }
+    }
+
+    // MARK: - Events
+
+    /// Subscribe to the QMP events QEMU emits on the current connection.
+    ///
+    /// The manager consumes the same events for its own `status` bookkeeping;
+    /// subscribers are independent, so watching them here displaces nothing. See
+    /// `QMPClient.events(bufferSize:)` for the buffering and lifetime rules — in
+    /// short: bounded, oldest-dropped, and finished when the connection ends.
+    ///
+    /// - Throws: `QMPError.notConnected` if no VM is connected.
+    public func events(
+        bufferSize: Int = QMPClient.defaultEventBufferSize
+    ) throws(QMPError) -> AsyncStream<QMPEvent> {
+        guard isConnected else {
+            throw QMPError.notConnected
+        }
+        return try qmpClient.events(bufferSize: bufferSize)
+    }
+
+    /// Start following the event stream for the connection just established.
+    ///
+    /// The stream finishes when the connection ends, so this task retires on its
+    /// own; `stopEventMonitor()` exists for the teardown paths that want it gone
+    /// before then.
+    private func startEventMonitor() {
+        stopEventMonitor()
+
+        guard let events = try? qmpClient.events() else {
+            logger.warning("Could not subscribe to QMP events; status will only update on demand")
+            return
+        }
+
+        eventMonitor = Task { [weak self] in
+            for await event in events {
+                await self?.apply(event)
+            }
+        }
+    }
+
+    private func stopEventMonitor() {
+        eventMonitor?.cancel()
+        eventMonitor = nil
+    }
+
+    /// Fold one event into `status`.
+    private func apply(_ event: QMPEvent) {
+        // Teardown has the last word on the status. A `quit` produces SHUTDOWN, and
+        // that event landing after `destroy()` has decided the outcome must not
+        // relabel a VM it failed to kill as stopped.
+        guard isConnected else { return }
+
+        guard let implied = QEMUVMStatus(event: event) else {
+            // Trace, not debug: the client already logs every event once, and some
+            // guests emit these several times a second.
+            logger.trace("QMP event with no bearing on the run state", metadata: [
+                "event": .string(event.event)
+            ])
+            return
+        }
+
+        guard implied != status else { return }
+
+        logger.info("VM status changed by QMP event", metadata: [
+            "event": .string(event.event),
+            "from": .string(status.rawValue),
+            "to": .string(implied.rawValue)
+        ])
+        status = implied
     }
 
     // MARK: - Disk Hot-Plug Operations
@@ -592,6 +694,43 @@ extension QEMUVMStatus {
             // so this keeps `.creating`. Nothing here initiates one, so it is
             // reachable only for a VM handed over mid-migration.
             self = .creating
+
+        default:
+            return nil
+        }
+    }
+
+    /// The status implied by a QMP event, or `nil` if the event says nothing about
+    /// the run state.
+    ///
+    /// The point of the event stream: QEMU announces these transitions, including
+    /// the ones initiated from inside the guest, so `status` no longer has to go
+    /// stale until something polls `query-status`.
+    ///
+    /// `nil` is the right answer more often than it looks. `RESET` leaves the run
+    /// state exactly as it was (and QEMU emits it twice per `system_reset`, verified
+    /// on 11.0.2), and `GUEST_PANICKED` means whatever `-action panic` says it
+    /// means. Guessing a status for either would be worse than leaving the last
+    /// known one in place.
+    public init?(event: QMPEvent) {
+        switch event.event {
+        case QMPEventName.stop, QMPEventName.suspend:
+            self = .paused
+
+        case QMPEventName.resume, QMPEventName.wakeup:
+            self = .running
+
+        case QMPEventName.powerdown:
+            // The guest has been asked to power off and has not done it yet — QEMU
+            // still reports the run state as `running`, and a guest with no OS never
+            // moves off it. `.shuttingDown` is the only place that request is
+            // visible, and it is what `shutdown()` sets for the same reason.
+            self = .shuttingDown
+
+        case QMPEventName.shutdown:
+            // The machine is going away: emitted before the reply to `quit`, and on
+            // a guest-initiated poweroff just before QEMU exits.
+            self = .stopped
 
         default:
             return nil

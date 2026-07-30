@@ -95,6 +95,7 @@ final class QMPErrorTests: XCTestCase {
             .socketPathTooLong(path: "/tmp/x", limit: 104),
             .noHotplugPortAvailable(machineType: "q35", portCount: 4, inUse: 4),
             .hotplugNotSupported(bus: "pcie.0", machineType: "q35"),
+            .capabilityNotNegotiated(.oob),
             .processLaunchFailed(path: "/bin/qemu", underlying: SomeoneElsesError()),
             .runtimeDirectoryCreationFailed(path: "/tmp/x", underlying: SomeoneElsesError()),
             .connectionFailed(endpoint: "127.0.0.1:1", underlying: SomeoneElsesError()),
