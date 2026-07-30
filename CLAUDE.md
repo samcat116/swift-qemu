@@ -29,7 +29,8 @@ swift test --filter QMPProtocolTests
 **QEMUManager** (Sources/SwiftQEMU/QEMUManager.swift)
 - High-level API that coordinates process and QMP management
 - Manages VM lifecycle: create, start, pause, reset, shutdown, destroy
-- Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown)
+- Tracks VM status (stopped, creating, running, paused, shuttingDown, unknown), kept current from QMP events rather than only on demand (see fix 14)
+- Re-exposes the event stream as `events(bufferSize:)` for applications, alongside its own subscription
 - Actor-based for thread-safe concurrent access
 
 **QEMUProcess** (Sources/SwiftQEMU/QEMUProcess.swift)
@@ -49,12 +50,16 @@ swift test --filter QMPProtocolTests
 - Supports Unix domain socket and TCP connections
 - **Critical fix**: Implements exponential backoff retry logic (up to 10 attempts) for socket connection timing issues
 - Handles QMP greeting, capability negotiation, and command execution
-- Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit
+- Executes QMP commands: query-status, cont, stop, system_powerdown, system_reset, quit, query-yank, yank
+- **Events**: `events(bufferSize:)` hands out an `AsyncStream<QMPEvent>` per subscriber — bounded, oldest-dropped, finished when the connection ends (see fix 14)
+- **Capabilities**: the greeting is kept (`greeting`), and the capabilities it offers that appear in `requestedCapabilities` are enabled and reported as `negotiatedCapabilities`. `executeOutOfBand` sends `exec-oob` requests for the handful of commands QEMU allows out-of-band
 - Connection state (channel, handler, connected flag) lives in one lock-guarded box, so the type is honestly `Sendable` rather than `@unchecked Sendable`. Losing the channel clears the connected flag, so the next command fails fast instead of being written into a dead socket
 - `disconnect()` is idempotent and treats an already-closed channel as success
 
 **QMPProtocol** (Sources/SwiftQEMU/QMPProtocol.swift)
 - Defines QMP message types: QMPGreeting, QMPRequest, QMPResponse, QMPEvent
+- `QMPCapability` (`.oob`) is the negotiable half of the greeting; `QMPEventName` names the events with behaviour attached, since a misspelled event name silently never matches
+- `QMPRequest.outOfBand` encodes as `exec-oob`. **Never** the `"control": {"run-oob": true}` form — QEMU 11 rejects it outright (see fix 14)
 - Provides type-safe QMPCommand enum for common commands
 - `QMPMessage` discriminates inbound traffic by its key (`QMP`/`event`/`return`/`error`). **Never** go back to trying each type in turn — every property of `QMPResponse` is optional, so a try-in-sequence decode accepts an event as an empty response (see fix 6)
 
@@ -125,12 +130,27 @@ The codebase includes critical fixes for production reliability:
     - `.creating` is left to the window before `createVM` returns. `inmigrate` keeps it — an incoming migration really is a VM still being constructed — and nothing else QEMU reports maps to it
     - The mapping moved out of `updateStatus()` into `QEMUVMStatus.init?(_ response: QMPStatusResponse)`, a pure function testable without a process or a socket. It returns `nil` for an unrecognised run state so the manager still logs the raw string before falling back to `.unknown`
 
+14. **Events Reach Callers, and the Greeting's Capabilities Are Used**: events were decoded correctly (fix 6) but only `DEVICE_DELETED` was acted on — everything else was logged at debug level and dropped, so `QEMUManager.status` went stale until someone called `getStatus()` and a guest powering itself off was invisible. The greeting's `capabilities` were decoded and discarded in the same way, leaving the protocol's only optional feature permanently off. Now:
+    - `QMPClient.events(bufferSize:)` returns an `AsyncStream<QMPEvent>`. **Per subscriber**, so the manager's own bookkeeping and an application's `for await` do not displace each other; **bounded** at `bufferSize` (default 64) keeping the *newest*, because these are yielded from the NIO event loop and a blocking yield would stall QEMU's socket for every waiter; and **finished when the connection ends**, so a `for await` terminates instead of parking. A stream belongs to one connection — reconnecting means resubscribing
+    - `DEVICE_DELETED` keeps its dedicated ticket path (a detach needs a targeted, timed wait, not a scan of a shared stream) *and* is published to subscribers. `QMPClientTests.testDeviceDeletedReachesBothItsTicketAndTheStream` is the guard on that
+    - `QEMUManager` consumes the stream in a task started at the end of `createVM`, subscribing *before* the first `updateStatus()` so no transition falls in the gap. `QEMUVMStatus.init?(event:)` is the mapping, pure and testable: `STOP`/`SUSPEND` → `.paused`, `RESUME`/`WAKEUP` → `.running`, `POWERDOWN` → `.shuttingDown`, `SHUTDOWN` → `.stopped`. `RESET` and `GUEST_PANICKED` map to **nothing** — verified on 11.0.2, `system_reset` leaves the run state alone and emits `RESET` *twice*, and what a panic implies depends on `-action panic`
+    - `POWERDOWN` → `.shuttingDown` is a statement about the *request*, not the run state, and QEMU has no run state for it — so a `getStatus()` while the guest is still working through the poweroff reports `.running` again. Same as `shutdown()`, which sets `.shuttingDown` for the same reason and has always had the same property
+    - Event-derived updates apply only while the manager considers itself connected, and the teardown paths stop the monitor before deciding the final status. Otherwise a `SHUTDOWN` still sitting in the buffer could relabel a VM that `destroy()` failed to kill as `.stopped`
+    - `updateStatus()` reports `.stopped` rather than `.unknown` when the query fails against an exited QEMU. Without that, the accurate `.stopped` from a `SHUTDOWN` event was overwritten by the next query, which cannot succeed against a socket that has gone
+    - Capability negotiation sends `qmp_capabilities` with `enable` set to the **intersection** of the greeting's offer and `requestedCapabilities` (default `[.oob]`). Never the wish list: `qmp_capabilities` fails outright on a capability QEMU did not advertise, and a failed negotiation leaves a monitor that answers every later command with "Expecting capabilities negotiation". The reply is now checked for an error, which it previously was not
+    - **An out-of-band request is `{"exec-oob": "<command>", "id": ...}`.** The `{"execute": ..., "control": {"run-oob": true}}` form from the original OOB proposal is rejected by QEMU 11 with `QMP input member 'control' is unexpected` — verified against 11.0.2, including for commands that *are* `allow-oob`. Encoding it that way would have shipped a feature that never worked, so `QMPProtocolTests.testOutOfBandRequestEncoding` asserts the wire form
+    - `executeOutOfBand` refuses with `QMPError.capabilityNotNegotiated(.oob)` rather than letting QEMU answer `QMP input member 'exec-oob' is unexpected`, which names the JSON instead of the problem
+    - QEMU permits OOB only for commands its schema marks `allow-oob`: on 11.0.2 exactly `migrate-pause`, `migrate-recover`, `query-yank`, `yank` — and **not** `quit`. So `yank(instances:outOfBand:)` (plus `queryYank`) is what the capability buys: the recovery path for a monitor blocked on an unresponsive backend
+    - Enabling `oob` carries no in-band cost on any supported QEMU. The old `COMMAND_DROPPED`/queue-full behaviour is gone — the event is absent from 11.0.2's `query-qmp-schema` entirely, and 64 pipelined in-band requests were all answered with `oob` on and off
+
 ### Known Gaps
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
 - **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
 - **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` drives the manager against a real QEMU for the create → start → destroy path (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake
+- **The manager does not reconcile `isConnected` when QEMU exits on its own**: a guest-initiated poweroff now moves `status` to `.stopped` via the `SHUTDOWN` event, but `isConnected` stays true and the process record and socket file are only released by an explicit `shutdown()`/`destroy()`. Commands in that window fail from the client as `.notConnected` rather than being refused up front
+- **Event subscriptions do not survive a reconnect** and do not replay: a stream belongs to one connection, and events emitted before `events()` was called are gone. Subscribe first, then read state
 - **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
 
 ### Configuration Types
@@ -182,6 +202,18 @@ qemu-system-x86_64 -accel help
 
 `QEMUConfigurationTests.testDefaultConfigurationStartsRealQEMU` starts a real QEMU with the stock configuration when one is installed, and skips otherwise. It is the only test that can confirm the accelerator and CPU model are actually accepted.
 
+Three more tests need a real QEMU for the same reason — the fake server accepts whatever it is sent, so only QEMU can say whether a request is *valid*:
+
+- `QEMUVMStatusTests.testCreatedVMReportsPausedAndBecomesRunningOnStart` — the run state comes from QEMU, not the test
+- `QEMUVMStatusTests.testEventsFromARealQEMUReachTheManagersSubscribers` — real event names and ordering (`RESUME` then `STOP`), and that `oob` negotiation succeeds
+- `QMPClientTests.testOutOfBandCommandIsAcceptedByARealQEMU` — an `exec-oob` request QEMU actually answers, which is the only check that would have caught the rejected `control` spelling
+
+Which commands a given QEMU allows out-of-band is in its own schema, and is the
+only trustworthy source: negotiate, send `query-qmp-schema` over the QMP socket,
+and collect the entries with `"allow-oob": true` (11.0.2 answers with
+`migrate-pause`, `migrate-recover`, `query-yank`, `yank`). Note that `-qmp stdio`
+truncates a reply that large — use a Unix socket for this.
+
 ### QMP Socket Debugging
 
 When debugging QMP issues:
@@ -225,6 +257,37 @@ Dropping a `QEMUManager` without shutting it down no longer leaks the VM —
 `QEMUProcess.deinit` SIGKILLs the child — but that is a backstop, not a shutdown:
 the guest gets no chance to power itself off.
 
+`status` is kept current from QMP events while connected, so a guest that pauses,
+resumes or powers itself off is reflected without polling. Watch the events
+directly to react to the rest:
+
+```swift
+// Bounded (newest kept), one stream per subscriber, finished when the connection
+// ends — so this loop terminates on shutdown rather than parking.
+for await event in try await manager.events() {
+    switch event.event {
+    case QMPEventName.shutdown:
+        print("guest powered off:", event.data?["reason"]?.stringValue ?? "?")
+    case "BLOCK_IO_ERROR", QMPEventName.guestPanicked:
+        print("needs attention:", event.event)
+    default:
+        break
+    }
+}
+```
+
+Out-of-band execution is negotiated by default where QEMU offers it, for the few
+commands that accept it:
+
+```swift
+if await manager.negotiatedCapabilities.contains(.oob) {
+    // Reaches a monitor blocked on an unresponsive backend, which an in-band
+    // command would queue behind. `quit` is *not* allow-oob; `yank` is.
+    let instances = try await client.queryYank(outOfBand: true)
+    try await client.yank(instances: instances, outOfBand: true)
+}
+```
+
 QMP payloads come back as `JSONValue`:
 
 ```swift
@@ -244,6 +307,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
 - timeout (createVM operation exceeded timeout)
 - invalidResponse, invalidConfiguration
+- capabilityNotNegotiated(QMPCapability) (an out-of-band request on a connection without `oob`)
 - qmpError(class, description) for QMP-specific errors
 
 ### Logging

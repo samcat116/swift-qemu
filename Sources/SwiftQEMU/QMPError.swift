@@ -17,6 +17,12 @@ public enum QMPError: Error, LocalizedError {
     /// The QEMU process outlived both SIGTERM and SIGKILL, so a force quit could not
     /// deliver what it promises. Carries the pid of the survivor.
     case processTerminationFailed(pid: Int32?)
+    /// An operation needs a QMP capability that this connection does not have —
+    /// either QEMU never offered it in its greeting, or it was excluded from
+    /// `QMPClient.requestedCapabilities`. Sending the request anyway earns a QMP
+    /// error that names the rejected JSON member rather than the missing
+    /// capability, so this is caught before it goes out.
+    case capabilityNotNegotiated(QMPCapability)
 
     public var errorDescription: String? {
         switch self {
@@ -48,6 +54,8 @@ public enum QMPError: Error, LocalizedError {
         case .processTerminationFailed(let pid):
             let which = pid.map { "process \($0)" } ?? "process"
             return "QEMU \(which) is still running after SIGTERM and SIGKILL"
+        case .capabilityNotNegotiated(let capability):
+            return "The QMP capability '\(capability.rawValue)' was not negotiated on this connection"
         }
     }
 
