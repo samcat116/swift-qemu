@@ -1,0 +1,26 @@
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_2498bf37aeb7ee::t_258566e91f3e78 28-31,104-112,320-412,414-415
+  s_2498bf37aeb7ee::t_81f189da95cd7d 413,416
+Sources/SwiftQEMU/QMPClient.swift
+  s_2498bf37aeb7ee::t_258566e91f3e78 381-384,388,395-413,419-421,429-432,468,472-473,483-485,487-488,490-492,494,503-509,511,514-537,539-540,548,553-564,592,597-631,633-638,640-641,654-676,699-700,707-736,738-742,744-745,758-773,776,778-787,794-831,842-862,866,918-919,921,928,938-940,944,946-951,960,976-978,980,984,987,998
+CLAUDE.md
+  s_2498bf37aeb7ee::t_df155ba4deae2c 32
+  s_2498bf37aeb7ee::t_4c8442fe3b186a 130-135
+  s_2498bf37aeb7ee::t_258566e91f3e78 55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "ddd78459a517ad774d6a0efbb946764573ef82cc",
+  "prompts": {},
+  "sessions": {
+    "s_2498bf37aeb7ee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fc11b1a8-4d4f-4d7a-bafa-ff7668c6b556",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
