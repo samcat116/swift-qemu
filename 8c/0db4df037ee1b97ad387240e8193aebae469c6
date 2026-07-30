@@ -1,0 +1,41 @@
+Sources/SwiftQEMU/QEMUProcess.swift
+  s_9b33c0b7a378a0::t_77f15d27f9db20 505-515,758-791,820-832,839-879
+  s_9b33c0b7a378a0::t_2651f6ba9b1eb7 880
+Tests/SwiftQEMUTests/QMPClientTests.swift
+  s_9b33c0b7a378a0::t_77f15d27f9db20 29-32,48-57,65-70,163-178,233-259,277-281,284-286,426-522,598-697,699-700
+  s_9b33c0b7a378a0::t_66f197ae3799a1 71
+  s_9b33c0b7a378a0::t_7edffc5541a78b 698
+  s_9b33c0b7a378a0::t_13440739f88104 701
+Sources/SwiftQEMU/QEMUManager.swift
+  s_9b33c0b7a378a0::t_77f15d27f9db20 11-18,67-68,125,228,282,395-402,407-419,424-426,432-433,441,445-451,457-471,481-485,500-609
+Sources/SwiftQEMU/QMPError.swift
+  s_9b33c0b7a378a0::t_77f15d27f9db20 20-31,69-91
+Sources/SwiftQEMU/QMPClient.swift
+  s_9b33c0b7a378a0::t_66f197ae3799a1 546-549,690
+  s_9b33c0b7a378a0::t_77f15d27f9db20 20-25,34,69-71,189,522-525,560,567-585,591-593,601-604,608-617,619,624-625,629-640,660,664-665,679-681,683-684,686-688,757-763,765,768-791,793-794,802,807-818,846,851-885,887-892,894-895,908-930,957-958,965-994,996-1000,1002-1003,1016-1031,1034,1036-1045,1052-1089,1100-1120,1124,1128-1137,1140-1145,1149-1151,1153,1159-1177,1215-1216,1218,1225,1235-1237,1241,1243-1248,1257,1279-1281,1283,1287,1290,1301
+  s_9b33c0b7a378a0::t_e9c07ada6f13b5 63
+CLAUDE.md
+  s_9b33c0b7a378a0::t_548fe63aa9c32b 55,65
+  s_9b33c0b7a378a0::t_77f15d27f9db20 32,58,60,136-154,173-174,187,278-285,347-348,350
+  s_9b33c0b7a378a0::t_374a55f61a8f71 33
+  s_9b33c0b7a378a0::t_7a13b5853a0ae2 155-156,228-234
+  s_9b33c0b7a378a0::t_e8601ce81f5c66 235
+Tests/SwiftQEMUTests/QEMUHotplugTests.swift
+  s_9b33c0b7a378a0::t_77f15d27f9db20 1-400
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "8c0db4df037ee1b97ad387240e8193aebae469c6",
+  "prompts": {},
+  "sessions": {
+    "s_9b33c0b7a378a0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "859c7a9c-97e7-45f9-b8ec-96a1e21819b2",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
