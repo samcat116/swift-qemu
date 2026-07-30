@@ -42,6 +42,7 @@ swift test --filter QMPProtocolTests
   - Otherwise: redirects to `/dev/null` (default behavior)
 - **Captures stderr** into a bounded tail buffer (last 16KB) via an actively drained pipe, exposed as `capturedStderr` and attached to errors. Also teed to the log file when log files are enabled.
 - Detects early process exit during the socket wait and throws `QMPError.processExited(exitCode:killedBySignal:stderr:)` immediately
+- `stop(timeout:)` is **async**: SIGTERM → bounded wait → SIGKILL → bounded wait. `process` and the socket file are released only once the child is confirmed gone, and a `deinit` SIGKILLs a child that outlives its `QEMUProcess` (see fix 11)
 
 **QMPClient** (Sources/SwiftQEMU/QMPClient.swift)
 - Implements QMP protocol communication using SwiftNIO
@@ -107,15 +108,22 @@ The codebase includes critical fixes for production reliability:
     - `.unspecified` emits no `-accel` at all, for callers configuring it through `-machine accel=...` in `additionalArgs`
     - `enableKVM` remains as a deprecated shim: `true` → `.kvm`, `false` → `.tcg` (what QEMU fell back to when the flag was absent). It cannot represent `hvf`, and reads `false` for it
 
-11. **`QEMUProcess` Isolation**: `QEMUProcess` was a `final class` marked `@unchecked Sendable` while holding four unsynchronized mutable fields (`process`, `stderrPipe`, `stderrCapture`, `exitWaiter`). `createVM` touches it from two concurrency domains at once — a task-group child runs `start(with:)`, which writes all four, while the failure path reads `capturedStderr`/`isRunning`. The annotation was the only reason Swift 6 did not diagnose it; the inner `StderrCapture`/`ExitWaiter` locks protect their contents, not the fields referencing them. It is now an `actor`, and `QEMUProcessTests.testStatusCanBeReadConcurrentlyWithAStartInFlight` covers the overlap — under `swift test --sanitize=thread` it reports races on the `stderrCapture` and `process` writes against a class and none against the actor.
-    - `nonisolated` is used in exactly two places, both deliberate: `getQMPSocketPath()` (fixed at init, so call sites keep working without `await`) and the two `static` callback installers, whose closures Foundation invokes on its own queues and must therefore *not* be actor-isolated
-    - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is now `await`-ed and `defer` bodies cannot await
+11. **Termination That Actually Terminates**: `stop()` sent SIGTERM and cleared `process` in the very next statement, which was wrong four ways at once — `isRunning` (derived from `process`) reported false over a live QEMU, the socket file was deleted from under it, the child was never waited on, and the `processAlreadyRunning` guard in `start()` waved through a restart that reused the survivor's socket path. A wedged QEMU that ignored SIGTERM was never killed at all, so `destroy()`'s documented force quit could not force anything. Now:
+    - `stop(timeout:)` is `async`: SIGTERM, wait up to `timeout`, SIGKILL (no Foundation API does this — it is a raw `kill(2)`), wait again. Default 5s via `QEMUProcess.defaultTerminationTimeout`
+    - `process`, `exitWaiter` and the socket file are released only after the exit is *confirmed*. If even SIGKILL fails, the reference is deliberately kept so `isRunning` stays truthful, and `destroy()` throws `QMPError.processTerminationFailed(pid:)` with `status = .unknown` rather than reporting a success it did not achieve
+    - `stop()`'s waits are deliberately **not** cancellable (a private detached-task wait, unlike `waitUntilExit()`). A cancelled wait would hand `stop()` an unearned "still running" and it would escalate — or clear its state — without having confirmed anything
+    - `deinit` SIGKILLs a still-running child. Foundation's `Process` does not, so dropping a `QEMUProcess`/`QEMUManager` used to leak a running VM for the lifetime of the host process. It cannot await, so there is no graceful path here: call `shutdown()` or `stop()` if the guest should power itself down
+    - `shutdown()`'s graceful branch now also calls `stop()` — the child is gone but its process record and socket file are not
+
+12. **`QEMUProcess` Isolation**: `QEMUProcess` was a `final class` marked `@unchecked Sendable` while holding four unsynchronized mutable fields (`process`, `stderrPipe`, `stderrCapture`, `exitWaiter`). `createVM` touches it from two concurrency domains at once — a task-group child runs `start(with:)`, which writes all four, while the failure path reads `capturedStderr`/`isRunning`. The annotation was the only reason Swift 6 did not diagnose it; the inner `StderrCapture`/`ExitWaiter` locks protect their contents, not the fields referencing them. It is now an `actor`, and `QEMUProcessTests.testStatusCanBeReadConcurrentlyWithAStartInFlight` covers the overlap — under `swift test --sanitize=thread` it reports races on the `stderrCapture` and `process` writes against a class and none against the actor.
+    - `nonisolated` is used in four deliberate places, and nowhere else: `getQMPSocketPath()` and `buildArguments(from:)` (both derive only from `let` state, so call sites and argument-list assertions stay synchronous), and the two `static` callback installers, whose closures Foundation invokes on its own queues and must therefore *not* be actor-isolated
+    - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties; anything computed or any method call would not compile there
+    - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is `await`-ed and `defer` bodies cannot await. That also reaches cleanup on failure paths, which the hand-written `await process.stop()` calls it replaced did not
 
 ### Known Gaps
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
-- **`stop()` neither waits nor escalates**: `terminate()` (SIGTERM) is followed immediately by `process = nil`, so `isRunning` reports false while QEMU may still be alive, the socket file is removed under a live process, the child is never reaped, and there is no SIGKILL escalation. There is also no `deinit`, so dropping a manager leaks a running VM
 - **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
 - **`prelaunch` maps to `.creating`**: a VM created with `startPaused: true` reports `.creating` rather than `.paused` until it is started, because QEMU reports `prelaunch` for both cases
 - **No end-to-end `QEMUManager` coverage**: its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. Covering the manager needs an injectable QMP-speaking fake
@@ -136,7 +144,7 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 ### Concurrency Model
 
 - QEMUManager is an actor for thread-safe state management
-- QEMUProcess is an actor. Its `Process`/`Pipe` state is genuinely thread-unsafe, which is the reason it is isolated rather than annotated (see fix 11)
+- QEMUProcess is an actor. Its `Process`/`Pipe` state is genuinely thread-unsafe, which is the reason it is isolated rather than annotated (see fix 12)
 - QMPClient is `Sendable`, with its connection state in one lock-guarded box
 - All async operations use Swift's async/await and structured concurrency
 
@@ -203,7 +211,15 @@ try await manager.start()
 // Later: gracefully shutdown (default 30 second timeout, then force quit)
 try await manager.shutdown()
 // Or with a custom budget: try await manager.shutdown(timeout: 10)
+
+// Force quit: SIGTERM, then SIGKILL after `terminationTimeout` (default 5s).
+// Throws QMPError.processTerminationFailed if QEMU survives both.
+try await manager.destroy()
 ```
+
+Dropping a `QEMUManager` without shutting it down no longer leaks the VM —
+`QEMUProcess.deinit` SIGKILLs the child — but that is a backstop, not a shutdown:
+the guest gets no chance to power itself off.
 
 QMP payloads come back as `JSONValue`:
 
@@ -221,6 +237,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - processNotRunning, processAlreadyRunning
 - socketCreationFailed (QMP socket not created within timeout, process still alive)
 - processExited(exitCode:killedBySignal:stderr:) (QEMU died before the socket was ready; carries its stderr)
+- processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
 - timeout (createVM operation exceeded timeout)
 - invalidResponse, invalidConfiguration
 - qmpError(class, description) for QMP-specific errors

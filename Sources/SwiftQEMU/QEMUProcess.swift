@@ -1,6 +1,15 @@
 import Foundation
 import Logging
 
+// `stop()` and `deinit` send SIGKILL through `kill(2)` — Foundation offers no
+// forced-kill API — so the POSIX layer is imported explicitly rather than relying
+// on Foundation to re-export it.
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
 /// Manages QEMU process lifecycle.
 ///
 /// An `actor` rather than a `@unchecked Sendable` class, because every field here
@@ -15,7 +24,9 @@ import Logging
 /// The two callbacks Foundation invokes on its own queues (the stderr readability
 /// handler and `terminationHandler`) are installed by `nonisolated` helpers, so
 /// they are honestly outside the actor and touch nothing but the locked helper
-/// objects handed to them.
+/// objects handed to them. `deinit` is likewise outside the actor, and reaches
+/// stored properties under the rule that a deinitializing actor has no other
+/// references left to race against.
 public actor QEMUProcess {
     private let logger: Logger
     private var process: Process?
@@ -27,10 +38,23 @@ public actor QEMUProcess {
     /// QEMU binary path
     public let qemuPath: String
 
+    /// How long `stop()` waits for the child to honour SIGTERM before escalating,
+    /// and how long it then waits after SIGKILL.
+    public static let defaultTerminationTimeout: TimeInterval = 5
+
     /// Is the QEMU process running
     public var isRunning: Bool {
         guard let process = process else { return false }
         return process.isRunning
+    }
+
+    /// PID of the current QEMU process, or `nil` once it has been reaped and
+    /// released by `stop()`.
+    ///
+    /// Worth reporting when termination fails: it is what a caller needs to go
+    /// deal with a survivor by hand.
+    public var processIdentifier: Int32? {
+        process?.processIdentifier
     }
 
     /// The tail of QEMU's stderr from the most recent run.
@@ -168,24 +192,67 @@ public actor QEMUProcess {
         }
     }
 
-    /// Stop QEMU process
-    public func stop() {
-        guard let process = process, process.isRunning else {
+    /// Stop the QEMU process: SIGTERM, wait, then SIGKILL.
+    ///
+    /// The process reference and the QMP socket file are released only once the
+    /// child has actually exited. Clearing them straight after `terminate()` — as
+    /// this used to — was wrong in four separate ways at once: `isRunning` reported
+    /// `false` while QEMU was still shutting down, the socket file was deleted from
+    /// under a live process, the child was never waited on, and the
+    /// `processAlreadyRunning` guard in `start()` waved through a restart that then
+    /// reused the same socket path as the survivor.
+    ///
+    /// Safe to call on a process that has already exited, and on one that was never
+    /// started: both are just the cleanup half of this method.
+    ///
+    /// After this returns, `isRunning` is `false` unless even SIGKILL failed to take
+    /// the child down, in which case the process reference is deliberately kept so
+    /// `isRunning` stays truthful and a restart is refused rather than colliding.
+    ///
+    /// - Parameter timeout: seconds to wait for the child to honour SIGTERM before
+    ///   escalating to SIGKILL. The same budget applies to the wait after SIGKILL.
+    public func stop(timeout: TimeInterval = QEMUProcess.defaultTerminationTimeout) async {
+        guard let process = process else {
             logger.debug("QEMU process not running, nothing to stop")
-            // A process that already exited still leaves the pipe behind.
+            // A start that failed before `run()` still leaves the pipe behind.
             detachStderrReader()
+            removeSocketFile()
             return
         }
 
-        logger.info("Stopping QEMU process", metadata: ["pid": .stringConvertible(process.processIdentifier)])
+        if process.isRunning {
+            logger.info("Stopping QEMU process", metadata: [
+                "pid": .stringConvertible(process.processIdentifier)
+            ])
 
-        process.terminate()
+            process.terminate()
+
+            if await waitForExit(timeout: timeout) == false {
+                logger.warning("QEMU ignored SIGTERM, escalating to SIGKILL", metadata: [
+                    "pid": .stringConvertible(process.processIdentifier),
+                    "timeout": .stringConvertible(timeout)
+                ])
+
+                // No Foundation API forces a kill, and `destroy()` is documented as
+                // a force quit — a wedged or stopped QEMU has to actually die.
+                kill(process.processIdentifier, SIGKILL)
+
+                if await waitForExit(timeout: timeout) == false {
+                    logger.error("QEMU process survived SIGKILL", metadata: [
+                        "pid": .stringConvertible(process.processIdentifier)
+                    ])
+                    return
+                }
+            }
+        } else {
+            logger.debug("QEMU process already exited, cleaning up")
+        }
+
         self.process = nil
+        self.exitWaiter = nil
 
         detachStderrReader()
-
-        // Clean up socket
-        try? FileManager.default.removeItem(atPath: qmpSocketPath)
+        removeSocketFile()
 
         logger.info("QEMU process stopped")
     }
@@ -217,21 +284,39 @@ public actor QEMUProcess {
 
         guard process.isRunning else { return }
 
-        let token = exitWaiter.nextToken()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                exitWaiter.install(token: token, continuation: continuation)
-            }
-        } onCancel: {
-            // Resumes only this waiter. Latching the whole waiter as finished
-            // would make a later `waitUntilExit()` return immediately for a
-            // process that is still very much alive.
-            exitWaiter.cancel(token: token)
-        }
+        await exitWaiter.waitForExit()
 
         try Task.checkCancellation()
     }
 
+    // MARK: - Deinitialization
+
+    /// Last-ditch cleanup for a `QEMUProcess` that is dropped without `stop()`.
+    ///
+    /// Without this, releasing a `QEMUProcess` (or the `QEMUManager` holding one)
+    /// left QEMU running for the lifetime of the host process — Foundation's
+    /// `Process` does not take its child down when it goes away.
+    ///
+    /// `deinit` cannot await, so there is no graceful shutdown to be had here and
+    /// no exit to confirm: SIGKILL is the only honest option. Callers that want the
+    /// guest to power itself down must call `QEMUManager.shutdown()` — or `stop()` —
+    /// before releasing this.
+    ///
+    /// An actor's `deinit` is not isolated, and reaches the stored properties below
+    /// only under the language's exception for a deinitializing actor — by then no
+    /// other reference exists to race against. Keep this to *stored* properties:
+    /// `isRunning` or any other computed member or method would not compile here.
+    deinit {
+        stderrPipe?.fileHandleForReading.readabilityHandler = nil
+
+        guard let process = process, process.isRunning else { return }
+
+        logger.warning("QEMUProcess released while QEMU was still running; killing it", metadata: [
+            "pid": .stringConvertible(process.processIdentifier)
+        ])
+        kill(process.processIdentifier, SIGKILL)
+        try? FileManager.default.removeItem(atPath: qmpSocketPath)
+    }
 
     // MARK: - Off-actor callbacks
 
@@ -267,6 +352,42 @@ public actor QEMUProcess {
     }
 
     // MARK: - Private Methods
+
+    /// Wait up to `timeout` for the child to exit. Reports whether it did.
+    ///
+    /// Deliberately not cancellable, unlike `waitUntilExit()`. Teardown must not be
+    /// abandonable half-done: a cancelled wait would hand `stop()` a `false` it had
+    /// not earned, so it would escalate to SIGKILL — or give up and clear `process`
+    /// and the socket file — without ever having confirmed anything. The wait
+    /// therefore runs in a detached task, which the caller's cancellation cannot
+    /// reach.
+    private func waitForExit(timeout: TimeInterval) async -> Bool {
+        guard let process = process else { return true }
+        guard let exitWaiter = exitWaiter else { return !process.isRunning }
+        guard process.isRunning else { return true }
+
+        let nanoseconds = UInt64(max(0, timeout) * 1_000_000_000)
+        await Task.detached {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { try? await Task.sleep(nanoseconds: nanoseconds) }
+                group.addTask { await exitWaiter.waitForExit() }
+
+                // Whichever lands first ends the wait; the other returns on
+                // cancellation, so leaving this scope cannot block.
+                await group.next()
+                group.cancelAll()
+            }
+        }.value
+
+        // `hasExited` is the authoritative answer — it is set by the termination
+        // handler — and is checked first so a lagging `isRunning` cannot provoke a
+        // pointless SIGKILL at a pid that has already been reaped.
+        return exitWaiter.hasExited || !process.isRunning
+    }
+
+    private func removeSocketFile() {
+        try? FileManager.default.removeItem(atPath: qmpSocketPath)
+    }
 
     /// Release the pipe and its reader. The `StderrCapture` is deliberately kept so
     /// callers can still read stderr after a failed start.
@@ -424,7 +545,7 @@ public actor QEMUProcess {
 /// `waitUntilExit()`.
 ///
 /// Three orderings have to work, and each one used to be a hang:
-/// the exit landing before anyone waits (latched by `hasExited`), several
+/// the exit landing before anyone waits (latched by `exited`), several
 /// callers waiting at once (a list, not a single slot, so nobody's continuation
 /// is overwritten and abandoned), and a waiter being cancelled before it has
 /// parked (`cancelledTokens`, since `onCancel` can run before the operation
@@ -435,7 +556,31 @@ final class ExitWaiter: @unchecked Sendable {
     private var waiters: [(token: UInt64, continuation: CheckedContinuation<Void, Never>)] = []
     private var cancelledTokens: Set<UInt64> = []
     private var lastToken: UInt64 = 0
-    private var hasExited = false
+    private var exited = false
+
+    /// Whether the termination handler has fired. Authoritative, and unlike
+    /// `Process.isRunning` it cannot lag behind the exit it reports.
+    var hasExited: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return exited
+    }
+
+    /// Park until the process exits, returning early if the calling task is
+    /// cancelled.
+    func waitForExit() async {
+        let token = nextToken()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                install(token: token, continuation: continuation)
+            }
+        } onCancel: {
+            // Resumes only this waiter. Latching the whole waiter as finished
+            // would make a later wait return immediately for a process that is
+            // still very much alive.
+            cancel(token: token)
+        }
+    }
 
     func nextToken() -> UInt64 {
         lock.lock()
@@ -446,7 +591,7 @@ final class ExitWaiter: @unchecked Sendable {
 
     func install(token: UInt64, continuation: CheckedContinuation<Void, Never>) {
         lock.lock()
-        if hasExited || cancelledTokens.remove(token) != nil {
+        if exited || cancelledTokens.remove(token) != nil {
             lock.unlock()
             continuation.resume()
             return
@@ -469,7 +614,7 @@ final class ExitWaiter: @unchecked Sendable {
 
     func processDidExit() {
         lock.lock()
-        hasExited = true
+        exited = true
         let resumed = waiters
         waiters.removeAll()
         cancelledTokens.removeAll()

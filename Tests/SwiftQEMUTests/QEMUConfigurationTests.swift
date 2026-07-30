@@ -147,8 +147,9 @@ final class QEMUConfigurationTests: XCTestCase {
 
         let socketPath = NSTemporaryDirectory() + "qemu-accel-\(UUID().uuidString).sock"
         let process = QEMUProcess(qemuPath: qemuPath, qmpSocketPath: socketPath, logger: Logger(label: "test"))
-        // A teardown block rather than `defer`, since `QEMUProcess` is an actor and
-        // `stop()` is awaited.
+        // An async teardown block rather than `defer`: `stop()` is awaited, so it
+        // cannot go in a `defer` at all, and a teardown block reaches it on the
+        // failure paths too — this test starts a real VM to leak.
         addTeardownBlock {
             await process.stop()
             try? FileManager.default.removeItem(atPath: socketPath)

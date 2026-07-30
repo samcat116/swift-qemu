@@ -86,10 +86,16 @@ public actor QEMUManager {
             isConnected = false
             status = .stopped
 
-            // Clean up process if it was started
+            // Clean up process if it was started. `stop()` waits for the child to
+            // actually go, so what follows this cannot race a half-dead QEMU — and
+            // if it fails to kill it, that is logged rather than thrown, so the
+            // original failure is still what the caller sees.
+            await process.stop()
             if await process.isRunning {
-                logger.warning("Cleaning up orphaned QEMU process")
-                await process.stop()
+                let pid = await process.processIdentifier
+                logger.error("QEMU process could not be terminated during cleanup", metadata: [
+                    "pid": .string(pid.map(String.init) ?? "unknown")
+                ])
             }
 
             throw error
@@ -176,6 +182,9 @@ public actor QEMUManager {
             // The socket is dead either way; drop the connection so the client
             // is not left believing it has one.
             try? await qmpClient.disconnect()
+            // The child has gone, but its process record and socket file have not.
+            // On an exited process that is all `stop()` does.
+            await process.stop()
             status = .stopped
             isConnected = false
         }
@@ -184,7 +193,14 @@ public actor QEMUManager {
     }
 
     /// Force quit the VM
-    public func destroy() async throws {
+    /// - Parameter terminationTimeout: How long to wait for the QEMU process to
+    ///   honour SIGTERM before it is killed outright (default: 5 seconds). The same
+    ///   budget applies to the wait after SIGKILL.
+    /// - Throws: `QMPError.processTerminationFailed` if QEMU outlived both signals.
+    ///   A force quit that could not force anything must not report success.
+    public func destroy(
+        terminationTimeout: TimeInterval = QEMUProcess.defaultTerminationTimeout
+    ) async throws {
         logger.info("Destroying VM")
 
         if isConnected {
@@ -207,7 +223,18 @@ public actor QEMUManager {
             isConnected = false
         }
 
-        await process.stop()
+        // Waits for the child and escalates to SIGKILL, so by the time this returns
+        // the VM is either gone or unkillable — never "terminate() has been called
+        // and we hope for the best".
+        await process.stop(timeout: terminationTimeout)
+
+        if await process.isRunning {
+            // Status stays away from `.stopped`: something is still holding the
+            // socket path and the VM's resources.
+            status = .unknown
+            throw QMPError.processTerminationFailed(pid: await process.processIdentifier)
+        }
+
         status = .stopped
 
         logger.info("VM destroyed")

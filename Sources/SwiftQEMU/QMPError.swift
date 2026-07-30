@@ -14,6 +14,9 @@ public enum QMPError: Error, LocalizedError {
     /// QEMU exited before the QMP socket was ready, carrying its stderr so the cause
     /// (a rejected argument, a missing disk image) is in the error itself.
     case processExited(exitCode: Int32, killedBySignal: Bool, stderr: String)
+    /// The QEMU process outlived both SIGTERM and SIGKILL, so a force quit could not
+    /// deliver what it promises. Carries the pid of the survivor.
+    case processTerminationFailed(pid: Int32?)
 
     public var errorDescription: String? {
         switch self {
@@ -42,6 +45,9 @@ public enum QMPError: Error, LocalizedError {
                 return "QEMU \(cause) before the QMP socket was ready (no stderr output)"
             }
             return "QEMU \(cause) before the QMP socket was ready: \(detail)"
+        case .processTerminationFailed(let pid):
+            let which = pid.map { "process \($0)" } ?? "process"
+            return "QEMU \(which) is still running after SIGTERM and SIGKILL"
         }
     }
 
