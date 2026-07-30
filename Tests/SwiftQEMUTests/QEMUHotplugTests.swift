@@ -1,5 +1,6 @@
-import XCTest
+import Foundation
 import Logging
+import Testing
 @testable import SwiftQEMU
 
 /// Tests for disk hot-plug on a PCIe machine type.
@@ -17,7 +18,8 @@ import Logging
 /// and accept it through a root port, `pc` accepts it on `pci.0` directly, a root
 /// port holds exactly one device, two root ports without `chassis` stop QEMU from
 /// starting, and `microvm` has no PCI bus to put a root port on at all.
-final class QEMUHotplugTests: XCTestCase {
+@Suite("Hot-plug configuration")
+struct QEMUHotplugTests {
 
     // MARK: - Helpers
 
@@ -54,49 +56,49 @@ final class QEMUHotplugTests: XCTestCase {
     // MARK: - The default configuration
 
     /// The headline of the bug: what a caller gets without configuring anything.
-    func testDefaultConfigurationPreCreatesRootPortsForHotplug() {
+    @Test func defaultConfigurationPreCreatesRootPortsForHotplug() {
         let config = QEMUConfiguration()
         let ports = rootPortDevices(in: arguments(for: config))
 
-        XCTAssertEqual(config.machineType, "q35", "the machine type this all hinges on")
-        XCTAssertEqual(
-            ports.count, QEMUConfiguration.automaticHotplugPortCount,
+        #expect(config.machineType == "q35", "the machine type this all hinges on")
+        #expect(
+            ports.count == QEMUConfiguration.automaticHotplugPortCount,
             "q35 cannot hot-plug onto pcie.0, so the default config must ship root ports"
         )
-        XCTAssertEqual(config.resolvedHotplugPortCount, ports.count)
+        #expect(config.resolvedHotplugPortCount == ports.count)
     }
 
     /// `chassis` is not decoration: two root ports that both leave it unset take
     /// QEMU down at startup with `Can't add chassis slot, error -16`.
-    func testEachRootPortCarriesItsOwnChassisNumber() {
+    @Test func eachRootPortCarriesItsOwnChassisNumber() {
         let ports = rootPortDevices(in: arguments(for: QEMUConfiguration()))
         let chassis = ports.compactMap { property("chassis", of: $0) }
 
-        XCTAssertEqual(chassis.count, ports.count, "every port must name a chassis")
-        XCTAssertEqual(Set(chassis).count, chassis.count, "chassis numbers must be unique")
-        XCTAssertFalse(chassis.contains("0"), "chassis 0 is the root complex itself")
-        XCTAssertEqual(chassis, (1...ports.count).map(String.init))
+        #expect(chassis.count == ports.count, "every port must name a chassis")
+        #expect(Set(chassis).count == chassis.count, "chassis numbers must be unique")
+        #expect(!chassis.contains("0"), "chassis 0 is the root complex itself")
+        #expect(chassis == (1...ports.count).map(String.init))
     }
 
     /// No `bus=`, deliberately: the machine's own default PCIe root complex is the
     /// right parent, and naming `pcie.0` outright would break the `.count(n)` case
     /// on a machine whose bus is called something else.
-    func testRootPortsDoNotHardCodeAParentBus() {
+    @Test func rootPortsDoNotHardCodeAParentBus() {
         for device in rootPortDevices(in: arguments(for: QEMUConfiguration())) {
-            XCTAssertNil(property("bus", of: device), "unexpected bus in \(device)")
+            #expect(property("bus", of: device) == nil, "unexpected bus in \(device)")
         }
     }
 
     /// The launch arguments and the pool `QEMUManager` allocates from are both
     /// derived from `hotplugPortIDs`. If they ever disagreed, `attachDisk` would
     /// name a bus QEMU has never heard of — which fails with `Bus 'x' not found`.
-    func testEmittedPortIDsAreExactlyTheOnesTheManagerHandsOut() {
+    @Test func emittedPortIDsAreExactlyTheOnesTheManagerHandsOut() {
         let config = QEMUConfiguration()
         let emitted = rootPortDevices(in: arguments(for: config))
             .compactMap { property("id", of: $0) }
 
-        XCTAssertEqual(emitted, config.hotplugPortIDs)
-        XCTAssertEqual(Set(emitted).count, emitted.count, "ids must be unique")
+        #expect(emitted == config.hotplugPortIDs)
+        #expect(Set(emitted).count == emitted.count, "ids must be unique")
     }
 
     // MARK: - Machine-type gate
@@ -104,259 +106,230 @@ final class QEMUHotplugTests: XCTestCase {
     /// `pc` hot-plugs onto `pci.0` without help, and `microvm` has no PCI bus at
     /// all — a root port there is not merely useless, it stops QEMU from starting
     /// with `No 'PCI' bus found for device 'pcie-root-port'`.
-    func testAutomaticAddsNoPortsWhereTheDefaultBusAlreadyHotplugs() {
-        for machineType in ["pc", "pc-i440fx-10.0", "microvm", "isapc"] {
-            var config = QEMUConfiguration()
-            config.machineType = machineType
+    @Test("A machine whose default bus already hot-plugs gets no ports",
+          arguments: ["pc", "pc-i440fx-10.0", "microvm", "isapc"])
+    func automaticAddsNoPortsWhereTheDefaultBusAlreadyHotplugs(machineType: String) {
+        var config = QEMUConfiguration()
+        config.machineType = machineType
 
-            XCTAssertFalse(config.requiresHotplugPort, "\(machineType) hot-plugs on its own")
-            XCTAssertEqual(config.resolvedHotplugPortCount, 0)
-            XCTAssertTrue(rootPortDevices(in: arguments(for: config)).isEmpty, machineType)
-        }
+        #expect(!config.requiresHotplugPort, "\(machineType) hot-plugs on its own")
+        #expect(config.resolvedHotplugPortCount == 0)
+        #expect(rootPortDevices(in: arguments(for: config)).isEmpty, "\(machineType)")
     }
 
     /// The versioned aliases are the same machine, and arm `virt` has the same
-    /// PCIe root complex with the same refusal.
-    func testAutomaticCoversVersionedAndNonX86PCIeMachines() {
-        for machineType in ["q35", "pc-q35-10.0", "pc-q35-6.2", "virt", "virt-9.2"] {
-            var config = QEMUConfiguration()
-            config.machineType = machineType
-
-            XCTAssertTrue(config.requiresHotplugPort, "\(machineType) needs a root port")
-            XCTAssertEqual(
-                rootPortDevices(in: arguments(for: config)).count,
-                QEMUConfiguration.automaticHotplugPortCount,
-                machineType
-            )
-        }
-    }
-
+    /// PCIe root complex with the same refusal. The last one is the rule that
     /// `-machine` takes options after the name, and the name is what decides this.
-    func testMachineOptionsDoNotHideTheMachineName() {
+    @Test("A PCIe machine gets the automatic ports",
+          arguments: ["q35", "pc-q35-10.0", "pc-q35-6.2", "virt", "virt-9.2", "q35,kernel_irqchip=off"])
+    func automaticCoversVersionedAndNonX86PCIeMachines(machineType: String) {
         var config = QEMUConfiguration()
-        config.machineType = "q35,kernel_irqchip=off"
+        config.machineType = machineType
 
-        XCTAssertTrue(config.requiresHotplugPort)
-        XCTAssertEqual(
-            rootPortDevices(in: arguments(for: config)).count,
-            QEMUConfiguration.automaticHotplugPortCount
+        #expect(config.requiresHotplugPort, "\(machineType) needs a root port")
+        #expect(
+            rootPortDevices(in: arguments(for: config)).count
+                == QEMUConfiguration.automaticHotplugPortCount,
+            "\(machineType)"
         )
     }
 
     // MARK: - Explicit port counts
 
-    func testExplicitCountOverridesTheMachineTypeGate() {
+    @Test func explicitCountOverridesTheMachineTypeGate() {
         var config = QEMUConfiguration()
         config.machineType = "pc"
         config.hotplugPorts = .count(2)
 
-        XCTAssertEqual(rootPortDevices(in: arguments(for: config)).count, 2)
-        XCTAssertEqual(config.hotplugPortIDs.count, 2)
+        #expect(rootPortDevices(in: arguments(for: config)).count == 2)
+        #expect(config.hotplugPortIDs.count == 2)
     }
 
-    func testDisabledEmitsNoPortsEvenOnQ35() {
+    @Test func disabledEmitsNoPortsEvenOnQ35() {
         var config = QEMUConfiguration()
         config.hotplugPorts = .disabled
 
-        XCTAssertEqual(config.resolvedHotplugPortCount, 0)
-        XCTAssertTrue(rootPortDevices(in: arguments(for: config)).isEmpty)
-        XCTAssertTrue(config.hotplugPortIDs.isEmpty)
+        #expect(config.resolvedHotplugPortCount == 0)
+        #expect(rootPortDevices(in: arguments(for: config)).isEmpty)
+        #expect(config.hotplugPortIDs.isEmpty)
     }
 
     /// A nonsense count is clamped rather than crashing a range or emitting
     /// arguments QEMU would reject.
-    func testNonPositiveCountsEmitNothing() {
-        for count in [0, -1, -100] {
-            var config = QEMUConfiguration()
-            config.hotplugPorts = .count(count)
+    @Test("A non-positive port count emits nothing", arguments: [0, -1, -100])
+    func nonPositiveCountsEmitNothing(count: Int) {
+        var config = QEMUConfiguration()
+        config.hotplugPorts = .count(count)
 
-            XCTAssertEqual(config.resolvedHotplugPortCount, 0, "count \(count)")
-            XCTAssertTrue(rootPortDevices(in: arguments(for: config)).isEmpty)
-        }
+        #expect(config.resolvedHotplugPortCount == 0, "count \(count)")
+        #expect(rootPortDevices(in: arguments(for: config)).isEmpty)
     }
 
     // MARK: - Port allocation
 
     /// One port, one device: QEMU refuses a second `device_add` onto an occupied
     /// port with `slot 0 function 0 already occupied`.
-    func testPortsAreHandedOutOneAtATimeAndReused() {
+    @Test func portsAreHandedOutOneAtATimeAndReused() {
         var pool = HotplugPortPool(portIDs: ["hp0", "hp1"])
-        XCTAssertEqual(pool.capacity, 2)
+        #expect(pool.capacity == 2)
 
-        XCTAssertEqual(pool.nextFreePort, "hp0")
+        #expect(pool.nextFreePort == "hp0")
         pool.claim("hp0", for: "vdb")
-        XCTAssertEqual(pool.port(for: "vdb"), "hp0")
+        #expect(pool.port(for: "vdb") == "hp0")
 
-        XCTAssertEqual(pool.nextFreePort, "hp1", "a claimed port must not be offered twice")
+        #expect(pool.nextFreePort == "hp1", "a claimed port must not be offered twice")
         pool.claim("hp1", for: "vdc")
 
-        XCTAssertNil(pool.nextFreePort, "exhausted")
-        XCTAssertEqual(pool.inUseCount, 2)
-        XCTAssertEqual(pool.freeCount, 0)
+        #expect(pool.nextFreePort == nil, "exhausted")
+        #expect(pool.inUseCount == 2)
+        #expect(pool.freeCount == 0)
 
         pool.release("vdb")
-        XCTAssertEqual(pool.nextFreePort, "hp0", "a detached disk gives its port back")
-        XCTAssertNil(pool.port(for: "vdb"))
-        XCTAssertEqual(pool.freeCount, 1)
+        #expect(pool.nextFreePort == "hp0", "a detached disk gives its port back")
+        #expect(pool.port(for: "vdb") == nil)
+        #expect(pool.freeCount == 1)
     }
 
     /// A caller-supplied `bus` belongs to a topology this pool knows nothing about,
     /// so claiming it must not silently consume one of the pool's own ports.
-    func testAForeignBusIsNotTracked() {
+    @Test func aForeignBusIsNotTracked() {
         var pool = HotplugPortPool(portIDs: ["hp0"])
         pool.claim("some-other-root-port", for: "vdb")
 
-        XCTAssertEqual(pool.nextFreePort, "hp0")
-        XCTAssertEqual(pool.inUseCount, 0)
-        XCTAssertNil(pool.port(for: "vdb"))
+        #expect(pool.nextFreePort == "hp0")
+        #expect(pool.inUseCount == 0)
+        #expect(pool.port(for: "vdb") == nil)
     }
 
     /// Detaching a disk that was never plugged into one of these ports — attached
     /// at launch, or onto an explicit bus — must not invent capacity.
-    func testReleasingAnUnknownDeviceChangesNothing() {
+    @Test func releasingAnUnknownDeviceChangesNothing() {
         var pool = HotplugPortPool(portIDs: ["hp0"])
         pool.claim("hp0", for: "vdb")
 
         pool.release("never-attached")
 
-        XCTAssertEqual(pool.inUseCount, 1)
-        XCTAssertNil(pool.nextFreePort)
+        #expect(pool.inUseCount == 1)
+        #expect(pool.nextFreePort == nil)
     }
 
-    func testAnEmptyPoolOffersNothing() {
+    @Test func anEmptyPoolOffersNothing() {
         let pool = HotplugPortPool(portIDs: [])
 
-        XCTAssertNil(pool.nextFreePort)
-        XCTAssertEqual(pool.capacity, 0)
-        XCTAssertEqual(pool.freeCount, 0)
+        #expect(pool.nextFreePort == nil)
+        #expect(pool.capacity == 0)
+        #expect(pool.freeCount == 0)
     }
 
     // MARK: - Diagnostics
 
     /// The point of these errors: QEMU's own `GenericError` says which bus refused,
     /// but nothing about what a caller is supposed to do about it.
-    func testNoHotplugPortErrorNamesTheConfigurationKnob() throws {
+    @Test func noHotplugPortErrorNamesTheConfigurationKnob() throws {
         let none = QMPError.noHotplugPortAvailable(machineType: "q35", portCount: 0, inUse: 0)
-        let description = try XCTUnwrap(none.errorDescription)
+        let description = try #require(none.errorDescription)
 
-        XCTAssertTrue(description.contains("q35"), description)
-        XCTAssertTrue(description.contains("hotplugPorts"), description)
+        #expect(description.contains("q35"), "\(description)")
+        #expect(description.contains("hotplugPorts"), "\(description)")
 
         let exhausted = QMPError.noHotplugPortAvailable(machineType: "q35", portCount: 4, inUse: 4)
-        let exhaustedDescription = try XCTUnwrap(exhausted.errorDescription)
+        let exhaustedDescription = try #require(exhausted.errorDescription)
 
-        XCTAssertTrue(exhaustedDescription.contains("4"), exhaustedDescription)
-        XCTAssertTrue(exhaustedDescription.contains("hotplugPorts"), exhaustedDescription)
+        #expect(exhaustedDescription.contains("4"), "\(exhaustedDescription)")
+        #expect(exhaustedDescription.contains("hotplugPorts"), "\(exhaustedDescription)")
     }
 
-    func testHotplugNotSupportedErrorNamesTheBusAndMachine() throws {
+    @Test func hotplugNotSupportedErrorNamesTheBusAndMachine() throws {
         let error = QMPError.hotplugNotSupported(bus: "pcie.0", machineType: "q35")
-        let description = try XCTUnwrap(error.errorDescription)
+        let description = try #require(error.errorDescription)
 
-        XCTAssertTrue(description.contains("pcie.0"), description)
-        XCTAssertTrue(description.contains("q35"), description)
-        XCTAssertTrue(description.contains("hotplugPorts"), description)
+        #expect(description.contains("pcie.0"), "\(description)")
+        #expect(description.contains("q35"), "\(description)")
+        #expect(description.contains("hotplugPorts"), "\(description)")
     }
+}
 
-    // MARK: - Against a real QEMU
+// MARK: - Against a real QEMU
 
-    private static let qemuCandidates = [
-        "/opt/homebrew/bin/qemu-system-x86_64",
-        "/usr/local/bin/qemu-system-x86_64",
-        "/usr/bin/qemu-system-x86_64"
-    ]
+/// Hot-plug driven end to end, because whether a `device_add` lands anywhere is a
+/// fact about QEMU's PCI topology that no fake can answer.
+///
+/// Needs `qemu-img` as well as `qemu-system-x86_64`: `blockdev-add` opens the image
+/// for real. Each VM boots paused with 128MB under TCG, which is a fraction of a
+/// second — `device_add` does not need the guest to be executing.
+@Suite("Hot-plug against a real QEMU", .requiresQEMUAndImageTool, .slowHangBackstop)
+struct RealQEMUHotplugTests {
 
-    private static let qemuImgCandidates = [
-        "/opt/homebrew/bin/qemu-img",
-        "/usr/local/bin/qemu-img",
-        "/usr/bin/qemu-img"
-    ]
+    private let temporaryFiles = TemporaryFiles()
 
-    private func installedQEMU() throws -> String {
-        guard let path = Self.qemuCandidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) else {
-            throw XCTSkip("qemu-system-x86_64 not installed")
-        }
-        return path
-    }
-
-    /// A real qcow2 image, since `blockdev-add` opens the file for real. Torn down
-    /// with the test.
+    /// A real qcow2 image, removed with the test.
     private func makeDiskImage() throws -> String {
-        guard let qemuImg = Self.qemuImgCandidates.first(where: {
-            FileManager.default.isExecutableFile(atPath: $0)
-        }) else {
-            throw XCTSkip("qemu-img not installed")
-        }
+        let qemuImg = try #require(QEMUFixtures.imageTool, "gate this test on .requiresQEMUAndImageTool")
+        let path = temporaryFiles.track(
+            NSTemporaryDirectory() + "qemu-hotplug-\(UUID().uuidString).qcow2"
+        )
 
-        let path = NSTemporaryDirectory() + "qemu-hotplug-\(UUID().uuidString).qcow2"
         let process = Process()
         process.executableURL = URL(fileURLWithPath: qemuImg)
         process.arguments = ["create", "-f", "qcow2", path, "16M"]
         process.standardOutput = FileHandle(forWritingAtPath: "/dev/null")
         try process.run()
         process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0, "qemu-img create failed")
+        #expect(process.terminationStatus == 0, "qemu-img create failed")
 
-        addTeardownBlock { try? FileManager.default.removeItem(atPath: path) }
         return path
     }
 
-    /// A paused VM is enough for hot-plug — `device_add` does not need the guest to
-    /// be executing — and it keeps these tests to a fraction of a second under TCG.
-    private func startVM(_ config: QEMUConfiguration) async throws -> QEMUManager {
-        var config = config
+    /// The config every test here starts from: whatever the test is about, plus the
+    /// small memory that keeps a real boot cheap.
+    private func config(_ customize: (inout QEMUConfiguration) -> Void = { _ in }) -> QEMUConfiguration {
+        var config = QEMUConfiguration()
         config.memoryMB = 128
-
-        let manager = QEMUManager(qemuPath: try installedQEMU(), logger: Logger(label: "test"))
-        addTeardownBlock { try? await manager.destroy() }
-
-        try await manager.createVM(config: config)
-        return manager
+        customize(&config)
+        return config
     }
 
     /// The regression test for the issue itself: hot-plug a disk with nothing
     /// configured but the disk. Before the root ports this failed with
     /// `Bus 'pcie.0' does not support hotplugging`.
-    func testAttachDiskWorksOnTheDefaultConfiguration() async throws {
-        let manager = try await startVM(QEMUConfiguration())
-        let image = try makeDiskImage()
+    @Test func attachDiskWorksOnTheDefaultConfiguration() async throws {
+        try await withVM(config()) { manager in
+            try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vdb")
 
-        try await manager.attachDisk(path: image, deviceName: "vdb")
+            let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
+            #expect(attached.contains { $0.contains("vdb") }, "expected vdb among \(attached)")
 
-        let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
-        XCTAssertTrue(
-            attached.contains { $0.contains("vdb") },
-            "expected vdb among \(attached)"
-        )
-        let free = await manager.availableHotplugPorts
-        XCTAssertEqual(
-            free, QEMUConfiguration.automaticHotplugPortCount - 1,
-            "the disk should be holding exactly one root port"
-        )
+            let free = await manager.availableHotplugPorts
+            #expect(
+                free == QEMUConfiguration.automaticHotplugPortCount - 1,
+                "the disk should be holding exactly one root port"
+            )
+        }
     }
 
     /// Every port is real and independently usable, not just the first.
-    func testEveryRootPortCanTakeADisk() async throws {
-        let manager = try await startVM(QEMUConfiguration())
+    @Test func everyRootPortCanTakeADisk() async throws {
+        try await withVM(config()) { manager in
+            for index in 0..<QEMUConfiguration.automaticHotplugPortCount {
+                try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vd\(index)")
+            }
 
-        for index in 0..<QEMUConfiguration.automaticHotplugPortCount {
-            try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vd\(index)")
-        }
+            let free = await manager.availableHotplugPorts
+            #expect(free == 0)
 
-        let free = await manager.availableHotplugPorts
-        XCTAssertEqual(free, 0)
-
-        // And the port after the last one is refused here, not by QEMU: a full pool
-        // is reported as a full pool rather than as a bus that cannot hot-plug.
-        do {
-            try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vd-overflow")
-            XCTFail("expected the attach to fail with no ports left")
-        } catch QMPError.noHotplugPortAvailable(let machineType, let portCount, let inUse) {
-            XCTAssertEqual(machineType, "q35")
-            XCTAssertEqual(portCount, QEMUConfiguration.automaticHotplugPortCount)
-            XCTAssertEqual(inUse, QEMUConfiguration.automaticHotplugPortCount)
+            // And the port after the last one is refused here, not by QEMU: a full
+            // pool is reported as a full pool rather than as a bus that cannot
+            // hot-plug.
+            let error = try await #require(throws: QMPError.self) {
+                try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vd-overflow")
+            }
+            guard case .noHotplugPortAvailable(let machineType, let portCount, let inUse) = error else {
+                Issue.record("Expected .noHotplugPortAvailable, got \(error)")
+                return
+            }
+            #expect(machineType == "q35")
+            #expect(portCount == QEMUConfiguration.automaticHotplugPortCount)
+            #expect(inUse == QEMUConfiguration.automaticHotplugPortCount)
         }
     }
 
@@ -364,37 +337,37 @@ final class QEMUHotplugTests: XCTestCase {
     /// the failure has to name the cause rather than passing QEMU's `GenericError`
     /// up. It is also refused before `blockdev-add`, so there is no orphaned backend
     /// node left behind.
-    func testAttachDiskWithoutPortsFailsWithANamedCause() async throws {
-        var config = QEMUConfiguration()
-        config.hotplugPorts = .disabled
-        let manager = try await startVM(config)
+    @Test func attachDiskWithoutPortsFailsWithANamedCause() async throws {
+        try await withVM(config { $0.hotplugPorts = .disabled }) { manager in
+            let error = try await #require(throws: QMPError.self) {
+                try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vdb")
+            }
+            guard case .noHotplugPortAvailable(let machineType, let portCount, _) = error else {
+                Issue.record("Expected .noHotplugPortAvailable, got \(error)")
+                return
+            }
+            #expect(machineType == "q35")
+            #expect(portCount == 0)
 
-        do {
-            try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vdb")
-            XCTFail("expected the attach to fail on q35 with no root ports")
-        } catch QMPError.noHotplugPortAvailable(let machineType, let portCount, _) {
-            XCTAssertEqual(machineType, "q35")
-            XCTAssertEqual(portCount, 0)
+            let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
+            #expect(!attached.contains { $0.contains("vdb") }, "nothing should have been added")
         }
-
-        let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
-        XCTAssertFalse(attached.contains { $0.contains("vdb") }, "nothing should have been added")
     }
 
     /// The gate's other side: `pc` gets no root ports, and must still hot-plug —
     /// onto its own `pci.0`, with no bus named at all.
-    func testAttachDiskStillWorksOnAMachineThatNeedsNoPorts() async throws {
-        var config = QEMUConfiguration()
-        config.machineType = "pc"
-        let manager = try await startVM(config)
+    @Test func attachDiskStillWorksOnAMachineThatNeedsNoPorts() async throws {
+        try await withVM(config { $0.machineType = "pc" }) { manager in
+            try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vdb")
 
-        try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vdb")
+            let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
+            #expect(attached.contains { $0.contains("vdb") }, "expected vdb among \(attached)")
 
-        let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
-        XCTAssertTrue(attached.contains { $0.contains("vdb") }, "expected vdb among \(attached)")
-        let free = await manager.availableHotplugPorts
-        XCTAssertNil(
-            free, "there is no port budget to report on a machine that hot-plugs directly"
-        )
+            let free = await manager.availableHotplugPorts
+            #expect(
+                free == nil,
+                "there is no port budget to report on a machine that hot-plugs directly"
+            )
+        }
     }
 }

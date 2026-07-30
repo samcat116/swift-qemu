@@ -1,6 +1,6 @@
-import XCTest
 import NIOCore
 import NIOPosix
+import Testing
 @testable import SwiftQEMU
 
 /// The one-shot waiter every QMP wait is now built from.
@@ -10,7 +10,11 @@ import NIOPosix
 /// indirectly, by driving a whole client against a scripted server and hoping the
 /// race landed the interesting way. Stated against the primitive they are
 /// deterministic: the resolver simply runs before the waiter.
-final class QMPWaiterTests: XCTestCase {
+///
+/// Every failure here is a wait that never comes back, so `.hangBackstop` bounds
+/// them: a regression fails the run rather than stopping it.
+@Suite("QMP waiter", .hangBackstop)
+struct QMPWaiterTests {
 
     private var eventLoop: EventLoop { MultiThreadedEventLoopGroup.singleton.any() }
 
@@ -24,118 +28,104 @@ final class QMPWaiterTests: XCTestCase {
     /// The whole point: a result that lands before anyone asks for it is latched,
     /// not dropped. This is the greeting-before-`waitForGreeting` case, which used
     /// to park the connect forever.
-    func testResultLatchedBeforeAnyoneWaitsIsDeliveredImmediately() async throws {
+    @Test func resultLatchedBeforeAnyoneWaitsIsDeliveredImmediately() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
         waiter.resolve(.success(7))
 
-        let value = try await waiter.value
-        XCTAssertEqual(value, 7)
+        #expect(try await waiter.value == 7)
     }
 
     /// The same for a failure.
-    func testErrorLatchedBeforeAnyoneWaitsIsDeliveredImmediately() async throws {
+    @Test func errorLatchedBeforeAnyoneWaitsIsDeliveredImmediately() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
         waiter.resolve(.failure(QMPError.connectionLost))
 
-        do {
-            _ = try await waiter.value
-            XCTFail("Expected the latched failure")
-        } catch {
-            guard case .connectionLost = error else {
-                return XCTFail("Expected .connectionLost, got \(error)")
-            }
+        let error = try await #require(throws: QMPError.self) { try await waiter.value }
+        guard case .connectionLost = error else {
+            Issue.record("Expected .connectionLost, got \(error)")
+            return
         }
     }
 
     /// Resolution from another task while a caller is parked resumes it.
-    func testResolutionWhileParkedResumesTheWaiter() async throws {
+    @Test func resolutionWhileParkedResumesTheWaiter() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
 
         let waiting = Task { try await waiter.value }
         try await Task.sleep(for: .milliseconds(50))
         waiter.resolve(.success(9))
 
-        let value = try await waiting.value
-        XCTAssertEqual(value, 9)
+        #expect(try await waiting.value == 9)
     }
 
     /// The first resolution is the answer. Delivery, the deadline, cancellation and
     /// teardown all call `resolve` without knowing about each other, so anything
     /// else would make the outcome depend on how they interleave.
-    func testFirstResolutionWins() async throws {
+    @Test func firstResolutionWins() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
         waiter.resolve(.success(1))
         waiter.resolve(.failure(QMPError.connectionLost))
         waiter.resolve(.success(2))
 
-        let value = try await waiter.value
-        XCTAssertEqual(value, 1)
+        #expect(try await waiter.value == 1)
     }
 
     // MARK: - Deadlines
 
     /// A waiter nothing resolves fails on its deadline rather than parking.
-    func testDeadlineFailsAnUnresolvedWaiter() async throws {
+    @Test func deadlineFailsAnUnresolvedWaiter() async throws {
         let waiter = QMPWaiter<Int>(timeout: .milliseconds(50), on: eventLoop)
 
-        do {
-            _ = try await waiter.value
-            XCTFail("Expected the deadline to fire")
-        } catch {
-            guard case .timeout = error else {
-                return XCTFail("Expected .timeout, got \(error)")
-            }
+        let error = try await #require(throws: QMPError.self) { try await waiter.value }
+        guard case .timeout = error else {
+            Issue.record("Expected .timeout, got \(error)")
+            return
         }
     }
 
-    /// A zero budget must fail immediately, not never. Racing the deadline against
-    /// the parking task used to make this the ordering most likely to hang.
-    func testZeroTimeoutFailsImmediately() async throws {
-        let waiter = QMPWaiter<Int>(timeout: .zero, on: eventLoop)
-
+    /// A deadline that fires before its waiter has even parked is still just
+    /// another resolver — but it is the ordering most likely to hang, because
+    /// racing the deadline against the parking task used to leave nothing able to
+    /// resume the caller. A zero budget makes that ordering certain; the rest are
+    /// small enough to hit it often, and repeated so they do.
+    ///
+    /// The elapsed budget is the real assertion here, and is deliberately much
+    /// tighter than `.hangBackstop` can express: 200 waits that each resolve
+    /// promptly take milliseconds, and 200 that strand take forever.
+    @Test(
+        "A tiny budget fails promptly however it races the waiter",
+        arguments: [Duration.zero, .nanoseconds(1), .microseconds(500), .milliseconds(1)]
+    )
+    func tinyDeadlinesNeverStrandTheWaiter(timeout: Duration) async throws {
         let started = ContinuousClock.now
-        do {
-            _ = try await waiter.value
-            XCTFail("Expected a zero budget to fail")
-        } catch {
-            guard case .timeout = error else {
-                return XCTFail("Expected .timeout, got \(error)")
-            }
-        }
-        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
-    }
 
-    /// A deadline that fires before its waiter is even constructed with one is
-    /// still just another resolver, and repeated tiny budgets are how that
-    /// ordering gets hit.
-    func testTinyDeadlinesNeverStrandTheWaiter() async throws {
         for _ in 0..<50 {
-            let waiter = QMPWaiter<Int>(timeout: .milliseconds(1), on: eventLoop)
-            do {
-                _ = try await waiter.value
-                XCTFail("Expected the deadline to fire")
-            } catch {
-                // Expected.
+            let waiter = QMPWaiter<Int>(timeout: timeout, on: eventLoop)
+            let error = try await #require(throws: QMPError.self) { try await waiter.value }
+            guard case .timeout = error else {
+                Issue.record("Expected .timeout, got \(error)")
+                return
             }
         }
+
+        #expect(started.duration(to: .now) < .seconds(5))
     }
 
     /// A deadline must not overrule a result that already arrived.
-    func testDeadlineDoesNotDisplaceAnEarlierResult() async throws {
+    @Test func deadlineDoesNotDisplaceAnEarlierResult() async throws {
         let waiter = QMPWaiter<Int>(timeout: .milliseconds(50), on: eventLoop)
         waiter.resolve(.success(3))
         // Well past the deadline: if resolving did not retire it, the value is
         // replaced by a timeout.
         try await Task.sleep(for: .milliseconds(150))
 
-        let value = try await waiter.value
-        XCTAssertEqual(value, 3)
+        #expect(try await waiter.value == 3)
     }
 
     // MARK: - Cancellation
 
     /// Cancelling a parked waiter comes back at once, not when the deadline fires.
-    func testCancellationWhileParkedIsHonoured() async throws {
+    @Test func cancellationWhileParkedIsHonoured() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
 
         let started = ContinuousClock.now
@@ -143,51 +133,50 @@ final class QMPWaiterTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(50))
         waiting.cancel()
 
-        do {
-            _ = try await waiting.value
-            XCTFail("Expected the cancelled wait to throw")
-        } catch QMPError.cancelled {
-            // Expected.
+        let error = try await #require(throws: QMPError.self) { try await waiting.value }
+        guard case .cancelled = error else {
+            Issue.record("Expected .cancelled, got \(error)")
+            return
         }
-        XCTAssertLessThan(started.duration(to: .now), .seconds(5))
+        #expect(started.duration(to: .now) < .seconds(5))
     }
 
     /// Cancellation landing *before* the waiter parks is the mirror image of the
     /// deadline hazard: the canceller finds nobody waiting. Latching makes that the
     /// same case as any other early resolution. Repeated, because an immediate
     /// `cancel()` usually beats the task to its first suspension.
-    func testCancellationBeforeParkingIsNotLost() async throws {
+    @Test func cancellationBeforeParkingIsNotLost() async throws {
         let started = ContinuousClock.now
         for _ in 0..<50 {
             let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
             let waiting = Task { try await waiter.value }
             waiting.cancel()
 
-            do {
-                _ = try await waiting.value
-                XCTFail("Expected the cancelled wait to throw")
-            } catch QMPError.cancelled {
-                // Expected.
+            let error = try await #require(throws: QMPError.self) { try await waiting.value }
+            guard case .cancelled = error else {
+                Issue.record("Expected .cancelled, got \(error)")
+                return
             }
         }
-        XCTAssertLessThan(
-            started.duration(to: .now), .seconds(5),
-            "Cancellation must be honoured however it races the waiter")
+        #expect(
+            started.duration(to: .now) < .seconds(5),
+            "Cancellation must be honoured however it races the waiter"
+        )
     }
 
     /// A cancelled waiter is resolved, so a result arriving afterwards has nowhere
     /// to go. That is what lets an inbound event skip past it to a live wait for
     /// the same device instead of being swallowed.
-    func testACancelledWaiterCountsAsResolved() async throws {
+    @Test func aCancelledWaiterCountsAsResolved() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
-        XCTAssertFalse(waiter.isResolved)
+        #expect(!waiter.isResolved)
 
         let waiting = Task { try await waiter.value }
         try await Task.sleep(for: .milliseconds(50))
         waiting.cancel()
         _ = try? await waiting.value
 
-        XCTAssertTrue(waiter.isResolved)
+        #expect(waiter.isResolved)
     }
 
     // MARK: - Misuse
@@ -196,24 +185,20 @@ final class QMPWaiterTests: XCTestCase {
     /// second is refused rather than allowed to displace the first, which is what
     /// used to happen to the greeting: the new continuation overwrote the old one,
     /// abandoning it with nothing to resume it and no deadline to fail it.
-    func testASecondWaiterIsRefusedRatherThanDisplacingTheFirst() async throws {
+    @Test func aSecondWaiterIsRefusedRatherThanDisplacingTheFirst() async throws {
         let waiter = QMPWaiter<Int>(timeout: Self.neverReachedTimeout, on: eventLoop)
 
         let first = Task { try await waiter.value }
         try await Task.sleep(for: .milliseconds(50))
 
-        do {
-            _ = try await waiter.value
-            XCTFail("Expected the second wait to be refused")
-        } catch {
-            guard case .invalidResponse = error else {
-                return XCTFail("Expected .invalidResponse, got \(error)")
-            }
+        let error = try await #require(throws: QMPError.self) { try await waiter.value }
+        guard case .invalidResponse = error else {
+            Issue.record("Expected .invalidResponse, got \(error)")
+            return
         }
 
         // And the first waiter is still intact.
         waiter.resolve(.success(5))
-        let delivered = try await first.value
-        XCTAssertEqual(delivered, 5)
+        #expect(try await first.value == 5)
     }
 }
