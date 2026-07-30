@@ -31,7 +31,14 @@ public actor QEMUManager {
     
     // MARK: - VM Lifecycle
     
-    /// Create and start a VM with the given configuration
+    /// Create a VM with the given configuration
+    ///
+    /// On return the VM exists and QMP is connected. With
+    /// `QEMUConfiguration.startPaused` (the default) the guest is not executing
+    /// yet, so `status` is `.paused` and `start()` is what runs it; otherwise it
+    /// is `.running`. `.creating` only ever describes the window before this
+    /// method returns.
+    ///
     /// - Parameters:
     ///   - config: The QEMU VM configuration
     ///   - timeout: Timeout in seconds for the entire operation (default: 30)
@@ -269,16 +276,9 @@ public actor QEMUManager {
         do {
             let qmpStatus = try await qmpClient.queryStatus()
 
-            switch qmpStatus.status.lowercased() {
-            case "running":
-                status = qmpStatus.running ? .running : .paused
-            case "paused", "suspended":
-                status = .paused
-            case "shutdown", "poweroff":
-                status = .stopped
-            case "inmigrate", "prelaunch":
-                status = .creating
-            default:
+            if let mapped = QEMUVMStatus(qmpStatus) {
+                status = mapped
+            } else {
                 logger.warning("Unknown QMP status: \(qmpStatus.status)")
                 status = .unknown
             }
@@ -510,11 +510,70 @@ struct HotplugPortPool: Sendable {
 // MARK: - VM Status
 
 public enum QEMUVMStatus: String, Codable, Sendable {
+    /// No QEMU process — never started, or gone.
     case stopped
+
+    /// The VM is still being brought into existence: `createVM` has not returned
+    /// yet, or QEMU is receiving an incoming migration.
+    ///
+    /// Deliberately *not* the state of a VM started with
+    /// `QEMUConfiguration.startPaused`. Once `createVM` returns, such a VM is
+    /// created and waiting for `start()`, which is `.paused`.
     case creating
+
+    /// The guest is executing.
     case running
+
+    /// The VM is live but not executing, and `start()` will resume it. Covers
+    /// both a VM stopped after it was running and one launched with `-S` that
+    /// has never run.
     case paused
+
+    /// `shutdown()` has asked the guest to power itself off.
     case shuttingDown
+
+    /// The status could not be determined: `query-status` failed, or QEMU
+    /// reported a run state this library does not recognise.
     case unknown
+}
+
+extension QEMUVMStatus {
+    /// The status corresponding to a QEMU run state, or `nil` if the run state is
+    /// not one this library recognises.
+    ///
+    /// A pure mapping rather than a `switch` buried in `QEMUManager`: it is the
+    /// part with the interesting decisions in it, and this way it can be tested
+    /// without a QEMU process or a QMP socket.
+    public init?(_ response: QMPStatusResponse) {
+        switch response.status.lowercased() {
+        case "running":
+            // The `running` flag is the tiebreak: QEMU can report the state as
+            // `running` while execution is actually stopped.
+            self = response.running ? .running : .paused
+
+        case "paused", "suspended":
+            self = .paused
+
+        case "prelaunch":
+            // A VM launched with `-S`: created, live, and waiting for `cont`.
+            // Every behaviour a caller can observe matches `.paused` — the same
+            // `start()` resumes it — and since `startPaused` defaults to `true`,
+            // calling it `.creating` made the out-of-the-box "created, ready to
+            // start" VM indistinguishable from one still starting up.
+            self = .paused
+
+        case "shutdown", "poweroff":
+            self = .stopped
+
+        case "inmigrate":
+            // An incoming migration genuinely is a VM still being constructed,
+            // so this keeps `.creating`. Nothing here initiates one, so it is
+            // reachable only for a VM handed over mid-migration.
+            self = .creating
+
+        default:
+            return nil
+        }
+    }
 }
 
