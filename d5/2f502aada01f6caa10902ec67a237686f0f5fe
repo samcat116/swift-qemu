@@ -1,0 +1,26 @@
+Sources/SwiftQEMU/QMPWaiter.swift
+  s_4f25afda6334a7::t_c39c2e6fd87cf8 105
+  s_4f25afda6334a7::t_dd9345d77edc96 33-38
+  s_4f25afda6334a7::t_d49b7d02109f69 147-149
+  s_4f25afda6334a7::t_933fc4ce457067 91
+  s_4f25afda6334a7::t_391e5ae4e7a537 115-120,124
+  s_4f25afda6334a7::t_888ee00c44a6ea 140
+CLAUDE.md
+  s_4f25afda6334a7::t_5448a7d3a6822a 220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.17",
+  "base_commit_sha": "d52f502aada01f6caa10902ec67a237686f0f5fe",
+  "prompts": {},
+  "sessions": {
+    "s_4f25afda6334a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1c32694-306c-4419-a3b7-9bc79021ade4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
