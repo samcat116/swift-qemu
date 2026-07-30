@@ -175,4 +175,57 @@ struct RealQEMUVMStatusTests {
             #expect(await manager.status == .paused)
         }
     }
+
+    /// Two `createVM` calls at once: one wins, the other is refused, and — the part
+    /// that used to be false — the refusal leaves the winner's VM alone.
+    ///
+    /// `createVM` guarded itself on `await process.isRunning`, and an actor is
+    /// reentrant across that suspension, so both calls got past it. The loser then
+    /// failed on `QEMUProcess`'s own guard *inside* the task group, which put it on
+    /// the failure path — and that path stops the QEMU process and clears the port
+    /// pool, neither of which belonged to it. The winner was left with a killed VM
+    /// and a manager that still believed it was connected.
+    @Test func aRefusedConcurrentCreateDoesNotTearDownTheWinnersVM() async throws {
+        var config = QEMUConfiguration()
+        config.memoryMB = 128
+
+        let manager = QEMUManager(
+            qemuPath: try QEMUFixtures.requireSystemBinary(),
+            logger: Logger(label: "test")
+        )
+
+        // Both in flight before either can finish, which is the only way to reach
+        // the window this is about.
+        let first = Task { try await manager.createVM(config: config) }
+        let second = Task { try await manager.createVM(config: config) }
+        let results = [await first.result, await second.result]
+
+        let failures = results.compactMap { result -> QMPError? in
+            guard case .failure(let error) = result else { return nil }
+            return error as? QMPError
+        }
+        #expect(results.count - failures.count == 1, "exactly one create should win")
+        #expect(failures.count == 1, "exactly one create should be refused")
+
+        if case .processAlreadyRunning = failures.first {} else {
+            Issue.record("Expected .processAlreadyRunning, got \(String(describing: failures.first))")
+        }
+
+        // The assertion the bug was hiding behind: the winner's VM is still there.
+        // A round-trip rather than the cached `status`, because it has to prove QEMU
+        // is alive and the QMP connection still works — the loser's cleanup used to
+        // kill the one and orphan the other.
+        //
+        // Nothing between here and the teardown throws, deliberately: this VM's
+        // cleanup is the last statement rather than a `defer` firing off a task
+        // nobody waits for, and the next test in this suite boots a VM of its own.
+        let liveStatus = try? await manager.getStatus()
+        #expect(liveStatus == .paused, "the winner's VM should still be up and answering QMP")
+        #expect(
+            await manager.availableHotplugPorts == QEMUConfiguration.automaticHotplugPortCount,
+            "the refused create must not have cleared the winner's port pool"
+        )
+
+        try? await manager.destroy()
+    }
 }

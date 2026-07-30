@@ -213,6 +213,35 @@ struct QEMUHotplugTests {
         #expect(pool.nextFreePort == nil)
     }
 
+    /// The rollback for an attach that claimed a port and then failed, and why it is
+    /// matched on the device *and* the port: releasing by name alone would hand back
+    /// a port whose device is still plugged into it.
+    @Test func releasingAPortOnlyWorksForTheDeviceHoldingIt() {
+        var pool = HotplugPortPool(portIDs: ["hp0", "hp1"])
+        pool.claim("hp0", for: "vdb")
+
+        pool.release("vdb", from: "hp1")
+        #expect(pool.port(for: "vdb") == "hp0", "an unmatched release must change nothing")
+        #expect(pool.inUseCount == 1)
+
+        pool.release("vdb", from: "hp0")
+        #expect(pool.port(for: "vdb") == nil)
+        #expect(pool.nextFreePort == "hp0")
+    }
+
+    /// A device that already holds a port keeps it. Overwriting would orphan the
+    /// first — leaving a slot that is physically occupied but that this pool reports
+    /// as free, which outlives the duplicate `device_add` QEMU is about to refuse.
+    @Test func claimingASecondPortForTheSameDeviceIsRefused() {
+        var pool = HotplugPortPool(portIDs: ["hp0", "hp1"])
+        pool.claim("hp0", for: "vdb")
+        pool.claim("hp1", for: "vdb")
+
+        #expect(pool.port(for: "vdb") == "hp0")
+        #expect(pool.inUseCount == 1)
+        #expect(pool.nextFreePort == "hp1", "hp1 was never actually taken")
+    }
+
     @Test func anEmptyPoolOffersNothing() {
         let pool = HotplugPortPool(portIDs: [])
 
@@ -351,6 +380,72 @@ struct RealQEMUHotplugTests {
 
             let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
             #expect(!attached.contains { $0.contains("vdb") }, "nothing should have been added")
+        }
+    }
+
+    /// Two attaches at once must land on two different ports.
+    ///
+    /// Selecting a port and claiming it used to sit on opposite sides of two QMP
+    /// round-trips, so that an attach QEMU rejected would not burn one. But
+    /// `QEMUManager` is a reentrant actor: across those suspensions the second
+    /// attach saw the first's port as still free, picked it, and was refused by QEMU
+    /// with `slot 0 function 0 already occupied` — a bare `GenericError` that
+    /// `hotplugFailure` does not rewrite, so the pool's whole purpose was defeated
+    /// exactly when it was being used.
+    @Test func concurrentAttachesTakeDifferentPorts() async throws {
+        try await withVM(config()) { manager in
+            let firstImage = try makeDiskImage()
+            let secondImage = try makeDiskImage()
+
+            let first = Task { try await manager.attachDisk(path: firstImage, deviceName: "vdb") }
+            let second = Task { try await manager.attachDisk(path: secondImage, deviceName: "vdc") }
+
+            if case .failure(let error) = await first.result {
+                Issue.record("First concurrent attach failed: \(error)")
+            }
+            if case .failure(let error) = await second.result {
+                Issue.record("Second concurrent attach failed: \(error)")
+            }
+
+            let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
+            #expect(attached.contains { $0.contains("vdb") }, "expected vdb among \(attached)")
+            #expect(attached.contains { $0.contains("vdc") }, "expected vdc among \(attached)")
+
+            // Two disks, two ports. A pool that handed out the same port twice would
+            // report one still free here even in the run where QEMU accepted both.
+            let free = await manager.availableHotplugPorts
+            #expect(
+                free == QEMUConfiguration.automaticHotplugPortCount - 2,
+                "two attached disks must be holding two distinct ports"
+            )
+        }
+    }
+
+    /// A port claimed for an attach that QEMU then rejects has to go back to the
+    /// pool: claiming up front is what makes the concurrent case correct, and this
+    /// is the property that used to come for free from claiming late.
+    @Test func aFailedAttachGivesItsPortBack() async throws {
+        try await withVM(config()) { manager in
+            let before = await manager.availableHotplugPorts
+
+            // A path QEMU cannot open, so `blockdev-add` fails and nothing is
+            // plugged in anywhere.
+            await #expect(throws: QMPError.self) {
+                try await manager.attachDisk(
+                    path: NSTemporaryDirectory() + "no-such-image-\(UUID().uuidString).qcow2",
+                    deviceName: "vdb"
+                )
+            }
+
+            #expect(
+                await manager.availableHotplugPorts == before,
+                "a rejected attach must not burn a port for the life of the VM"
+            )
+
+            // And the port is genuinely reusable, not merely counted as free.
+            try await manager.attachDisk(path: try makeDiskImage(), deviceName: "vdb")
+            let attached = try await manager.listDisks().compactMap { $0["qdev"]?.stringValue }
+            #expect(attached.contains { $0.contains("vdb") }, "expected vdb among \(attached)")
         }
     }
 
