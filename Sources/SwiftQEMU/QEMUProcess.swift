@@ -1,7 +1,15 @@
 import Foundation
 import Logging
 import Subprocess
+
+// `FilePath`/`FileDescriptor` come from the OS `System` module on Darwin and from
+// swift-system's `SystemPackage` everywhere else. Subprocess selects between them
+// the same way, so its API is spelled in whichever one is available here.
+#if canImport(System)
 import System
+#else
+import SystemPackage
+#endif
 
 // `stop()` and `deinit` send signals through `kill(2)` against the pid
 // `Subprocess` publishes — see `ChildProcess` for why the signalling goes through
