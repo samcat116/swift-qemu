@@ -34,7 +34,7 @@ public actor QEMUManager {
     ///   - config: The QEMU VM configuration
     ///   - timeout: Timeout in seconds for the entire operation (default: 30)
     public func createVM(config: QEMUConfiguration, timeout: TimeInterval = 30) async throws {
-        guard !process.isRunning else {
+        guard !(await process.isRunning) else {
             throw QMPError.processAlreadyRunning
         }
 
@@ -79,7 +79,12 @@ public actor QEMUManager {
             // Cleanup on any failure. Read stderr before stopping the process — on a
             // timeout QEMU is still alive, and its output is usually the only thing
             // that explains why the socket never showed up.
-            let stderr = process.capturedStderr
+            //
+            // These reads and the `start(with:)` above no longer touch the same
+            // state from two concurrency domains: `QEMUProcess` is an actor, so the
+            // group's cancelled child is serialized against this path rather than
+            // relying on `@unchecked Sendable` to hide the overlap.
+            let stderr = await process.capturedStderr
             logger.error("Failed to create QEMU VM: \(error)", metadata: [
                 "qemuStderr": .string(stderr.isEmpty ? "<empty>" : stderr)
             ])
@@ -93,9 +98,10 @@ public actor QEMUManager {
             // if it fails to kill it, that is logged rather than thrown, so the
             // original failure is still what the caller sees.
             await process.stop()
-            if process.isRunning {
+            if await process.isRunning {
+                let pid = await process.processIdentifier
                 logger.error("QEMU process could not be terminated during cleanup", metadata: [
-                    "pid": .string(process.processIdentifier.map(String.init) ?? "unknown")
+                    "pid": .string(pid.map(String.init) ?? "unknown")
                 ])
             }
 
@@ -176,7 +182,7 @@ public actor QEMUManager {
             group.cancelAll()
         }
 
-        if process.isRunning {
+        if await process.isRunning {
             logger.warning("VM did not shut down gracefully, forcing termination")
             try await destroy()
         } else {
@@ -229,11 +235,11 @@ public actor QEMUManager {
         // and we hope for the best".
         await process.stop(timeout: terminationTimeout)
 
-        if process.isRunning {
+        if await process.isRunning {
             // Status stays away from `.stopped`: something is still holding the
             // socket path and the VM's resources.
             status = .unknown
-            throw QMPError.processTerminationFailed(pid: process.processIdentifier)
+            throw QMPError.processTerminationFailed(pid: await process.processIdentifier)
         }
 
         status = .stopped

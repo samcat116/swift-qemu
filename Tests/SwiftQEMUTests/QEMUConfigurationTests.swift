@@ -147,24 +147,20 @@ final class QEMUConfigurationTests: XCTestCase {
 
         let socketPath = NSTemporaryDirectory() + "qemu-accel-\(UUID().uuidString).sock"
         let process = QEMUProcess(qemuPath: qemuPath, qmpSocketPath: socketPath, logger: Logger(label: "test"))
-        defer { try? FileManager.default.removeItem(atPath: socketPath) }
+        // An async teardown block rather than `defer`: `stop()` is awaited, so it
+        // cannot go in a `defer` at all, and a teardown block reaches it on the
+        // failure paths too — this test starts a real VM to leak.
+        addTeardownBlock {
+            await process.stop()
+            try? FileManager.default.removeItem(atPath: socketPath)
+        }
 
         var config = QEMUConfiguration()
         config.memoryMB = 128
 
-        // `stop()` is async, so it cannot go in a `defer` — it has to be reached on
-        // both paths by hand, and this one starts a real VM to leak.
-        do {
-            try await process.start(with: config)
-        } catch {
-            await process.stop()
-            throw error
-        }
-
-        let isRunning = process.isRunning
-        let stderr = process.capturedStderr
-        await process.stop()
-
+        try await process.start(with: config)
+        let isRunning = await process.isRunning
+        let stderr = await process.capturedStderr
         XCTAssertTrue(isRunning, "stderr was: \(stderr)")
     }
 }

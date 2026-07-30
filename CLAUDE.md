@@ -34,6 +34,7 @@ swift test --filter QMPProtocolTests
 
 **QEMUProcess** (Sources/SwiftQEMU/QEMUProcess.swift)
 - Manages the QEMU process lifecycle using Foundation's Process API
+- An `actor`. `isRunning`, `capturedStderr`, `start(with:)` and `stop()` are all isolated, so reads of process state are `await`-ed. `getQMPSocketPath()` is `nonisolated` (the path is fixed at init). The two Foundation callbacks — the stderr readability handler and `terminationHandler` — are installed by `nonisolated static` helpers so they run honestly off-actor, closing over only the internally-locked `StderrCapture`/`ExitWaiter`
 - Builds QEMU command-line arguments from QEMUConfiguration
 - Handles QMP Unix socket creation and readiness with retry logic (up to 10 seconds)
 - **Critical fix**: Redirects stdout to prevent pipe buffer overflow crashes
@@ -114,7 +115,12 @@ The codebase includes critical fixes for production reliability:
     - `deinit` SIGKILLs a still-running child. Foundation's `Process` does not, so dropping a `QEMUProcess`/`QEMUManager` used to leak a running VM for the lifetime of the host process. It cannot await, so there is no graceful path here: call `shutdown()` or `stop()` if the guest should power itself down
     - `shutdown()`'s graceful branch now also calls `stop()` — the child is gone but its process record and socket file are not
 
-12. **A Created VM Reports `.paused`, Not `.creating`**: `startPaused` defaults to `true`, so the stock `createVM` launches QEMU with `-S`, and QEMU reports that run state as `prelaunch` — which mapped to `.creating`. A VM that was fully created and waiting to be started therefore read as still being created, and `.creating` meant two things at once, so a caller could not tell "still coming up" from "waiting for me". Now:
+12. **`QEMUProcess` Isolation**: `QEMUProcess` was a `final class` marked `@unchecked Sendable` while holding four unsynchronized mutable fields (`process`, `stderrPipe`, `stderrCapture`, `exitWaiter`). `createVM` touches it from two concurrency domains at once — a task-group child runs `start(with:)`, which writes all four, while the failure path reads `capturedStderr`/`isRunning`. The annotation was the only reason Swift 6 did not diagnose it; the inner `StderrCapture`/`ExitWaiter` locks protect their contents, not the fields referencing them. It is now an `actor`, and `QEMUProcessTests.testStatusCanBeReadConcurrentlyWithAStartInFlight` covers the overlap — under `swift test --sanitize=thread` it reports races on the `stderrCapture` and `process` writes against a class and none against the actor.
+    - `nonisolated` is used in four deliberate places, and nowhere else: `getQMPSocketPath()` and `buildArguments(from:)` (both derive only from `let` state, so call sites and argument-list assertions stay synchronous), and the two `static` callback installers, whose closures Foundation invokes on its own queues and must therefore *not* be actor-isolated
+    - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties; anything computed or any method call would not compile there
+    - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is `await`-ed and `defer` bodies cannot await. That also reaches cleanup on failure paths, which the hand-written `await process.stop()` calls it replaced did not
+
+13. **A Created VM Reports `.paused`, Not `.creating`**: `startPaused` defaults to `true`, so the stock `createVM` launches QEMU with `-S`, and QEMU reports that run state as `prelaunch` — which mapped to `.creating`. A VM that was fully created and waiting to be started therefore read as still being created, and `.creating` meant two things at once, so a caller could not tell "still coming up" from "waiting for me". Now:
     - `prelaunch` maps to `.paused`. It is a stopped-but-live VM that `start()` resumes, which is what `.paused` means everywhere else in the API
     - `.creating` is left to the window before `createVM` returns. `inmigrate` keeps it — an incoming migration really is a VM still being constructed — and nothing else QEMU reports maps to it
     - The mapping moved out of `updateStatus()` into `QEMUVMStatus.init?(_ response: QMPStatusResponse)`, a pure function testable without a process or a socket. It returns `nil` for an unrecognised run state so the manager still logs the raw string before falling back to `.unknown`
@@ -123,7 +129,6 @@ The codebase includes critical fixes for production reliability:
 
 Reviewed and deliberately left for follow-up work — do not assume these are handled:
 
-- **`QEMUProcess` is `@unchecked Sendable` and genuinely raced**: `createVM` mutates its state from a task-group child while the actor's failure path reads `capturedStderr`/`isRunning`. Making it an `actor` would remove the class of bug
 - **Per-request deadlines spawn a detached task each** that sleeps out the full timeout even after the request resolves, and requests are not cancellation-aware (a cancelled caller waits out the timeout)
 - **Thin end-to-end `QEMUManager` coverage**: most of its bugs were regression-tested at the `QMPClient`/`QEMUProcess` level. `QEMUVMStatusTests` drives the manager against a real QEMU for the create → start → destroy path (skipped where QEMU is absent); covering the failure paths still needs an injectable QMP-speaking fake
 - **PCI hot-unplug needs guest cooperation**: `detachDisk` legitimately times out against a VM with no guest OS — verified over a raw QMP socket that QEMU emits no `DEVICE_DELETED` at all in that case. Also, `deviceAdd` with no explicit `bus` cannot hotplug on `q35` (`pcie.0` does not support it); use `pc` or an explicit root port
@@ -143,8 +148,8 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 ### Concurrency Model
 
 - QEMUManager is an actor for thread-safe state management
-- QEMUProcess uses @unchecked Sendable (process management is inherently thread-unsafe)
-- QMPClient uses @unchecked Sendable (manages its own thread safety via SwiftNIO EventLoopGroup)
+- QEMUProcess is an actor. Its `Process`/`Pipe` state is genuinely thread-unsafe, which is the reason it is isolated rather than annotated (see fix 12)
+- QMPClient is `Sendable`, with its connection state in one lock-guarded box
 - All async operations use Swift's async/await and structured concurrency
 
 ### Dependencies

@@ -90,28 +90,26 @@ final class QEMUVMStatusTests: XCTestCase {
 
         let manager = QEMUManager(qemuPath: qemuPath, logger: Logger(label: "test"))
 
+        // This test starts a real VM to leak, and `destroy()` is `await`-ed, so
+        // cleanup goes in a teardown block rather than a `defer` — which cannot
+        // await — and thereby also covers the failure paths below.
+        addTeardownBlock { try? await manager.destroy() }
+
         var config = QEMUConfiguration()
         config.memoryMB = 128
         XCTAssertTrue(config.startPaused, "the default this test is about")
 
-        do {
-            try await manager.createVM(config: config)
+        try await manager.createVM(config: config)
 
-            let afterCreate = try await manager.getStatus()
-            XCTAssertEqual(
-                afterCreate, .paused,
-                "a created-but-not-started VM is waiting for start(), not still being created"
-            )
+        let afterCreate = try await manager.getStatus()
+        XCTAssertEqual(
+            afterCreate, .paused,
+            "a created-but-not-started VM is waiting for start(), not still being created"
+        )
 
-            try await manager.start()
-            let afterStart = try await manager.getStatus()
-            XCTAssertEqual(afterStart, .running)
-        } catch {
-            // `destroy()` is async, so it cannot go in a `defer` — and this test
-            // starts a real VM to leak.
-            try? await manager.destroy()
-            throw error
-        }
+        try await manager.start()
+        let afterStart = try await manager.getStatus()
+        XCTAssertEqual(afterStart, .running)
 
         try await manager.destroy()
         let afterDestroy = await manager.status
