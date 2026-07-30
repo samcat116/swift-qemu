@@ -38,8 +38,9 @@ swift test --filter QMPProtocolTests
 - An `actor`. `isRunning`, `capturedStderr`, `start(with:)` and `stop()` are all isolated, so reads of process state are `await`-ed. `getQMPSocketPath()` is `nonisolated` (the path is fixed at init). The two Foundation callbacks — the stderr readability handler and `terminationHandler` — are installed by `nonisolated static` helpers so they run honestly off-actor, closing over only the internally-locked `StderrCapture`/`ExitWaiter`
 - Builds QEMU command-line arguments from QEMUConfiguration
 - Handles QMP Unix socket creation and readiness with retry logic (up to 10 seconds)
+- **Puts the socket in a private `0700` directory** (`<runtimeDirectory>/qemu-<token>/qmp.sock`), not loose in `/tmp` — see fix 17
 - **Critical fix**: Redirects stdout to prevent pipe buffer overflow crashes
-  - If `ENABLE_QEMU_PROCESS_LOG_FILES=true` (or `yes`, `1`): stdout goes to `/tmp/qemu-*.log`
+  - If `ENABLE_QEMU_PROCESS_LOG_FILES=true` (or `yes`, `1`): stdout goes to `<instance directory>/qemu-<token>.log`, mode `0600`
   - Otherwise: redirects to `/dev/null` (default behavior)
 - **Captures stderr** into a bounded tail buffer (last 16KB) via an actively drained pipe, exposed as `capturedStderr` and attached to errors. Also teed to the log file when log files are enabled.
 - Detects early process exit during the socket wait and throws `QMPError.processExited(exitCode:killedBySignal:stderr:)` immediately
@@ -71,7 +72,7 @@ swift test --filter QMPProtocolTests
 The codebase includes critical fixes for production reliability:
 
 1. **Pipe Buffer Overflow Prevention**: QEMU stdout is redirected away from pipes to prevent crashes when buffers fill up. The original implementation used `Pipe()` objects but never read from them, causing QEMU to crash with `NIOCore.IOError` when the 64KB buffer filled. Current behavior:
-   - Set `ENABLE_QEMU_PROCESS_LOG_FILES=true` to capture output in `/tmp/qemu-*.log` files
+   - Set `ENABLE_QEMU_PROCESS_LOG_FILES=true` to capture output in a log file inside the instance's private directory (see fix 17)
    - Default behavior (when env var not set): stdout redirects to `/dev/null`
    - stderr uses a `Pipe()` that **is** continuously drained by a `readabilityHandler` into `StderrCapture` (bounded to the last 16KB). A pipe is only ever safe with an active reader — **never** attach one without draining it.
 
@@ -119,8 +120,8 @@ The codebase includes critical fixes for production reliability:
     - `shutdown()`'s graceful branch now also calls `stop()` — the child is gone but its process record and socket file are not
 
 12. **`QEMUProcess` Isolation**: `QEMUProcess` was a `final class` marked `@unchecked Sendable` while holding four unsynchronized mutable fields (`process`, `stderrPipe`, `stderrCapture`, `exitWaiter`). `createVM` touches it from two concurrency domains at once — a task-group child runs `start(with:)`, which writes all four, while the failure path reads `capturedStderr`/`isRunning`. The annotation was the only reason Swift 6 did not diagnose it; the inner `StderrCapture`/`ExitWaiter` locks protect their contents, not the fields referencing them. It is now an `actor`, and `QEMUProcessTests.testStatusCanBeReadConcurrentlyWithAStartInFlight` covers the overlap — under `swift test --sanitize=thread` it reports races on the `stderrCapture` and `process` writes against a class and none against the actor.
-    - `nonisolated` is used in four deliberate places, and nowhere else: `getQMPSocketPath()` and `buildArguments(from:)` (both derive only from `let` state, so call sites and argument-list assertions stay synchronous), and the two `static` callback installers, whose closures Foundation invokes on its own queues and must therefore *not* be actor-isolated
-    - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties; anything computed or any method call would not compile there
+    - `nonisolated` is used in six deliberate places, and nowhere else: `getQMPSocketPath()` and `buildArguments(from:)` (both derive only from `let` state, so call sites and argument-list assertions stay synchronous), the two `static` callback installers, whose closures Foundation invokes on its own queues and must therefore *not* be actor-isolated, and the two `static` cleanup helpers (`removeRuntimeFiles`/`removeSocketFile`), which `deinit` calls with the paths passed in as arguments
+    - `deinit` is `nonisolated` by language rule, and reaches stored properties under the exception for a deinitializing actor — which is what lets fix 11's SIGKILL-on-drop survive the conversion. It touches only stored properties, and reads them one `if` at a time: folding two into `a && b` makes the second operand an autoclosure, which is nonisolated and will not compile there. Anything computed, or any isolated method call, is out for the same reason
     - Tests clean up via `addTeardownBlock` rather than `defer`, because `stop()` is `await`-ed and `defer` bodies cannot await. That also reaches cleanup on failure paths, which the hand-written `await process.stop()` calls it replaced did not
 
 13. **A Created VM Reports `.paused`, Not `.creating`**: `startPaused` defaults to `true`, so the stock `createVM` launches QEMU with `-S`, and QEMU reports that run state as `prelaunch` — which mapped to `.creating`. A VM that was fully created and waiting to be started therefore read as still being created, and `.creating` meant two things at once, so a caller could not tell "still coming up" from "waiting for me". Now:
@@ -134,7 +135,7 @@ The codebase includes critical fixes for production reliability:
     - A `PendingRequest` without a continuation has not been written yet, so no reply can belong to it. The untagged-response FIFO fallback (old QEMU that does not echo `id`) skips those records rather than taking the head blindly
 
 15. **Bounded Inbound Frames**: `channelRead` accumulated everything it read and only drained on a newline, so a peer that never sent one grew the buffer for as long as it kept writing. Fix 6's `discardReadBytes()` stopped *consumed* frames accumulating; a single unterminated frame was still unbounded. `maximumFrameSize` (default `QMPClient.defaultMaximumFrameSize`, 512 KB, settable per client) now caps one frame including its terminating newline, and exceeding it fails the connection with `QMPError.frameTooLarge(limit:)`.
-    - QEMU does not do this, so this is hardening — it matters because the socket lives in a world-writable directory today, and because a half-written frame should surface as a named error rather than as growing memory and, eventually, a bare `.timeout`
+    - QEMU does not do this, so this is hardening — it matters because a half-written frame should surface as a named error rather than as growing memory and, eventually, a bare `.timeout`. It used to matter more: the socket lived in a world-writable directory until fix 17 moved it into a private one
     - The cap is on **frame size**, not merely on withheld newlines: an over-limit frame is rejected whether or not its newline has arrived. The unterminated branch (`readableBytes > limit`) and the complete-frame branch (`messageLength > limit`) are both reachable and both tested — which arrives depends only on how the peer's bytes land across socket reads
     - Waiters are failed *before* the close, so the in-flight caller gets `frameTooLarge` rather than the `connectionLost` that `channelInactive` would otherwise latch a moment later. `failAllWaiters` keeps the first error
     - 512 KB is far above any real QMP message (`query-block` on a long device list, the largest realistic payload, runs to tens of KB). `testLargeFrameWithinTheLimitIsStillDelivered` exists because a cap that clipped legitimate payloads would be worse than no cap
@@ -147,6 +148,14 @@ The codebase includes critical fixes for production reliability:
     - `pc` deliberately gets none: its `pci.0` hot-plugs directly, and `attachDisk` names no bus there
     - Both failure modes now name their cause: `QMPError.noHotplugPortAvailable(machineType:portCount:inUse:)` when there is no free port (thrown *before* `blockdev-add`, so a refused attach leaves no orphaned backend node), and `QMPError.hotplugNotSupported(bus:machineType:)` in place of QEMU's bare `GenericError`. `attachDisk(bus:)` lets a caller with its own topology bypass the pool entirely
     - Every QEMU behaviour above was checked over a raw QMP socket against QEMU 11.0.2 before being encoded, and `QEMUHotplugTests` starts real VMs to cover both sides of the gate: default-config attach, all four ports, pool exhaustion, `pc` with no ports, and `.disabled` on q35 (which is the pre-fix state, and must fail with the named error)
+
+17. **A Private Directory for the QMP Socket**: the socket defaulted to `/tmp/qemu-<uuid>.sock`, and `start()` deleted whatever sat at that path before launching. `/tmp` is world-writable and shared with every user on the host, and a QMP socket is a full control channel for the VM — connect to it and you can `quit` the guest, hot-plug devices, or read block device state. The UUID made it hard to guess rather than protected. Now:
+    - The socket is `<runtimeDirectory>/qemu-<token>/qmp.sock`, in a directory created with mode `0700`. **The directory's mode is the access control** — a socket file's own permission bits are not portably honoured, so putting the socket somewhere private is the only thing that works. The mode is set twice (as a `createDirectory` attribute, then via `setAttributes`) because Foundation does not promise the attribute reaches `mkdir(2)` rather than being applied afterwards
+    - `withIntermediateDirectories: false` for the leaf, so anything already at that path is an error rather than something to adopt
+    - `runtimeDirectory` is injectable on both `QEMUProcess` and `QEMUManager` (defaults to `NSTemporaryDirectory()`, already per-user on macOS)
+    - Teardown removes the *directory*, and only ever one this instance created. The old code deleted a caller-supplied path outright; `removeSocketFile` now refuses anything that is not a socket, regular file, or symlink, because `removeItem` on a directory takes everything under it
+    - **The name is a 13-character base-36 token, not a UUID, and this matters**: `sun_path` is 104 bytes on Darwin and `NSTemporaryDirectory()` spends ~50 of them before this library adds anything. A UUID-named directory plus `qmp.sock` does not fit — the injectable-base-directory test hit exactly that and had to be shortened. `QEMUProcess.maxSocketPathLength` is read from `sockaddr_un`, and `start()` throws `QMPError.socketPathTooLong(path:limit:)` rather than letting an over-long path present as a socket that never appears
+    - The debug log moved into the same private directory at mode `0600` (with `-nographic` it is the guest console). It is named per *run*, not per instance, so a restart does not overwrite the log being diagnosed — and a directory holding a log is the one thing teardown leaves behind, since a log you cannot read after the VM exits is no use
 
 ### Known Gaps
 
@@ -185,10 +194,11 @@ Reviewed and deliberately left for follow-up work — do not assume these are ha
 ### Environment Variables
 
 **ENABLE_QEMU_PROCESS_LOG_FILES**: Controls QEMU process output handling
-- Set to `true`, `yes`, or `1` to capture output in `/tmp/qemu-*.log` files
+- Set to `true`, `yes`, or `1` to capture output in `<instance directory>/qemu-<token>.log` (mode `0600`); the path is logged at `info` when the process starts
 - When unset or any other value: redirects stdout to `/dev/null`
 - Usage: `ENABLE_QEMU_PROCESS_LOG_FILES=true swift run`
 - Does **not** affect stderr capture — stderr is always captured in memory and reported on failure, regardless of this variable
+- Setting it means the instance directory is **not** removed on teardown, so the log survives the VM. Those directories are yours to clean up
 
 ### Testing with Real QEMU
 
@@ -217,8 +227,9 @@ qemu-system-x86_64 -machine help
 
 When debugging QMP issues:
 - Enable log files: `export ENABLE_QEMU_PROCESS_LOG_FILES=true`
-- Check socket file creation: `ls -la /tmp/qemu-*.sock`
-- Monitor QEMU output logs: `tail -f /tmp/qemu-*.log`
+- The socket and log live in a private per-instance directory under `NSTemporaryDirectory()` — `/var/folders/…/T/qemu-<token>/` on macOS, `/tmp/qemu-<token>/` on Linux. `getQMPSocketPath()` reports the exact path, and it is logged at `info` on start
+- Check socket file creation: `ls -la "$(dirname "$SOCKET")"` — or `ls -la "${TMPDIR:-/tmp}"/qemu-*/`
+- Monitor QEMU output logs: `tail -f "${TMPDIR:-/tmp}"/qemu-*/*.log`
 - Watch for "Connection refused" errors (indicates timing issues)
 - Verify socket permissions and ownership
 
@@ -226,6 +237,9 @@ When debugging QMP issues:
 
 ```swift
 let manager = QEMUManager(qemuPath: "/usr/bin/qemu-system-x86_64")
+// The QMP socket goes in a private 0700 directory under NSTemporaryDirectory().
+// To put it elsewhere — XDG_RUNTIME_DIR, say — pass `runtimeDirectory:`. Keep the
+// base short: the whole socket path has to fit in ~100 bytes.
 
 var config = QEMUConfiguration()
 config.memoryMB = 2048
@@ -281,6 +295,7 @@ All errors conform to QMPError enum (Sources/SwiftQEMU/QMPError.swift):
 - socketCreationFailed (QMP socket not created within timeout, process still alive)
 - processExited(exitCode:killedBySignal:stderr:) (QEMU died before the socket was ready; carries its stderr)
 - processTerminationFailed(pid:) (QEMU outlived both SIGTERM and SIGKILL, so `destroy()` could not force anything)
+- socketPathTooLong(path:limit:) (the QMP socket path does not fit in `sockaddr_un.sun_path`; QEMU would fail to bind, which otherwise reads as a socket that never appears)
 - noHotplugPortAvailable(machineType:portCount:inUse:) (nowhere to hot-plug the disk: the machine type refuses hot-plug on its default bus and no free `pcie-root-port` was left. Thrown before anything reaches QEMU)
 - hotplugNotSupported(bus:machineType:) (QEMU refused `device_add` because the target bus does not support hot-plug, in place of its own bare `GenericError`)
 - timeout (createVM operation exceeded timeout)
