@@ -3,8 +3,14 @@ import PackageDescription
 
 let package = Package(
     name: "swift-qemu",
+    // No API here needs a modern floor: the package is NIO, Subprocess and
+    // System, all of which sit at macOS 13 or lower. The floor exists only so
+    // the package builds, so keep it no higher than consumers need — a floor
+    // above the consumer's own makes the product unlinkable there ("requires
+    // minimum platform version 26.0 ... but this target supports 15.0"). 15.0
+    // is the floor of the macOS host that drives QEMU via HVF.
     platforms: [
-        .macOS(.v26)
+        .macOS(.v15)
     ],
     products: [
         .library(
