@@ -1,0 +1,19 @@
+Package.swift
+  s_7531fb684dded0::t_5d07c4785e5a73 6-11,13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.18",
+  "base_commit_sha": "0478a017d719200a0bfb2b7802978cbc6309d94f",
+  "prompts": {},
+  "sessions": {
+    "s_7531fb684dded0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b83081fd-b5b3-4ae1-9399-c0841a71d935",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Sam Schmitt <sam@samschmitt.com>"
+    }
+  }
+}
